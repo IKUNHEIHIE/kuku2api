@@ -12,6 +12,8 @@ jobs:
         with:
           node-version: '24'
       - run: npm test
+      - run: node --test test/publication.mjs
+      - run: node test/installation-mutations.mjs
       - name: Check Bash entry points
         if: runner.os == 'Linux'
         run: bash -n install.sh && bash -n start.sh

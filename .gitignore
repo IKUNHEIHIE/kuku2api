@@ -8,7 +8,7 @@ capture/stream*.txt
 capture/sse_*.txt
 capture/reqs.txt
 capture/paths.txt
-analysis/
+/analysis/
 *.pcapng
 *.log
 accounts.json
@@ -19,14 +19,14 @@ keys.json
 settings.json
 admin-token.json
 admin-token.json.*
-data/
+/data/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
 
 # All local captures, private backups and machine-specific state.
-capture/
-.runtime/
+/capture/
+/.runtime/
 .env
 .env.*
 !.env.example
