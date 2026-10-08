@@ -1,0 +1,28 @@
+name: Checks
+on: [push, pull_request]
+jobs:
+  backend:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm test
+      - name: Check Bash entry points
+        if: runner.os == 'Linux'
+        run: bash -n install.sh && bash -n start.sh
+  console:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm exec --yes --package=pnpm@10.34.0 -- pnpm install --frozen-lockfile --prod=false
+        working-directory: ui
+      - run: npm exec --yes --package=pnpm@10.34.0 -- pnpm run build
+        working-directory: ui

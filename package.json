@@ -1,0 +1,14 @@
+{
+  "name": "kuku2api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible reverse proxy for Baidu GenFlowPro (库库AI), with an account pool",
+  "engines": { "node": ">=24.15.0" },
+  "scripts": {
+    "postinstall": "node src/admin-token.mjs",
+    "start": "node src/server.mjs",
+    "test": "node test/offline.mjs && node test/backend-hardening.mjs && node --test test/database.mjs && node --test test/accounts.mjs && node --test test/desktop-login.mjs && node --test test/claim-stream.mjs && node --test test/session-isolation.mjs && node --test test/installation.mjs",
+    "accept": "node test/live.mjs"
+  }
+}
