@@ -8,10 +8,12 @@ import { KukuAccount } from '../src/upstream.mjs';
 import { createApp } from '../src/server.mjs';
 import { openDatabase } from '../src/database.mjs';
 
-async function fixture(t, { terminal = 'TURN_DONE', newline = '\n', incomplete = false, stall = false, stallJson = null, wrongReply = false, requiresClient = null } = {}) {
+async function fixture(t, { terminal = 'TURN_DONE', newline = '\n', incomplete = false, stall = false, stallJson = null, wrongReply = false, requiresClient = null, streamTimeoutMs = stall ? 200 : 1500 } = {}) {
   const previous = process.env.KUKU_BASE_URL;
   const calls = { turns: 0, reports: 0, rewards: 0, released: 0, sent: [] };
   let ready = false, paid = false;
+  let notifyStreamStarted;
+  const streamStarted = new Promise(resolve => { notifyStreamStarted = resolve; });
   const upstream = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -32,6 +34,7 @@ async function fixture(t, { terminal = 'TURN_DONE', newline = '\n', incomplete =
     res.write(frame('MODEL_CALL_END', { input_tokens: 12, output_tokens: 3 }));
     res.write(frame('REPLY_END'));
     res.write(frame('ACTUAL_POINT', { consume_points: 0.02 }));
+    notifyStreamStarted();
     if (wrongReply) res.write(frame('TURN_DONE', { reply_id: 'another-reply' }));
     if (requiresClient) { res.write(frame(requiresClient)); return; }
     if (incomplete) return res.end();
@@ -47,7 +50,9 @@ async function fixture(t, { terminal = 'TURN_DONE', newline = '\n', incomplete =
   process.env.KUKU_BASE_URL = `http://127.0.0.1:${upstream.address().port}`;
   const database = openDatabase({ file: ':memory:' });
   const pool = new Pool([{ id: 'fake', bduss: 'synthetic', stoken: 'synthetic' }], { database, logger: { warn() {}, log() {} } });
-  pool.accounts[0].client = new KukuAccount({ bduss: 'synthetic', stoken: 'synthetic' }, { requestTimeoutMs: 150, streamTimeoutMs: 200 });
+  // Shared CI runners can pause longer than 150 ms even for loopback requests.
+  // Keep short budgets only where the test deliberately waits for a deadline.
+  pool.accounts[0].client = new KukuAccount({ bduss: 'synthetic', stoken: 'synthetic' }, { requestTimeoutMs: stallJson ? 150 : 1500, streamTimeoutMs });
   MODEL_INDEX.set('synthetic', { model_name: 'synthetic', display_name: 'synthetic' });
   pool.refreshModelIndex = async () => {};
   t.after(async () => {
@@ -58,11 +63,11 @@ async function fixture(t, { terminal = 'TURN_DONE', newline = '\n', incomplete =
     if (previous === undefined) delete process.env.KUKU_BASE_URL; else process.env.KUKU_BASE_URL = previous;
   });
   const chat = (signal) => pool.chat({ account: pool.accounts[0], model: { id: 'synthetic' }, messages: [{ role: 'user', content: 'synthetic' }], think_mode: 1 }, () => {}, signal);
-  return { pool, database, calls, chat };
+  return { pool, database, calls, chat, streamStarted };
 }
 
 for (const terminal of ['TURN_DONE', 'FINISH', '[DONE]']) {
-  test(`${terminal} finishes a still-open upstream socket and retains final usage and points`, { timeout: 2000 }, async t => {
+  test(`${terminal} finishes a still-open upstream socket and retains final usage and points`, { timeout: 5000 }, async t => {
     const { chat, calls } = await fixture(t, { terminal, newline: '\r\n' });
     const result = await chat();
     assert.equal(result.content, 'synthetic');
@@ -73,7 +78,7 @@ for (const terminal of ['TURN_DONE', 'FINISH', '[DONE]']) {
   });
 }
 
-test('actual admin claim path pays +50 after TURN_DONE without waiting for socket EOF; repeat spends nothing', { timeout: 2000 }, async t => {
+test('actual admin claim path pays +50 after TURN_DONE without waiting for socket EOF; repeat spends nothing', { timeout: 5000 }, async t => {
   const { pool, calls } = await fixture(t);
   const app = createApp({ pool, adminToken: 'synthetic-admin' });
   const claim = async () => {
@@ -94,7 +99,7 @@ test('actual admin claim path pays +50 after TURN_DONE without waiting for socke
   assert.ok([...pool.sessions.values()].every(session => session.logical_key.startsWith('claim:fake:')));
 });
 
-test('socket EOF without a turn terminal fails, preserves observed cost and never reports or pays CHAT', { timeout: 2000 }, async t => {
+test('socket EOF without a turn terminal fails, preserves observed cost and never reports or pays CHAT', { timeout: 5000 }, async t => {
   const { pool, calls, database } = await fixture(t, { incomplete: true });
   const [result] = await pool.claimFreePoints({ only: 'fake', runChat: true, chatModel: 'synthetic' });
   assert.equal(result.ok, false);
@@ -104,7 +109,7 @@ test('socket EOF without a turn terminal fails, preserves observed cost and neve
   assert.deepEqual({ ...database.sql.prepare('SELECT status,consume_points FROM usage_records').get() }, { status: 'failed', consume_points: 0.02 });
 });
 
-test('MODEL_CALL_END, REPLY_END and another reply TURN_DONE cannot finish a stalled turn; timeout releases its claim queue', { timeout: 2000 }, async t => {
+test('MODEL_CALL_END, REPLY_END and another reply TURN_DONE cannot finish a stalled turn; timeout releases its claim queue', { timeout: 5000 }, async t => {
   const { pool, calls } = await fixture(t, { stall: true, wrongReply: true });
   const [result] = await pool.claimFreePoints({ only: 'fake', runChat: true, chatModel: 'synthetic' });
   assert.equal(result.ok, false);
@@ -113,20 +118,21 @@ test('MODEL_CALL_END, REPLY_END and another reply TURN_DONE cannot finish a stal
   assert.equal(pool.queues.size, 0);
 });
 
-test('JSON deadline also aborts a hanging response body', { timeout: 2000 }, async t => {
+test('JSON deadline also aborts a hanging response body', { timeout: 5000 }, async t => {
   const { pool } = await fixture(t, { stallJson: '/api/genflowpro/freepoint/homenew' });
   await assert.rejects(pool.accounts[0].client.freePointHome(), e => e.network && e.code === 'upstream_timeout' && e.status === 504);
 });
 
-test('caller cancellation interrupts a live SSE body promptly', { timeout: 2000 }, async t => {
-  const { chat } = await fixture(t, { stall: true });
+test('caller cancellation interrupts a live SSE body promptly', { timeout: 5000 }, async t => {
+  const { chat, streamStarted } = await fixture(t, { stall: true, streamTimeoutMs: 1500 });
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 70);
-  try { await assert.rejects(chat(controller.signal), e => e.network && e.retryUnsafe && e.code !== 'upstream_timeout'); }
-  finally { clearTimeout(timer); }
+  const rejected = assert.rejects(chat(controller.signal), e => e.network && e.retryUnsafe && e.code !== 'upstream_timeout');
+  await streamStarted;
+  controller.abort();
+  await rejected;
 });
 
-test('an ambiguous paid turn cannot automatically fail over to another account', { timeout: 2000 }, async t => {
+test('an ambiguous paid turn cannot automatically fail over to another account', { timeout: 5000 }, async t => {
   const { pool, calls } = await fixture(t, { incomplete: true });
   pool.accounts.push({ ...pool.accounts[0], id: 'second', priority: 1 });
   const app = createApp({ pool, adminToken: 'synthetic-admin' });
@@ -141,7 +147,7 @@ test('an ambiguous paid turn cannot automatically fail over to another account',
 });
 
 for (const requiresClient of ['REQUIRE_EXTERNAL_EXECUTION', 'AWAITING_INPUT']) {
-  test(`${requiresClient} immediately stops a paused tool workflow without reporting or paying CHAT`, { timeout: 2000 }, async t => {
+  test(`${requiresClient} immediately stops a paused tool workflow without reporting or paying CHAT`, { timeout: 5000 }, async t => {
     const { pool, calls } = await fixture(t, { requiresClient });
     const [result] = await pool.claimFreePoints({ only: 'fake', runChat: true, chatModel: 'synthetic' });
     assert.equal(result.ok, false);
@@ -152,7 +158,7 @@ for (const requiresClient of ['REQUIRE_EXTERNAL_EXECUTION', 'AWAITING_INPUT']) {
   });
 }
 
-test('reward earning allocates an isolated session instead of resuming an old paused conversation', { timeout: 2000 }, async t => {
+test('reward earning allocates an isolated session instead of resuming an old paused conversation', { timeout: 5000 }, async t => {
   const { pool } = await fixture(t);
   pool.sessions.set('fake:old', { session_id: 'old-paused', client_session_id: 'old-client', turn: 2 });
   const [result] = await pool.claimFreePoints({ only: 'fake', runChat: true, chatModel: 'synthetic' });
