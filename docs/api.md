@@ -42,7 +42,7 @@ PORT=8787 API_KEYS=a,b ADMIN_TOKEN=xxx node src/server.mjs
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `PORT` | `8787` | 监听端口 |
+| `PORT` | 已保存的安装端口，未设置则 `8787` | 临时覆盖监听端口，不改写 SQLite |
 | `API_KEYS` | 空 | 逗号分隔的环境普通 key。**环境及数据库普通密钥全部为空时不鉴权**（本机自用） |
 | `ADMIN_TOKEN` | 自动生成或读取 SQLite 令牌 | 管理端令牌。非空显式值优先；未配置或仅空白时加载数据库，缺失则生成并保存强令牌。所有 `/pool/admin/*` 仍需正确令牌 |
 | `CORS_ORIGIN` | `*` | `access-control-allow-origin` 的值 |
@@ -1240,7 +1240,7 @@ GET 示例：
 
 PATCH 只接收 settings 的三个直接字段，例如 `{ "site_name":"我的号池", "log_retention_days":30 }`；省略字段保持不变。site_name 为去首尾空格后的 1..80 字符；保留天数为整数 0..3650，0 表示长期保留。未知字段拒绝，整份参数先校验再保存。修改策略会立即清理已过期数据，随后启动/每小时继续清理。对话清理也移除旧 Responses 映射，可能使旧 previous_response_id 无法续接，但累计 token/积分统计仍保留。
 
-定时领取的 enabled/hour 仍调用原 `/pool/admin/auto-claim`，不能通过 PATCH settings 修改；状态和结果保存 SQLite。保存失败时不会激活未保存的配置。连接用 baseUrl、浏览器填写的 API key/管理员令牌仍属前端本机连接配置，不能通过此接口上传、枚举或获取服务端凭据；PORT/CORS_ORIGIN/DATABASE_FILE 等启动配置仍使用环境变量。
+定时领取的 enabled/hour 仍调用原 `/pool/admin/auto-claim`，不能通过 PATCH settings 修改；状态和结果保存 SQLite。保存失败时不会激活未保存的配置。连接用 baseUrl、浏览器填写的 API key/管理员令牌仍属前端本机连接配置，不能通过此接口上传、枚举或获取服务端凭据；CORS_ORIGIN/DATABASE_FILE 等启动配置仍使用环境变量，监听端口由安装器保存到 SQLite，PORT 可临时覆盖（见 §24）。
 
 ### 19.7 验证记录及前端配合
 
@@ -1464,7 +1464,11 @@ SQLite 的会话映射保存所属账号、已验证上游用户身份和外部�
 
 默认安装使用固定 pnpm 10.34.0 和 `ui/pnpm-lock.yaml`，先完成控制台依赖安装与构建，再初始化 SQLite 和管理员令牌；构建失败不初始化数据库。首次令牌仍为 256 位密码学随机数，只在生成时显示一次；重装与重启复用已有值，显式 ADMIN_TOKEN 优先。已有账号、普通密钥、设置和领取开关不重置；新安装自动领取默认关闭。安装器不执行真实模型验收、领取或桌面设备伪造。
 
-安装参数：Unix `--dir PATH` / Windows `-InstallDir PATH`；`--no-start` / `-NoStart` 仅安装；`--backend-only` / `-BackendOnly` 不构建控制台；`--skip-dependencies` / `-SkipDependencies` 使用已有前端依赖重新构建。PORT 仍由环境指定；默认启动前检查端口冲突，拒绝影响已有服务。安装成功默认以前台运行，关闭终端或 Ctrl+C 停止；通过 `start.sh` / `start.ps1` 再次启动。启动器清除所有大小写的 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 并设置 NODE_USE_ENV_PROXY=0，账号流量直连。安装不注册系统服务、开放端口或改变监听地址。
+安装参数：Unix `--dir PATH` / Windows `-InstallDir PATH`；`--port 8788` / `-Port 8788` 指定端口；`--lang auto|zh|en` / `-Lang auto|zh|en` 指定语言；`--no-start` / `-NoStart` 仅安装；`--backend-only` / `-BackendOnly` 不构建控制台；`--skip-dependencies` / `-SkipDependencies` 使用已有前端依赖重新构建。默认启动前检查端口冲突，拒绝影响已有服务。安装成功默认以前台运行，关闭终端或 Ctrl+C 停止；通过 `start.sh` / `start.ps1` 再次启动。启动器清除所有大小写的 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 并设置 NODE_USE_ENV_PROXY=0，账号流量直连。安装不注册系统服务、开放端口或改变监听地址。
+
+交互终端中，未通过参数指定端口时询问服务端口，回车沿用默认值；非法输入或启动端口被占用时可重新输入。非交互运行不等待输入。默认值按命令行参数、`PORT`、已保存端口、8787 的顺序取值。成功安装后将端口保存为 SQLite `settings` 表的 `installation.port`，不改变其他设置或已有令牌。构建失败或取消提问不保存选择。`--no-start` / `-NoStart` 保存合法端口但不检查占用。后续启动（包括 `npm start`）读取保存值；`PORT` 可临时覆盖，不更新保存值。该配置不通过管理台 settings API 修改，无需前端新增接口调用。
+
+语言默认为按系统时区判断：中国大陆及香港、澳门、台湾时区使用中文，其余使用英文（新加坡等同为 UTC+8 的时区不因此使用中文）。支持 Windows 时区 ID 和常见 IANA 别名；Unix 从 `TZ` 或系统时区配置读取。手动 `zh` / `en` 优先于自动判断。源码与运行时下载提示、端口提问、安装结果及首次管理员令牌提醒均使用所选语言，第三方依赖工具日志保持原样。
 
 ### 24.1 新增静态访问行为
 

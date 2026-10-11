@@ -6,7 +6,8 @@ import path from 'node:path';
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // Explicit operator configuration wins. Otherwise a local secret survives reinstall/restart.
-export function resolveAdminToken({ file = path.join(ROOT, 'admin-token.json'), store = null, envToken = process.env.ADMIN_TOKEN, logger = console } = {}) {
+export function resolveAdminToken({ file = path.join(ROOT, 'admin-token.json'), store = null, envToken = process.env.ADMIN_TOKEN, logger = console, language = 'zh' } = {}) {
+  const t = (zh, en) => language === 'en' ? en : zh;
   if (typeof envToken === 'string' && envToken.trim()) return envToken;
   if (store) {
     const saved = store.load();
@@ -17,9 +18,9 @@ export function resolveAdminToken({ file = path.join(ROOT, 'admin-token.json'), 
     const initialized = store.initialize({ token: `kuku-admin-${randomBytes(32).toString('base64url')}` });
     if (!/^kuku-admin-[A-Za-z0-9_-]{43}$/.test(initialized.value?.token ?? '')) throw new Error('Database has an invalid administrator token; restore a verified backup');
     if (initialized.created) {
-      logger.log('首次初始化：已生成管理员强令牌（仅本次显示）：');
+      logger.log(t('首次初始化：已生成管理员强令牌（仅本次显示）：', 'First initialization: administrator token generated (shown only once):'));
       logger.log(initialized.value.token);
-      logger.log('请立即保存此令牌，并在控制台系统设置中填写管理员令牌。令牌已保存在本机 SQLite 数据库，请勿分享。');
+      logger.log(t('请立即保存此令牌，并在控制台系统设置中填写管理员令牌。令牌已保存在本机 SQLite 数据库，请勿分享。', 'Save this token now and enter it in the console administrator settings. It is stored in the local SQLite database; do not share it.'));
     }
     return initialized.value.token;
   }

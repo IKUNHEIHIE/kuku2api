@@ -5,12 +5,15 @@ import { mkdtempSync, mkdirSync, writeFileSync, cpSync, rmSync, symlinkSync, exi
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { createStaticUi } from '../src/static-ui.mjs';
 import { createApp } from '../src/server.mjs';
-import { installOptions, supportedNode, availablePort } from '../scripts/install.mjs';
+import { installOptions, supportedNode, availablePort, choosePort } from '../scripts/install.mjs';
 import { directEnvironment } from '../scripts/start.mjs';
+import { installerLanguage } from '../scripts/install-language.mjs';
+import { listenPort, savedListenPort } from '../src/listen-port.mjs';
+import { openDatabase } from '../src/database.mjs';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 function fixture() {
@@ -26,6 +29,13 @@ async function http(app, fn) {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   try { await fn(`http://127.0.0.1:${server.address().port}`); }
   finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+}
+async function freePort() {
+  const server = createServer();
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  await new Promise(resolve => server.close(resolve));
+  return port;
 }
 
 test('installer accepts supported Node versions and rejects old or malformed versions', () => {
@@ -47,6 +57,7 @@ test('launcher disables every case of upstream proxy variables without changing 
 test('installer detects occupied and invalid ports without disturbing the running service', async () => {
   await http((_req, res) => res.end('alive'), async base => {
     await assert.rejects(availablePort(Number(new URL(base).port)), /in use/);
+    await assert.rejects(availablePort(new URL(base).port, 'zh'), /端口.*无法使用/);
     assert.equal(await (await fetch(base)).text(), 'alive');
   });
   await assert.rejects(availablePort(0), /PORT/);
@@ -92,17 +103,19 @@ test('fresh offline installation initializes SQLite once, preserves accounts/set
     cpSync(path.join(ROOT,'src'), path.join(root,'src'), {recursive:true});
     cpSync(path.join(ROOT,'scripts'), path.join(root,'scripts'), {recursive:true});
     writeFileSync(path.join(root,'package.json'), JSON.stringify({name:'kuku2api',version:'0.2.0',type:'module'}));
-    const env = directEnvironment({ ...process.env, ADMIN_TOKEN:'', DATABASE_FILE:path.join(root,'data/kukuai.sqlite') });
-    const invoke = () => spawnSync(process.execPath, [path.join(root,'scripts/install.mjs'),'--backend-only','--no-start'], {cwd:root,env,encoding:'utf8'});
-    const first = invoke(); assert.equal(first.status, 0, 'Fresh install must succeed');
+    const env = directEnvironment({ ...process.env, PORT: undefined, ADMIN_TOKEN:'', DATABASE_FILE:path.join(root,'data/kukuai.sqlite') });
+    const invoke = (...args) => spawnSync(process.execPath, [path.join(root,'scripts/install.mjs'),'--backend-only','--no-start','--lang','zh', ...args], {cwd:root,env,encoding:'utf8'});
+    const first = invoke('--port', '19876'); assert.equal(first.status, 0, 'Fresh install must succeed');
     assert.match(first.stdout, /kuku2api 0\.2\.0 安装完成/);
     const tokens = first.stdout.match(/kuku-admin-[A-Za-z0-9_-]{43}/g) ?? [];
     assert.equal(tokens.length, 1); assert.match(first.stdout, /保存/);
+    assert.equal(savedListenPort(root, env.DATABASE_FILE), 19876);
     const db = new DatabaseSync(env.DATABASE_FILE);
     db.prepare('INSERT INTO accounts VALUES (?,?)').run('fixture-account', JSON.stringify({id:'fixture-account'}));
     db.prepare('INSERT OR REPLACE INTO settings VALUES (?,?)').run('installation-test', JSON.stringify({preserved:true}));
     db.close();
     const second = invoke(); assert.equal(second.status, 0);
+    assert.match(second.stdout, /127\.0\.0\.1:19876/);
     assert.equal(second.stdout.includes(tokens[0]), false, 'Saved token must not be printed again');
     const restored = new DatabaseSync(env.DATABASE_FILE);
     try {
@@ -111,6 +124,105 @@ test('fresh offline installation initializes SQLite once, preserves accounts/set
       assert.equal(Object.values(restored.prepare('PRAGMA integrity_check').get())[0], 'ok');
     } finally { restored.close(); }
   } finally { rmSync(root, {recursive:true,force:true}); }
+});
+
+test('installer selects language from Chinese time zones rather than a shared UTC offset', () => {
+  for (const zone of ['Asia/Shanghai', 'Asia/Urumqi', 'Asia/Hong_Kong', 'Asia/Macau', 'Asia/Taipei', 'PRC', 'China Standard Time', 'Taipei Standard Time']) {
+    assert.equal(installerLanguage('auto', zone), 'zh', zone);
+  }
+  for (const zone of ['Asia/Singapore', 'Asia/Tokyo', 'Europe/London', 'UTC', '']) assert.equal(installerLanguage('auto', zone), 'en', zone);
+  assert.equal(installerLanguage('en', 'Asia/Shanghai'), 'en');
+  assert.equal(installerLanguage('zh', 'UTC'), 'zh');
+  assert.throws(() => installerLanguage('invalid'), /--lang/);
+});
+
+test('installer flags accept explicit ports and reject missing, fractional or unsafe input', () => {
+  assert.equal(installOptions(['--port', '12345', '--lang', 'en']).port, 12345);
+  assert.equal(installOptions(['--lang', 'zh']).lang, 'zh');
+  for (const value of ['0', '65536', '-1', '1.2', '1e3', '', ' ', 'Infinity']) assert.throws(() => listenPort(value), /PORT/);
+  for (const args of [['--port'], ['--lang'], ['--port', '--no-start'], ['--lang', 'fr']]) assert.throws(() => installOptions(args));
+});
+
+test('interactive port selection retries invalid and occupied ports without touching running services', async () => {
+  const answers = ['not-a-port', '19998', '19999'];
+  const warnings = [], checked = [], prompts = [];
+  const port = await choosePort({ interactive: true, envPort: undefined, savedPort: 19876, language: 'zh',
+    ask: async prompt => { prompts.push(prompt); return answers.shift(); }, warn: text => warnings.push(text),
+    check: async value => { checked.push(value); if (value === 19998) throw new Error('占用'); },
+  });
+  assert.equal(port, 19999); assert.deepEqual(checked, [19998, 19999]);
+  assert.equal(warnings.length, 2); assert.match(warnings[0], /整数/); assert.match(prompts[0], /19876/);
+});
+
+test('port defaults, explicit flags and non-interactive installs never wait for input', async () => {
+  const ask = async () => { throw new Error('must not prompt'); };
+  const check = async () => {};
+  assert.equal(await choosePort({ port: 19001, envPort: '19002', savedPort: 19003, interactive: true, ask, check }), 19001);
+  assert.equal(await choosePort({ envPort: '19002', savedPort: 19003, interactive: false, ask, check }), 19002);
+  assert.equal(await choosePort({ envPort: undefined, savedPort: 19003, interactive: false, ask, check }), 19003);
+  assert.equal(await choosePort({ envPort: undefined, interactive: false, ask, check }), 8787);
+  assert.equal(await choosePort({ envPort: undefined, savedPort: 19003, interactive: true, ask: async () => '', check }), 19003);
+  assert.equal(await choosePort({ port: 19001, start: false, check: async () => { throw new Error('must not check availability'); } }), 19001);
+  await assert.rejects(choosePort({ port: 19001, check: async () => { throw new Error('in use'); } }), /in use/);
+});
+
+test('timezone language and explicit override apply to token reminders in non-interactive installation', () => {
+  const root = fixture();
+  try {
+    cpSync(path.join(ROOT, 'src'), path.join(root, 'src'), { recursive: true });
+    cpSync(path.join(ROOT, 'scripts'), path.join(root, 'scripts'), { recursive: true });
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'kuku2api', type: 'module' }));
+    for (const [zone, override, expected] of [['Asia/Shanghai', null, '首次初始化'], ['America/New_York', null, 'Save this token'], ['Asia/Shanghai', 'en', 'Save this token']]) {
+      const file = path.join(root, `data/${override ?? zone.replaceAll('/', '-')}.sqlite`);
+      const result = spawnSync(process.execPath, [path.join(root, 'scripts/install.mjs'), '--backend-only', '--no-start', ...(override ? ['--lang', override] : [])], {
+        cwd: root, encoding: 'utf8', timeout: 15000, env: directEnvironment({ ...process.env, PORT: '19997', TZ: zone, ADMIN_TOKEN: '', DATABASE_FILE: file }),
+      });
+      assert.equal(result.status, 0); assert.match(result.stdout, new RegExp(expected));
+      if (expected === 'Save this token') assert.equal(/[\u4e00-\u9fff]/u.test(result.stdout), false);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('saved port lookup is read-only and never creates a missing database', () => {
+  const root = fixture();
+  try {
+    const file = path.join(root, 'data/kukuai.sqlite');
+    assert.equal(savedListenPort(root, file), undefined);
+    assert.equal(existsSync(file), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('backend restarts use the SQLite port and allow a temporary PORT override', async () => {
+  const root = fixture();
+  try {
+    cpSync(path.join(ROOT, 'src'), path.join(root, 'src'), { recursive: true });
+    cpSync(path.join(ROOT, 'scripts'), path.join(root, 'scripts'), { recursive: true });
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'kuku2api', type: 'module' }));
+    const env = directEnvironment({ ...process.env, PORT: undefined, ADMIN_TOKEN: '', AUTO_CLAIM: '0', DATABASE_FILE: path.join(root, 'data/kukuai.sqlite') });
+    const savedPort = await freePort(), temporaryPort = await freePort();
+    const install = spawnSync(process.execPath, [path.join(root, 'scripts/install.mjs'), '--backend-only', '--no-start', '--port', String(savedPort)], { cwd: root, env, encoding: 'utf8' });
+    assert.equal(install.status, 0);
+    for (const override of [undefined, String(temporaryPort)]) {
+      const child = spawn(process.execPath, [path.join(root, 'src/server.mjs')], { cwd: root, env: { ...env, PORT: override }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      try {
+        const actual = await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('Backend did not start')), 10000);
+          child.once('error', error => { clearTimeout(timer); reject(error); });
+          child.once('exit', () => { clearTimeout(timer); reject(new Error('Backend exited before listening')); });
+          child.stdout.on('data', data => {
+            const match = /kuku2api on http:\/\/127\.0\.0\.1:(\d+)/.exec(data.toString());
+            if (match) { clearTimeout(timer); resolve(Number(match[1])); }
+          });
+        });
+        assert.equal(actual, Number(override ?? savedPort));
+        assert.equal((await fetch(`http://127.0.0.1:${actual}/healthz`)).status, 200);
+      } finally {
+        const closed = new Promise(resolve => child.once('close', resolve));
+        child.kill(); await closed;
+      }
+    }
+    assert.equal(savedListenPort(root, env.DATABASE_FILE), savedPort);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('static files cannot escape the public directory through a symlink or Windows junction', async () => {
@@ -135,5 +247,17 @@ test('a failed console build stops installation before initializing a database o
     });
     assert.equal(result.status,1); assert.equal(existsSync(database),false);
     assert.equal(/kuku-admin-[A-Za-z0-9_-]{43}/.test(result.stdout),false);
+    const existing = openDatabase({ root, file: database });
+    existing.store('installation').save({ port: 19877, other_setting: true }); existing.close();
+    const retry = spawnSync(process.execPath, [path.join(root, 'scripts/install.mjs'), '--skip-dependencies', '--no-start', '--port', '19878'], {
+      cwd: root, encoding: 'utf8', env: directEnvironment({ ...process.env, ADMIN_TOKEN: '', DATABASE_FILE: database }),
+    });
+    assert.equal(retry.status, 1);
+    assert.equal(savedListenPort(root, database), 19877);
+    const restored = openDatabase({ root, file: database });
+    try {
+      assert.equal(restored.store('installation').load().other_setting, true);
+      assert.equal(restored.store('admin').load().token, undefined);
+    } finally { restored.close(); }
   } finally { rmSync(root,{recursive:true,force:true}); }
 });

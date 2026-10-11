@@ -10,9 +10,9 @@ export function directEnvironment(env = process.env) {
   return result;
 }
 
-export function start(root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')) {
+export function start(root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..'), { port } = {}) {
   const child = spawn(process.execPath, [path.join(root, 'src', 'server.mjs')], {
-    cwd: root, env: directEnvironment(), stdio: 'inherit', windowsHide: true,
+    cwd: root, env: directEnvironment(port === undefined ? process.env : { ...process.env, PORT: String(port) }), stdio: 'inherit', windowsHide: true,
   });
   child.once('error', () => { console.error('Cannot start kuku2api. Check Node.js and directory permissions.'); process.exitCode = 1; });
   child.once('exit', (code, signal) => { process.exitCode = code ?? (signal === 'SIGINT' ? 0 : 1); });

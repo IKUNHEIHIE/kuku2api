@@ -14,6 +14,7 @@ import { openDatabase, createDatabaseLogger } from './database.mjs';
 import { databaseAdminRoute } from './database-api.mjs';
 import { createDesktopLogin } from './desktop-login.mjs';
 import { createStaticUi } from './static-ui.mjs';
+import { listenPort } from './listen-port.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -786,6 +787,7 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   const database = openDatabase({ root: ROOT });
+  const port = listenPort(process.env.PORT ?? database.store('installation').load().port ?? 8787);
   const accountStore = database.store('accounts');
   const loaded = accountStore.load();
   const deviceId = loaded.default_device_id ?? '';
@@ -823,7 +825,6 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
   if (acct) await pool.refreshModelIndex(acct);
   const catalog = getCachedCatalog();
   logger.log(`models: ${catalog?.model_list?.length ?? 0}`);
-  const port = Number(process.env.PORT ?? 8787);
   const server = createServer(app).listen(port, '127.0.0.1', () => logger.log(`kuku2api on http://127.0.0.1:${port}; storage=sqlite`));
   const shutdown = () => { autoClaim.stop(); clearInterval(pruneTimer); server.close(() => { database.close(); process.exit(0); }); };
   process.once('SIGINT', shutdown);
