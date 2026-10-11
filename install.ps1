@@ -83,6 +83,14 @@ try {
       $taskNode = Join-Path $taskRuntime 'node.exe'
     }
   }
+  $taskInstallerSource = Get-Content -LiteralPath (Join-Path $InstallDir 'scripts/install.mjs') -Raw
+  if (-not $taskInstallerSource.Contains('export const INSTALLER_PROTOCOL = 2;') -or
+      -not (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install-language.mjs')) -or
+      -not (Test-Path -LiteralPath (Join-Path $InstallDir 'src/listen-port.mjs'))) {
+    Write-Host (Get-TaskMessage "检测到旧版或不完整的源码目录：$InstallDir" "Outdated or incomplete source directory detected: $InstallDir")
+    Write-Host (Get-TaskMessage '请先停止旧服务并备份自定义源码，再更新该目录的完整源码。Git 安装可运行 git pull --ff-only；压缩包安装请重新下载并解压完整源码。保留 data 目录、数据库和令牌文件。' 'Stop the old service and back up custom code, then update the complete source in this directory. Git installs can use git pull --ff-only; archive installs must download and extract the complete source again. Preserve data, databases and token files.')
+    throw (Get-TaskMessage '安装入口与源码版本不匹配，已停止；数据库和令牌尚未被改动。' 'Installer/source version mismatch; stopped without changing the database or token.')
+  }
   $taskArgs = @('--lang', $Lang)
   if ($PSBoundParameters.ContainsKey('Port')) { $taskArgs += @('--port', "$Port") }
   if ($NoStart) { $taskArgs += '--no-start' }

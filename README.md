@@ -45,6 +45,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\kuku2api-install.
 
 已有 Git 安装目录可先运行 `git pull --ff-only` 获取最新源码，再执行 `install.sh` / `install.ps1` 重建控制台。若有本地代码修改，请先保存；压缩包安装目录需先更新源码，单纯重复运行安装器不会下载覆盖旧代码。全新安装会从 GitHub 的 main 分支下载当前最新前后端。
 
+如果曾遇到 `Unknown installer option: --lang`，表示下载的新入口正在调用安装目录中的旧版 `scripts/install.mjs`。入口现在会在执行前检查兼容版本；发现旧版或不完整源码时停止并提示更新，不会初始化或覆盖数据库、令牌。不要删除旧安装目录或单独替换一个安装文件。
+
+Linux/macOS 通过压缩包安装的默认目录可这样更新（先停止旧服务，并备份自行修改的源码；自定义目录请替换 `$HOME/kuku2api`）：
+
+```bash
+curl -fsSL https://codeload.github.com/IKUNHEIHIE/kuku2api/tar.gz/refs/heads/main -o /tmp/kuku2api-update.tar.gz &&
+tar -xzf /tmp/kuku2api-update.tar.gz -C "$HOME/kuku2api" --strip-components=1 &&
+bash "$HOME/kuku2api/install.sh" --lang zh
+```
+
+源码包不包含本地数据库、令牌及私有运行时，解压更新会替换项目源码，保留现有 `data/`。数据库仍按原有路径读取；如曾设置 `DATABASE_FILE`，更新和启动时沿用相同环境变量。
+
 如果选择其他端口，登录页展开“服务端地址配置”，填写安装器显示的根地址，例如 `http://127.0.0.1:8788`，不要加 `/v1`。管理员可直接读取号池本地状态；模型调用仍使用独立的普通 API 密钥。
 
 关闭终端或按 Ctrl+C 会停止服务。再次启动：
@@ -107,5 +119,5 @@ SQLite 使用 WAL；在线备份请使用 SQLite 一致性备份，或停止服�
 
 ## 验证
 
-后端回归共 275 项，覆盖管理员与普通密钥隔离、流式失败、独立会话、隐私存储、账号保存故障、安装语言、端口保存及重启行为。安装不包含付费模型验收。
+后端核心回归共 275 项，另有 6 项安装入口兼容性检查（按平台运行），覆盖旧版/不完整源码拦截及更新后账号、令牌保留。核心检查覆盖管理员与普通密钥隔离、流式失败、独立会话、隐私存储、账号保存故障、安装语言、端口保存及重启行为。安装不包含付费模型验收。
 

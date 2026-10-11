@@ -81,6 +81,17 @@ else
   mv "$work/node" "$install_dir/.runtime/node"
   node_bin="$install_dir/.runtime/node/bin/node"
 fi
+if ! "$node_bin" -e 'const fs=require("node:fs"),p=require("node:path"),root=process.argv[1];try{process.exit(fs.readFileSync(p.join(root,"scripts/install.mjs"),"utf8").includes("export const INSTALLER_PROTOCOL = 2;")&&["scripts/install-language.mjs","src/listen-port.mjs"].every(file=>fs.existsSync(p.join(root,file)))?0:1)}catch{process.exit(1)}' "$install_dir"; then
+  message "检测到旧版或不完整的源码目录：$install_dir" "Outdated or incomplete source directory detected: $install_dir" >&2
+  message '请先停止旧服务并备份自定义源码，再更新完整源码。数据库和令牌尚未被改动。' 'Stop the old service and back up custom code before updating the complete source. The database and token have not been changed.' >&2
+  if [[ -e "$install_dir/.git" ]]; then
+    printf 'git -C %q pull --ff-only\n' "$install_dir" >&2
+  else
+    printf 'curl -fsSL %q -o /tmp/kuku2api-update.tar.gz && tar -xzf /tmp/kuku2api-update.tar.gz -C %q --strip-components=1\n' "$SOURCE_URL" "$install_dir" >&2
+  fi
+  printf 'bash %q\n' "$install_dir/install.sh" >&2
+  exit 1
+fi
 export PATH="$(dirname -- "$node_bin"):$PATH"
 cd -- "$install_dir"
 "$node_bin" scripts/install.mjs "${options[@]}"

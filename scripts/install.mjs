@@ -10,6 +10,7 @@ import { installerLanguage } from './install-language.mjs';
 import { directEnvironment, start } from './start.mjs';
 
 export const PNPM_VERSION = '10.34.0';
+export const INSTALLER_PROTOCOL = 2;
 export function supportedNode(version) {
   const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version);
   return !!m && (Number(m[1]) > 24 || (Number(m[1]) === 24 && Number(m[2]) >= 15));
