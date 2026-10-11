@@ -15,6 +15,7 @@ const roots = new Set(['src', 'scripts', 'test', 'docs', 'ui', '.github']);
 const rootFiles = new Set(['.gitattributes', '.gitignore', '.npmrc', 'README.md', 'package.json', 'install.sh', 'install.ps1', 'start.sh', 'start.ps1', 'upgrade.sh', 'upgrade.ps1']);
 const forbidden = /^(?:data|capture|analysis)(?:\/|$)|^ui\/\.github(?:\/|$)|(?:^|\/)(?:node_modules|dist|coverage|__screenshots__|\.vitest-attachments|\.tanstack|\.vscode|\.idea|\.git|\.runtime|\.agents|\.codex|\.aws)(?:\/|$)|(?:^|\/)\.env(?:$|\.(?!example$))|\.sqlite[^/]*$|\.db(?:-[^/]*)?$|\.(?:bak|tmp|key|pem)$|(?:^|\/)(?:\.DS_Store|Thumbs\.db)$/;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+const blobHash = bytes => createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
 const git = (root, args) => {
   const result = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', windowsHide: true, timeout: 120000, maxBuffer: 8 * 1024 * 1024 });
   if (result.status !== 0) throw new Error(`Git ${args[0]} failed (exit ${result.status}); local code was not discarded.`);
@@ -109,8 +110,11 @@ export async function manage(root, source, action, args, { build = buildConsole,
         const match = /^(\d+) blob ([a-f0-9]{40})\t([\s\S]+)$/.exec(line);
         if (!match || !installedFiles.has(match[3])) throw new Error('Git update and downloaded archive differ; retry the upgrade');
         const bytes = readFileSync(path.join(source, match[3]));
-        const hash = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
-        if (hash !== match[2]) throw new Error('Git update and downloaded archive differ; retry the upgrade');
+        // GitHub archives honor this repository's *.ps1 text eol=crlf attribute;
+        // the corresponding Git blobs use LF. Do not normalize binary/other files.
+        const archiveHash = blobHash(bytes);
+        const scriptHash = match[3].endsWith('.ps1') ? blobHash(Buffer.from(bytes.toString('utf8').replaceAll('\r\n', '\n'))) : archiveHash;
+        if (archiveHash !== match[2] && scriptHash !== match[2]) throw new Error('Git update and downloaded archive differ; retry the upgrade');
       }
     }
     // Validate every destination before building, stopping, or changing any installed files.

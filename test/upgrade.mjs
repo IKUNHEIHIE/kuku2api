@@ -262,6 +262,9 @@ test('verified stop waits for process exit even when its listener closes before 
 test('clean Git installation upgrades by fast forward and keeps its repository intact', async () => {
   const f = await fixture();
   try {
+    for (const root of [f.root, f.source]) put(root, '.gitattributes', '*.ps1 text eol=crlf\n');
+    put(f.root, 'start.ps1', 'Write-Host "fixture"\n');
+    put(f.source, 'start.ps1', 'Write-Host "fixture"\r\n');
     const { previous, next } = gitUpdate(f);
     const result = await manage(f.root, f.source, 'upgrade', offline);
     assert.equal(git(f.root, 'rev-parse', 'HEAD'), next);
