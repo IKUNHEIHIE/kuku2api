@@ -101,7 +101,8 @@ PORT=8787 API_KEYS=a,b ADMIN_TOKEN=xxx node src/server.mjs
 | `POST /v1/responses` | `API_KEYS` | Responses（含流式） |
 | `GET /v1/responses` | `API_KEYS` | Responses 列表 + 游标分页 |
 | `GET /v1/responses/:id` · `DELETE` | `API_KEYS` | 回查 / 删除单条 |
-| `GET /pool/state` · `GET /pool/health` | `API_KEYS`（**不是**管理令牌） | 号池只读 |
+| `GET /pool/state` | `API_KEYS` 或有效 `ADMIN_TOKEN` | 号池本地状态；管理员无需普通 API 密钥 |
+| `GET /pool/health` | `API_KEYS`（**不是**管理令牌） | 号池上游体检 |
 | `GET /pool/points` | `API_KEYS` | 账号剩余积分（真上游，零积分） |
 | `GET /pool/sessions` | `API_KEYS` | 上游会话列表（真上游，零积分） |
 | `POST/PATCH/DELETE /pool/admin/*` | `ADMIN_TOKEN`（普通 `API_KEYS` 进不来） | 号池写操作 |
@@ -237,7 +238,7 @@ PORT=8787 API_KEYS=a,b ADMIN_TOKEN=xxx node src/server.mjs
 |---|---|---|
 | `x-kuku-account` | 定向某个号（按 `id` 或 `alias`） | **不得绕过 disabled / cooldown / auth_dead**；未知 id → 404 |
 | `x-kuku-allow-unavailable: 1` | 管理端探活专用，允许打停用/冷却中的号 | 普通前端**不要用** |
-| `x-kuku-session` | 复用同一段上游会话 | 不带则按"首个 user 消息前 200 字"自动派生 key |
+| `x-kuku-session` | 复用同一段上游会话 | 不带则新建独立随机会话；Responses 可用 `previous_response_id` 明确续聊 |
 
 ### 响应（非流式，实测）
 
@@ -451,9 +452,9 @@ event: response.completed          最后   response = 完整对象（含 usage�
 
 内部会话键的真实形状（两种，实测而非推测）：
 - 请求带了 `x-kuku-session` → **键就是你传的那个字符串本身**，原样落 ledger（实测 `x-kuku-session: <redacted-local-value>` → ledger 里 `session_key` 就是 `<redacted-local-value>`）
-- 没带 → 由后端推导成 `k:<account>:<首条 user 消息前 200 字>`（`previous_response_id` 续接时沿用上一轮存下来的那个键，不会重新推导）
+- 没带 → 由后端生成独立随机会话键，不按正文匹配旧会话（`previous_response_id` 续接时沿用上一轮存下来的键）
 
-所以**想让会话键可预测，就一直自己带 `x-kuku-session`**；靠 `k:` 那个形状去硬拼迟早会被账号 id 或首条消息变化坑到。
+需要续聊时，请明确复用 `x-kuku-session` 或使用 Responses 的 `previous_response_id`；不要依赖首句相同来恢复会话。没有明确标识的新请求只向上游发送最新用户消息，不会自动重放传入的完整历史。
 
 ### 多轮语义对照（前端最容易搞混的地方）
 
@@ -469,9 +470,13 @@ event: response.completed          最后   response = 完整对象（含 usage�
 
 ## 8. 号池状态与体检（只读）
 
-这两条走**普通 `API_KEYS`**（不是管理令牌），因为它们只读。实测（本机当前池内一个号）：
+`GET /pool/state` 接受普通 API 密钥或有效管理员令牌；`GET /pool/health` 仍走普通 `API_KEYS`。实测（本机当前池内一个号）：
 
 ### `GET /pool/state`
+
+鉴权更新（2026-10-11）：管理员可使用 `x-admin-token: <管理员令牌>` 或 `Authorization: Bearer <管理员令牌>` 读取状态，无需另外配置普通 API 密钥。有效的 `x-admin-token` 独立验证，即使同时携带过期的普通 API 密钥，也能读取状态。普通 API 密钥及未配置任何普通密钥时的本机免鉴权规则保持不变。
+
+此管理员例外仅适用于精确路径 `GET /pool/state`，不适用于 `/v1/*` 模型调用、`/pool/health`、`/pool/points` 等接口；已配置普通 API 密钥时，这些接口仍要求有效的普通 API 密钥。响应字段不变，不返回任何令牌。
 
 ```json
 {
@@ -1473,3 +1478,13 @@ SQLite 的会话映射保存所属账号、已验证上游用户身份和外部�
 ### 24.2 发布与验证
 
 公开源码排除 data/、capture/、analysis/、所有凭据 JSON 与其备份、环境变量私密文件、私有运行时、node_modules、构建输出及浏览器测试截图。前端保留现有源码和模板许可声明。上线命令见项目 README；完整后端回归与安装专项验证均不消费积分。
+
+## 25. 后端审计修复（2026-10-12）
+
+- **Responses 流式失败**：上游在正文或思考增量之后失败，保留已发送的部分正文、思考、已知用量和积分消耗，以 `error` 事件及最终 `response.failed` 事件结束；最终事件包含 `response.status: "failed"`，不发送 `response.completed`。已保存的失败回复可按原规则 GET 查询，SQLite 用量与回复状态一致。思考增量也算已输出，不能因此自动换号重发。流式 HTTP 头发送后状态仍为 200，客户端须检查最终事件；非流式失败返回非 2xx 错误。
+- **新对话隔离**：未提供非空 `x-kuku-session` 且未提供 `previous_response_id` 的请求，每次创建随机独立会话，首句或前 200 字相同不再触发续聊。明确指定的续聊键、账号归属校验和队列规则保持不变。依赖旧自动匹配的客户端应改为明确传会话标识；本次不修改前端源码。
+- **`store:false`**：SQLite 与兼容内存 ledger 仅保留白名单内的回复 ID、账号/会话映射、模型、状态、时间和用量；不保留 `instructions`、输入、正文、思考或任意 metadata。即时返回的 Response 仍可包含本次结果，但 GET 和列表不提供 `store:false` 回复，`previous_response_id` 仍可用于续聊。打开数据库时也清理旧 `store:false` 回复中曾残留的指令和输出；不改动 `store:true` 内容。该清理不擦除上游历史、旧 JSON 或已有备份。
+- **业务错误状态**：上游 HTTP 200 但业务码非零，或返回无法解析的 JSON，均作为 502 错误处理；已识别积分不足仍为 402，明确的请求参数错误仍为 400，超时仍为 504。兼容或自定义错误对象的状态必须是 400–599，不能把业务失败包装成 HTTP 200。
+- **删除/重排账号**：与添加和编辑共用串行修改队列，先保存候选记录，成功后更新运行时号池。保存失败返回 500，内存账号、顺序、优先级和冷却等运行状态保持原样；成功响应结构不变。
+
+新增 8 项隔离反例回归，完整后端检查共 268 项；测试不连接真实上游、不发送付费对话、不领取积分。

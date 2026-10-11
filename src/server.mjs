@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { Pool, sseChunk, makeChunk, getCachedCatalog, unknownModelId, unknownThinkMode } from './gateway.mjs';
 import { UpstreamError } from './upstream.mjs';
-import { toRecords, createKeyRing } from './store.mjs';
+import { createKeyRing } from './store.mjs';
 import { normalizeInput, buildResponse, newResponseId, resolveThink, EFFORT_TO_THINK, ResponseStream } from './responses.mjs';
 import { deriveSessionKey } from './gateway.mjs';
 import { createAccountManager } from './accounts.mjs';
@@ -106,7 +106,8 @@ function failureResponse(err) {
   if (err?.insufficient_balance || Number(err?.code) === 11002) {
     return { status: 402, code: 'insufficient_balance' };
   }
-  return { status: err?.status ?? (err?.network ? 502 : 500),
+  const status = Number(err?.status);
+  return { status: Number.isInteger(status) && status >= 400 && status <= 599 ? status : (err instanceof UpstreamError || err?.network ? 502 : 500),
     code: ['upstream_timeout', 'upstream_incomplete', 'upstream_requires_client', 'session_account_mismatch', 'session_history_unavailable'].includes(err?.code) ? err.code : undefined };
 }
 
@@ -275,7 +276,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
   const controller = new AbortController();
   res.once?.('close', () => { if (!res.writableFinished) controller.abort(); });
   const created = Math.floor(Date.now() / 1000);
-  const sessionKey = prev?.session_key ?? req.headers['x-kuku-session'] ?? deriveSessionKey({ messages, accountId: acct.id });
+  const sessionKey = prev?.session_key ?? deriveSessionKey({ sessionKey: req.headers['x-kuku-session'], messages, accountId: acct.id });
   const stream = body.stream === true;
   const skeleton = buildResponse({
     id,
@@ -312,6 +313,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
           sc ? (delta) => {
             if (controller.signal.aborted) return;
             if (delta.reasoning_content) {
+              sentAny = true;
               if (!sc.reasoningOpen) { sc.reasoningOpen = true; sc.reasoningStarted(); }
               sc.reasoningDelta(delta.reasoning_content);
               sc.reasoningText = (sc.reasoningText ?? '') + delta.reasoning_content;
@@ -341,11 +343,18 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
   }
 
   if (controller.signal.aborted) return;
-  if (lastErr && !sentAny) {
+  if (lastErr) {
     const f = failureResponse(lastErr);
     if (sc) {
-      sc.failed(redact(lastErr.message));
-      return;
+      const observed = lastErr.observation ?? {};
+      const failed = buildResponse({ id, model, created, text: sc.text, thinking: sc.reasoningText ?? '',
+        usage: observed.usage, consume: observed.consume_points, instructions: body.instructions,
+        previous_response_id: prevId, store: body.store, session_id: observed.session_id, reply_id: observed.reply_id,
+        error: { message: redact(lastErr.message), code: f.code ?? 'upstream_error' } });
+      failed.kuku.account = acct.id;
+      ledger?.put({ id, session_key: sessionKey, session_id: observed.session_id ?? null, model, account: acct.id,
+        created_at: created, output_text: sc.text, response: failed });
+      return sc.failed(redact(lastErr.message), failed);
     }
     return openError(res, f.status, redact(lastErr.message), 'upstream_error', f.code);
   }
@@ -401,11 +410,6 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
     if (!adminToken) return false;
     const h = req.headers.authorization ?? '';
     return (h.startsWith('Bearer ') ? h.slice(7) : req.headers['x-admin-token'] ?? '') === adminToken;
-  };
-
-  const persist = () => {
-    if (!store) return;
-    store.save({ default_device_id: deviceId, accounts: toRecords(pool.accounts) });
   };
 
   const shape = (a) => ({
@@ -485,22 +489,14 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
       }
 
       if (m && req.method === 'DELETE') {
-        const id = decodeURIComponent(m[1]);
-        const i = pool.accounts.findIndex((x) => x.id === id);
-        if (i < 0) return openError(res, 404, `unknown account ${id}`);
-        const rec = toRecords(pool.accounts);
-        rec.splice(i, 1);
-        pool.set(rec);
-        for (const a of pool.accounts) a.deviceId = deviceId;
-        persist();
+        const removed = await accountManager.remove(decodeURIComponent(m[1]));
+        if (removed.error) return openError(res, removed.error.status, removed.error.message);
         // Deleting leaves a hole in the priority sequence; the caller can close it with /resequence.
         return json(res, 200, { ok: true, accounts: pool.accounts.map(shape), gap: true });
       }
 
       if (url.pathname === '/pool/admin/resequence' && req.method === 'POST') {
-        pool.accounts.sort((x, y) => x.priority - y.priority);
-        pool.accounts.forEach((a, i) => { a.priority = i; });
-        persist();
+        await accountManager.resequence();
         return json(res, 200, { ok: true, accounts: pool.accounts.map(shape) });
       }
 
@@ -620,7 +616,11 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
     }
 
     if (await serveUi(req, res)) return;
-    if (!authed(req)) return openError(res, 401, 'bad api key');
+    // Console state is readable by admins even when a stale ordinary key is also sent.
+    // Keep this exception scoped to GET state; model and upstream routes still require API keys.
+    const adminState = req.method === 'GET' && url.pathname === '/pool/state' && adminToken &&
+      (req.headers['x-admin-token'] === adminToken || admined(req));
+    if (!adminState && !authed(req)) return openError(res, 401, 'bad api key');
 
     if (url.pathname === '/v1/models') {
       let d = getCachedCatalog();

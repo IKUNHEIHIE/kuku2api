@@ -117,6 +117,7 @@ export function Chats() {
     () => sessionKeyFromUrl || initialActiveSession?.sessionKey || 'session-1'
   )
   const [models, setModels] = useState<ModelItem[]>([])
+  const [modelError, setModelError] = useState<string | null>(null)
   const [thinkList, setThinkList] = useState<ThinkModeItem[]>([])
   const [selectedModel, setSelectedModel] = useState<string>(
     () => modelFromUrl || initialActiveSession?.model || 'gateway-glm-5.3-flash'
@@ -260,11 +261,16 @@ export function Chats() {
   useEffect(() => {
     async function loadData() {
       try {
+        let mErr: string | null = null
         const [modelsRes, poolRes, pointsRes] = await Promise.all([
-          kukuApi.getModels().catch(() => null),
+          kukuApi.getModels().catch((err: unknown) => {
+            mErr = err instanceof Error ? err.message : String(err)
+            return null
+          }),
           kukuApi.getPoolState().catch(() => null),
           kukuApi.getPoolPoints().catch(() => null),
         ])
+        setModelError(mErr)
 
         if (pointsRes) {
           setPoolPoints(pointsRes)
@@ -457,11 +463,13 @@ export function Chats() {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
       setIsGenerating(false)
-      const stopped = messages.map((m) =>
-        m.isStreaming ? { ...m, isStreaming: false } : m
-      )
-      setMessages(stopped)
-      persistSession(stopped)
+      setMessages((prev) => {
+        const stopped = prev.map((m) =>
+          m.isStreaming ? { ...m, isStreaming: false } : m
+        )
+        persistSession(stopped)
+        return stopped
+      })
     }
   }
 
@@ -983,9 +991,33 @@ export function Chats() {
 
       <Main fixed className='flex flex-col p-4 md:p-6 gap-3'>
         {models.length === 0 && (
-          <div className='flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-800 dark:text-amber-300'>
-            <AlertTriangle size={15} className='shrink-0 text-amber-600 dark:text-amber-400' />
-            <span>上游模型目录暂未拉取到或暂不可达，请检查后端运行状态 (/healthz) 与号池配置 (/pool/state)。</span>
+          <div className='flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-800 dark:text-amber-300'>
+            <div className='flex items-center gap-2'>
+              <AlertTriangle size={15} className='shrink-0 text-amber-600 dark:text-amber-400' />
+              <span>
+                {modelError?.includes('bad api key') || modelError?.includes('401')
+                  ? '未获取到模型目录：当前未配置普通 API 密钥 (401 bad api key)。/v1/models 接口要求使用普通 API 密钥鉴权。'
+                  : modelError
+                    ? `获取模型目录失败: ${modelError}。请检查后端连接与上游账号健康状态。`
+                    : '上游模型目录返回为空。号池可能存在账号但均未登录有效或上游不可达，请在「号池管理」中执行体检并确认状态。'}
+              </span>
+            </div>
+            {(modelError?.includes('bad api key') || modelError?.includes('401')) && (
+              <div className='flex items-center gap-3 shrink-0'>
+                <a
+                  href='/keys'
+                  className='text-xs underline font-semibold text-amber-900 dark:text-amber-200 hover:opacity-80'
+                >
+                  前往「API密钥」
+                </a>
+                <a
+                  href='/settings'
+                  className='text-xs underline font-semibold text-amber-900 dark:text-amber-200 hover:opacity-80'
+                >
+                  填写连接配置
+                </a>
+              </div>
+            )}
           </div>
         )}
 

@@ -745,10 +745,6 @@ async function apiRequest<T>(
     if (apiKey) {
       safeSetHeader(headers, 'Authorization', `Bearer ${apiKey}`)
       safeSetHeader(headers, 'x-api-key', apiKey)
-    } else if (adminToken) {
-      // 管理后台免填 API 密钥模式：若尚未配置普通 apiKey，自动透传 adminToken 作为授权凭证
-      safeSetHeader(headers, 'Authorization', `Bearer ${adminToken}`)
-      safeSetHeader(headers, 'x-api-key', adminToken)
     }
   }
 
@@ -1188,10 +1184,9 @@ export const kukuApi = {
     if (adminToken) {
       safeSetHeader(headers, 'x-admin-token', adminToken)
     }
-    const tokenToUse = apiKey || adminToken
-    if (tokenToUse) {
-      safeSetHeader(headers, 'Authorization', `Bearer ${tokenToUse}`)
-      safeSetHeader(headers, 'x-api-key', tokenToUse)
+    if (apiKey) {
+      safeSetHeader(headers, 'Authorization', `Bearer ${apiKey}`)
+      safeSetHeader(headers, 'x-api-key', apiKey)
     }
     if (account && account !== 'auto') {
       const safeAccount = !isSafeHeaderString(account) ? encodeURI(account) : account
@@ -1356,10 +1351,9 @@ export const kukuApi = {
     if (adminToken) {
       safeSetHeader(headers, 'x-admin-token', adminToken)
     }
-    const tokenToUse = apiKey || adminToken
-    if (tokenToUse) {
-      safeSetHeader(headers, 'Authorization', `Bearer ${tokenToUse}`)
-      safeSetHeader(headers, 'x-api-key', tokenToUse)
+    if (apiKey) {
+      safeSetHeader(headers, 'Authorization', `Bearer ${apiKey}`)
+      safeSetHeader(headers, 'x-api-key', apiKey)
     }
     if (account && account !== 'auto') {
       const safeAccount = !isSafeHeaderString(account) ? encodeURI(account) : account

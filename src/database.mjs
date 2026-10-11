@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { existsSync, readFileSync, mkdirSync, openSync, closeSync, chmodSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { responseRecordForStorage } from './ledger.mjs';
 
 export const SYSTEM_DEFAULTS = { site_name: 'kuku2api', log_retention_days: 30, conversation_retention_days: 0 };
 const parse = (s) => {
@@ -112,7 +113,7 @@ export function openDatabase({ root, file = process.env.DATABASE_FILE || path.jo
   const ledger = {
     get(id) { const r = sql.prepare('SELECT data FROM responses WHERE id=?').get(id); return r ? parse(r.data) : null; },
     put(rec) {
-      const saved = rec.response?.store === false ? { ...rec, output_text: '', response: { ...rec.response, output: [], output_text: '' } } : rec;
+      const saved = responseRecordForStorage(rec);
       sql.prepare('INSERT INTO responses(id,created_at,data) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(saved.id, saved.created_at ?? 0, encode(saved)); return rec;
     },
     del(id) {
@@ -281,6 +282,13 @@ export function openDatabase({ root, file = process.env.DATABASE_FILE || path.jo
   };
   try {
     if (migrate && root) migrateLegacy();
+    // Also remove content retained by older store:false records, without touching stored replies.
+    transaction(() => {
+      for (const row of sql.prepare("SELECT id,data FROM responses WHERE json_extract(data,'$.response.store') IS 0").all()) {
+        const sanitized = encode(responseRecordForStorage(parse(row.data)));
+        if (sanitized !== row.data) sql.prepare('UPDATE responses SET data=? WHERE id=?').run(sanitized, row.id);
+      }
+    });
     store('system').initialize(SYSTEM_DEFAULTS);
   }
   catch (e) { sql.close(); throw e; }

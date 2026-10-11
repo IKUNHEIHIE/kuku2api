@@ -455,6 +455,7 @@ export class Pool {
 
   async chat(args, onDelta = () => {}, signal) {
     const logicalKey = deriveSessionKey({ sessionKey: args.sessionKey, messages: args.messages, accountId: args.account.id });
+    args = { ...args, sessionKey: logicalKey };
     // Every entry point (Chat, Responses, reward earning) shares this account-scoped queue.
     return this.serialize(`chat:${accountSessionKey(args.account.id, logicalKey)}`, () => this.recordedChat(args, onDelta, signal));
   }
@@ -479,6 +480,7 @@ export class Pool {
       }
     }
     if (error) {
+      error.observation = observation;
       try { this.logger.warn('inference failed:', args.source ?? 'chat', args.account.id, args.model.id, error.message); }
       catch { console.error('Database inference error log could not be saved'); }
       throw error;
@@ -632,8 +634,7 @@ export class Pool {
 // history, so turns are serialised per session key.
 export function deriveSessionKey({ sessionKey, messages, accountId }) {
   if (sessionKey) return sessionKey;
-  const firstUser = messages.find((m) => m.role === 'user')?.content ?? '';
-  return `k:${accountId}:${String(firstUser).slice(0, 200)}`;
+  return `new:${crypto.randomUUID()}`;
 }
 
 // Treat every external key as opaque; even a key resembling this format is encoded again.

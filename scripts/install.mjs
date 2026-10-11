@@ -39,6 +39,7 @@ export async function install(root, args) {
   if (!supportedNode(process.versions.node)) throw new Error('Node.js >=24.15.0 is required. Run install.sh or install.ps1 to install a private runtime.');
   const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
   if (manifest.name !== 'kuku2api') throw new Error('This is not a kuku2api source directory');
+  console.log(`正在安装 kuku2api ${manifest.version ?? '(本地源码)'}${options.ui ? '，包含最新控制台' : '（仅后端）'}。`);
   if (options.start) await availablePort(Number(process.env.PORT ?? 8787));
   // Build first: a dependency/build failure must not initialize or replace a database/token.
   if (options.ui) {
@@ -62,8 +63,9 @@ export async function install(root, args) {
   const database = openDatabase({ root });
   try { resolveAdminToken({ store: database.store('admin') }); }
   finally { database.close(); }
-  console.log('安装完成。请保存上方首次生成的管理员令牌；再次安装会复用已有数据库与令牌。');
+  console.log(`kuku2api ${manifest.version ?? '(本地源码)'} 安装完成。请保存上方首次生成的管理员令牌；再次安装会复用已有数据库与令牌。`);
   console.log(`控制台 / API: http://127.0.0.1:${process.env.PORT ?? 8787}${options.ui ? '' : ' (仅后端；未构建控制台)'}`);
+  if (options.ui) console.log(`登录页的“服务端地址配置”应填写 http://127.0.0.1:${process.env.PORT ?? 8787}（不要加 /v1），管理员令牌与普通 API 密钥分别填写。`);
   console.log('自动领取默认关闭。关闭终端会停止前台服务；再次运行 start.sh 或 start.ps1 启动。');
   if (options.start) start(root);
 }

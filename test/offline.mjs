@@ -661,7 +661,8 @@ await t('business failure cools the account and retries the next', async () => {
   const p = mkPool(2);
   const res = await callChat(p, { model: 'gateway-glm-5.3-flash', messages: [{ role: 'user', content: 'hi' }] });
   assert.ok(p.accounts[0].cooldown_until > Date.now(), 'deterministic failure must cool the account');
-  assert.equal(res.statusCode, 200);
+  assert.equal(res.statusCode, 502, 'the stub rejects every account; exhaustion must not return HTTP 200');
+  assert.equal(hits.sendmsg, 2, 'both accounts were attempted');
 });
 await t('http 400 cools nothing and returns 400', async () => {
   mode.failSendmsg = 'param';
@@ -729,7 +730,9 @@ await t('auth failure during a turn marks the account dead and fails over', asyn
   const p = mkPool(2);
   const res = await callChat(p, { model: 'gateway-glm-5.3-flash', messages: [{ role: 'user', content: 'hi' }] });
   assert.equal(p.accounts[0].auth_dead, true);
-  assert.equal(res.statusCode, 200, 'second account served it');
+  assert.equal(res.statusCode, 502, 'the stub rejects both accounts, so neither served a reply');
+  assert.equal(p.accounts[1].auth_dead, true);
+  assert.equal(hits.sendmsg, 2);
 });
 
 console.log('\n== points balance ==');
@@ -1996,7 +1999,9 @@ await t('stream failure surfaces an error event and stops', async () => {
   const res = mockRes();
   await respApp(p)(mockReq({}, '/v1/responses', 'POST', { model: 'gateway-glm-5.3-flash', input: 'hi', stream: true }), res);
   const evts = sseEvents(res.body);
-  assert.equal(evts.at(-1).type, 'error');
+  assert.ok(evts.some(e => e.type === 'error'));
+  assert.equal(evts.at(-1).type, 'response.failed');
+  assert.equal(evts.at(-1).response.status, 'failed');
   assert.ok(!res.body.includes('gxNjREZlJmU2RQ'));
 });
 await t('concurrent turns on one session serialize instead of interleaving', async () => {

@@ -100,7 +100,7 @@ export class KukuAccount {
     try {
       parsed = JSON.parse(text);
     } catch {
-      throw new UpstreamError('non-json body', { status: res.status, body: text });
+      throw new UpstreamError('non-json body', { status: 502, body: text });
     }
     // Two different success envelopes live upstream: `/wenchain/*` and `/bizapi/*` answer
     // `{status:{code}}`, while `/api/genflowpro/*` answers `{errno,show_msg}` with no status
@@ -110,7 +110,7 @@ export class KukuAccount {
     const code = st ? st.code : parsed.errno;
     if (code !== 0) {
       const msg = (st ? st.msg : parsed.show_msg ?? parsed.errmsg) ?? '';
-      throw new UpstreamError(`code=${code} ${msg}`, { code, status: res.status, body: parsed });
+      throw new UpstreamError(`code=${code} ${msg}`, { code, status: 502, body: parsed });
     }
     return parsed.data ?? {};
   }

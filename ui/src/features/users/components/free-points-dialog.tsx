@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import {
   Gift,
   RotateCw,
@@ -61,7 +61,7 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
   const [loading, setLoading] = useState(false)
   const [taskAccounts, setTaskAccounts] = useState<AccountFreePointTasks[]>([])
   const [autoClaim, setAutoClaim] = useState<AutoClaimResponse | null>(null)
-  const [runChat, setRunChat] = useState<boolean>(false)
+  const [runChat, setRunChat] = useState<boolean>(true)
   const [claiming, setClaiming] = useState<string | null>(null)
   const [runningAutoClaim, setRunningAutoClaim] = useState(false)
   const [updatingAutoClaim, setUpdatingAutoClaim] = useState(false)
@@ -105,8 +105,16 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
   }, [setAutoClaimState])
 
   useEffect(() => {
+    let ignore = false
     if (open) {
-      void loadData()
+      void (async () => {
+        if (!ignore) {
+          await loadData()
+        }
+      })()
+    }
+    return () => {
+      ignore = true
     }
   }, [open, loadData])
 
@@ -180,7 +188,11 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
           toast.info('定时任务执行完毕：各账号今日已无新增可领积分')
         }
 
-        await Promise.all([loadData(), refreshAccounts(), runPointsCheck()])
+        await Promise.all([
+          loadData(),
+          refreshAccounts(),
+          runPointsCheck(undefined, { silent: true }).catch(() => {}),
+        ])
       }
     } catch (err: unknown) {
       toast.error('执行每日任务失败: ' + (err instanceof Error ? err.message : String(err)))
@@ -233,7 +245,11 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
           toast.info(`${targetDesc} 操作完成：今日已无新增可领积分（已领取过或未达标）`)
         }
 
-        await Promise.all([loadData(), refreshAccounts(), runPointsCheck(accountId)])
+        await Promise.all([
+          loadData(),
+          refreshAccounts(),
+          runPointsCheck(accountId, { silent: true }).catch(() => {}),
+        ])
       }
     } catch (err: unknown) {
       toast.error('领取积分失败: ' + (err instanceof Error ? err.message : String(err)))
@@ -242,20 +258,65 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
     }
   }
 
-  // Calculate total claimable points across all accounts
-  const totalClaimablePoints = taskAccounts.reduce((acc, a) => {
-    const accountSum = (a.tasks || []).reduce((sum, t) => sum + (t.claimable_point > 0 ? t.claimable_point : 0), 0)
-    return acc + accountSum
-  }, 0)
+  // 1. 现有已就绪、直接可领取的积分总和（例如签到积分、或者之前已完成对话但未点领取的积分）
+  const directClaimablePoints = useMemo(() => {
+    return taskAccounts.reduce((acc, a) => {
+      const accountSum = (a.tasks || []).reduce(
+        (sum, t) => sum + (t.claimable_point > 0 ? t.claimable_point : 0),
+        0
+      )
+      return acc + accountSum
+    }, 0)
+  }, [taskAccounts])
 
-  // Can single account claim in batch mode?
-  const canAccountClaim = (a: AccountFreePointTasks) => {
-    const hasClaimable = (a.tasks || []).some((t) => t.claimable_point > 0)
-    const hasChatTask = runChat && (a.tasks || []).some((t) => (t.task_type === 'CHAT' || t.task_key === 'daily_chat') && t.task_status !== 'FINISHED')
-    return hasClaimable || hasChatTask
-  }
+  // 2. 待完成日常对话任务（daily_chat / CHAT）的账号统计与预期可得积分（每号通常为 50 pts）
+  const { pendingChatAccountsCount, potentialChatPoints } = useMemo(() => {
+    return taskAccounts.reduce(
+      (acc, a) => {
+        const chatTask = (a.tasks || []).find(
+          (t) =>
+            (t.task_type === 'CHAT' || t.task_key === 'daily_chat') &&
+            t.task_status !== 'FINISHED' &&
+            (t.claimable_point ?? 0) === 0
+        )
+        if (chatTask) {
+          acc.pendingChatAccountsCount += 1
+          acc.potentialChatPoints += chatTask.reward_point > 0 ? chatTask.reward_point : 50
+        }
+        return acc
+      },
+      { pendingChatAccountsCount: 0, potentialChatPoints: 0 }
+    )
+  }, [taskAccounts])
 
-  const canClaimAny = taskAccounts.some((a) => canAccountClaim(a))
+  // 3. 当前勾选配置下预期可领取的总积分：
+  // 若勾选了 runChat（完成一次对话再领），预期总积分为直接可领 + 对话任务预期积分；
+  // 若未勾选，仅为直接可领积分。
+  const expectedTotalPoints = useMemo(() => {
+    return runChat
+      ? directClaimablePoints + potentialChatPoints
+      : directClaimablePoints
+  }, [runChat, directClaimablePoints, potentialChatPoints])
+
+  // 4. 单账号能否参与一键领取
+  const canAccountClaim = useCallback(
+    (a: AccountFreePointTasks) => {
+      const hasClaimable = (a.tasks || []).some((t) => t.claimable_point > 0)
+      const hasChatTask =
+        runChat &&
+        (a.tasks || []).some(
+          (t) =>
+            (t.task_type === 'CHAT' || t.task_key === 'daily_chat') &&
+            t.task_status !== 'FINISHED'
+        )
+      return hasClaimable || hasChatTask
+    },
+    [runChat]
+  )
+
+  const canClaimAny = useMemo(() => {
+    return taskAccounts.some((a) => canAccountClaim(a))
+  }, [taskAccounts, canAccountClaim])
 
   const formatDateTime = (ts?: number | null) => {
     if (!ts) return '—'
@@ -263,13 +324,22 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
   }
 
   // Displayed accounts based on filter selector
-  const displayedAccounts =
-    selectedFilterAccount === 'all'
+  const displayedAccounts = useMemo(() => {
+    return selectedFilterAccount === 'all'
       ? taskAccounts
       : taskAccounts.filter((a) => a.id === selectedFilterAccount)
+  }, [selectedFilterAccount, taskAccounts])
+
+  const handleOpenChange = (newOpen: boolean) => {
+    if (!newOpen) {
+      setUserSelectedAccount(null)
+      setExecutionReport(null)
+    }
+    onOpenChange(newOpen)
+  }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className='sm:max-w-3xl max-h-[90vh] overflow-y-auto'>
         <DialogHeader className='text-start'>
           <div className='flex items-center justify-between'>
@@ -484,12 +554,19 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
                   className='mt-1'
                 />
                 <div className='space-y-0.5'>
-                  <Label htmlFor='chat-option' className='text-xs font-semibold cursor-pointer flex items-center gap-1.5'>
-                    <MessageSquare size={13} className='text-amber-600 dark:text-amber-400' />
-                    <span>全号池批量：完成一次对话再领 (chat: true)</span>
-                  </Label>
+                  <div className='flex items-center gap-2'>
+                    <Label htmlFor='chat-option' className='text-xs font-semibold cursor-pointer flex items-center gap-1.5'>
+                      <MessageSquare size={13} className='text-amber-600 dark:text-amber-400' />
+                      <span>全号池批量：完成一次对话再领 (chat: true)</span>
+                    </Label>
+                    {pendingChatAccountsCount > 0 && (
+                      <Badge variant='outline' className='text-[10px] bg-amber-500/10 text-amber-700 dark:text-amber-300 border-amber-500/30 font-mono'>
+                        含 {pendingChatAccountsCount} 个账号待对话 (+{potentialChatPoints} pts)
+                      </Badge>
+                    )}
+                  </div>
                   <p className='text-[11px] text-muted-foreground leading-relaxed'>
-                    ⚠️ 勾选后「一键领取所有账号」将自动为所有未完成日常对话的账号消耗一轮微型推理（仅花 ~0.01 积分）完成上游 <code className='font-mono font-semibold'>daily_chat</code> 任务，从而领取 <strong>50 免费积分</strong>。默认不勾选。
+                    ⚠️ 勾选后「一键领取所有账号」将自动为所有未完成日常对话的账号消耗一轮微型推理（仅花 ~0.01 积分）完成上游 <code className='font-mono font-semibold'>daily_chat</code> 任务，从而领取 <strong>50 免费积分</strong>。默认开启。
                   </p>
                 </div>
               </div>
@@ -505,7 +582,15 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
                 ) : (
                   <Sparkles size={14} />
                 )}
-                <span>一键领取所有账号积分 ({totalClaimablePoints} pts 可领)</span>
+                <span>
+                  {runChat
+                    ? expectedTotalPoints > 0
+                      ? `一键对话并领取全部账号 (+${expectedTotalPoints} pts 预期)`
+                      : `一键领取所有账号积分 (${directClaimablePoints} pts 可领)`
+                    : directClaimablePoints > 0
+                      ? `一键领取现有直接积分 (${directClaimablePoints} pts 可领)`
+                      : `今日积分已全部领完 (0 pts)`}
+                </span>
               </Button>
             </div>
             <div className='text-[11px] text-muted-foreground bg-muted/30 px-2.5 py-1.5 rounded border border-border/40'>
@@ -588,7 +673,12 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
 
                     <div className='flex flex-wrap items-center gap-2'>
                       <span className='text-xs font-mono text-muted-foreground mr-1'>
-                        当前可领: <strong className='text-emerald-600 dark:text-emerald-400 font-semibold'>{claimableSum}</strong> pts
+                        直接可领: <strong className='text-emerald-600 dark:text-emerald-400 font-semibold'>{claimableSum}</strong> pts
+                        {chatTask && chatTask.task_status !== 'FINISHED' && (
+                          <span className='ml-1 text-[11px] text-amber-600 dark:text-amber-400 font-medium'>
+                            (对话可得 +{chatTask.reward_point || 50} pts)
+                          </span>
+                        )}
                       </span>
 
                       {/* 1. 对话任务专属单号按钮 */}
@@ -661,7 +751,7 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
                           (account.tasks || []).map((t, idx) => {
                             const isChatTask = t.task_type === 'CHAT' || t.task_key === 'daily_chat'
                             return (
-                              <TableRow key={idx} className='text-xs hover:bg-muted/30'>
+                              <TableRow key={t.task_key || idx} className='text-xs hover:bg-muted/30'>
                                 <TableCell className='font-medium py-2'>
                                   <div className='flex items-center gap-1.5'>
                                     <span>{t.task_name || t.task_key}</span>

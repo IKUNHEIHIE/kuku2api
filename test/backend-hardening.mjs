@@ -77,6 +77,49 @@ test('a generated administrator token protects existing routes; the old demo tok
   }
 });
 
+test('administrators can read GET pool state independently of ordinary keys without authorizing model calls', async () => {
+  const pool = new Pool([]);
+  const app = createApp({ pool, adminToken: 'fake-admin', apiKeys: ['fake-api-key'] });
+  async function call(headers, url = '/pool/state', method = 'GET', target = app) {
+    const req = { url, method, headers, async *[Symbol.asyncIterator]() {} };
+    const res = { statusCode: null, writeHead(status) { this.statusCode = status; }, end(body) { this.body = JSON.parse(body); } };
+    await target(req, res);
+    return res;
+  }
+  for (const headers of [
+    { 'x-admin-token': 'fake-admin' },
+    { authorization: 'Bearer fake-admin' },
+    { 'x-admin-token': 'fake-admin', authorization: 'Bearer stale-key', 'x-api-key': 'stale-key' },
+    { 'x-admin-token': 'wrong-admin', authorization: 'Bearer fake-admin' },
+    { authorization: 'Bearer fake-api-key' },
+    { 'x-api-key': 'fake-api-key', 'x-admin-token': 'wrong-admin' },
+  ]) {
+    const res = await call(headers);
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.body.accounts, []);
+    assert.equal(res.body.admin_enabled, true);
+    assert.equal(res.body.api_open, false);
+    assert.equal(res.body.api_key_count, 1);
+    assert.ok(!JSON.stringify(res.body).includes('fake-admin'));
+  }
+  for (const headers of [{}, { 'x-admin-token': 'wrong-admin' }, { authorization: 'Bearer stale-key' }]) {
+    assert.equal((await call(headers)).statusCode, 401);
+  }
+  for (const [method, url] of [
+    ['POST', '/v1/chat/completions'], ['POST', '/v1/responses'], ['GET', '/v1/models'],
+    ['GET', '/v1/responses'], ['GET', '/pool/health'], ['GET', '/pool/points'],
+    ['POST', '/pool/state'], ['GET', '/pool/state/'],
+  ]) {
+    for (const headers of [{ 'x-admin-token': 'fake-admin' }, { authorization: 'Bearer fake-admin', 'x-admin-token': 'fake-admin' }]) {
+      assert.equal((await call(headers, url, method)).statusCode, 401, `${method} ${url}`);
+    }
+  }
+  const noAdmin = createApp({ pool, apiKeys: ['fake-api-key'] });
+  assert.equal((await call({ 'x-admin-token': '' }, '/pool/state', 'GET', noAdmin)).statusCode, 401);
+  const local = createApp({ pool });
+  assert.equal((await call({}, '/pool/state', 'GET', local)).statusCode, 200);
+});
+
 function rewardPool({ chatReady = false, failedReward = null, refusedReward = null } = {}) {
   const pool = new Pool([{ id: 'fake', bduss: 'FAKE-BDUSS', stoken: 'FAKE-STOKEN', priority: 0 }]);
   const paid = new Set();

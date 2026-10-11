@@ -39,7 +39,9 @@ test('identical custom keys and default prompts allocate different upstream sess
   for (const key of ['shared', null]) {
     const a = await s.chat('a', key); const b = await s.chat('b', key);
     assert.notEqual(a.session_id, b.session_id);
-    assert.equal((await s.chat('a', key)).session_id, a.session_id);
+    const next = await s.chat('a', key);
+    if (key) assert.equal(next.session_id, a.session_id);
+    else assert.notEqual(next.session_id, a.session_id, 'no explicit key means a new conversation');
   }
   assert.ok(s.calls.send.every(c => c.session_id.startsWith(`session-${c.account}-`)));
 });

@@ -91,10 +91,11 @@ test('fresh offline installation initializes SQLite once, preserves accounts/set
   try {
     cpSync(path.join(ROOT,'src'), path.join(root,'src'), {recursive:true});
     cpSync(path.join(ROOT,'scripts'), path.join(root,'scripts'), {recursive:true});
-    writeFileSync(path.join(root,'package.json'), JSON.stringify({name:'kuku2api',type:'module'}));
+    writeFileSync(path.join(root,'package.json'), JSON.stringify({name:'kuku2api',version:'0.2.0',type:'module'}));
     const env = directEnvironment({ ...process.env, ADMIN_TOKEN:'', DATABASE_FILE:path.join(root,'data/kukuai.sqlite') });
     const invoke = () => spawnSync(process.execPath, [path.join(root,'scripts/install.mjs'),'--backend-only','--no-start'], {cwd:root,env,encoding:'utf8'});
     const first = invoke(); assert.equal(first.status, 0, 'Fresh install must succeed');
+    assert.match(first.stdout, /kuku2api 0\.2\.0 安装完成/);
     const tokens = first.stdout.match(/kuku-admin-[A-Za-z0-9_-]{43}/g) ?? [];
     assert.equal(tokens.length, 1); assert.match(first.stdout, /保存/);
     const db = new DatabaseSync(env.DATABASE_FILE);

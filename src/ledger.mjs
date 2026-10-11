@@ -1,5 +1,22 @@
 // Response ledger: previous_response_id must resolve back to the upstream session, so the
 // mapping has to survive a restart. In-memory for lookups, debounced to disk.
+export function responseRecordForStorage(rec) {
+  if (rec.response?.store !== false) return rec;
+  const response = { store: false, instructions: null, output: [], output_text: '' };
+  for (const key of ['id', 'object', 'created_at', 'status', 'completed_at', 'model', 'previous_response_id', 'usage']) {
+    if (rec.response[key] !== undefined) response[key] = rec.response[key];
+  }
+  response.kuku = {};
+  for (const key of ['account', 'session_id', 'reply_id', 'consume_points']) {
+    if (rec.response.kuku?.[key] !== undefined) response.kuku[key] = rec.response.kuku[key];
+  }
+  const saved = { response, output_text: '' };
+  for (const key of ['id', 'session_key', 'session_id', 'model', 'account', 'created_at']) {
+    if (rec[key] !== undefined) saved[key] = rec[key];
+  }
+  return saved;
+}
+
 export function createLedger(store, { max = 500 } = {}) {
   const map = new Map();
   let order = [];
@@ -9,7 +26,7 @@ export function createLedger(store, { max = 500 } = {}) {
     try {
       const loaded = store.load();
       for (const rec of loaded.responses ?? []) {
-        map.set(rec.id, rec);
+        map.set(rec.id, responseRecordForStorage(rec));
         order.push(rec.id);
       }
     } catch {
@@ -34,7 +51,7 @@ export function createLedger(store, { max = 500 } = {}) {
       return map.get(id) ?? null;
     },
     put(rec) {
-      map.set(rec.id, rec);
+      map.set(rec.id, responseRecordForStorage(rec));
       order.push(rec.id);
       while (order.length > max) {
         const old = order.shift();

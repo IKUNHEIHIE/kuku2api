@@ -107,5 +107,20 @@ export function createAccountManager({ pool, store, deviceId, initializeDesktop 
       return { ok: true, account: a };
     });
   }
-  return { add, patch };
+  function remove(id) {
+    return serial(() => {
+      if (!pool.accounts.some(a => a.id === id)) return failure(404, `unknown account ${id}`);
+      commit(toRecords(pool.accounts).filter(a => a.id !== id));
+      return { ok: true };
+    });
+  }
+  function resequence() {
+    return serial(() => {
+      const records = toRecords(pool.accounts).sort((a, b) => a.priority - b.priority);
+      records.forEach((a, i) => { a.priority = i; });
+      commit(records);
+      return { ok: true };
+    });
+  }
+  return { add, patch, remove, resequence };
 }

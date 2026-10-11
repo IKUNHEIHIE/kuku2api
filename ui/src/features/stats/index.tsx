@@ -500,7 +500,7 @@ export function StatsFeature() {
                   </TableRow>
                 ) : (
                   stats.groups.map((g, idx) => (
-                    <TableRow key={idx} className='text-xs font-mono hover:bg-muted/40'>
+                    <TableRow key={g.bucket || idx} className='text-xs font-mono hover:bg-muted/40'>
                       <TableCell className='font-semibold text-foreground'>{g.bucket || '—'}</TableCell>
                       <TableCell className='text-right'>{formatNumber(g.attempts)}</TableCell>
                       <TableCell className='text-right'>

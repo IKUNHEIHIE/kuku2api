@@ -40,7 +40,7 @@ export type UsersContextType = {
   setGap: (gap: boolean) => void
   refreshAccounts: () => Promise<void>
   runHealthCheck: (accountId?: string) => Promise<void>
-  runPointsCheck: (accountId?: string) => Promise<void>
+  runPointsCheck: (accountId?: string, options?: { silent?: boolean }) => Promise<void>
   resetCooldown: (accountId?: string) => Promise<void>
   resequence: () => Promise<void>
   deleteAccount: (id: string) => Promise<void>
@@ -156,35 +156,38 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
     }
   }, [])
 
-  const runHealthCheck = async (accountId?: string) => {
-    try {
-      setCheckingHealth(true)
-      const res = await kukuApi.getPoolHealth(accountId)
-      setHealthResults((prev) => {
-        const next = { ...prev }
-        for (const item of res.accounts) {
-          next[item.id] = item
+  const runHealthCheck = useCallback(
+    async (accountId?: string) => {
+      try {
+        setCheckingHealth(true)
+        const res = await kukuApi.getPoolHealth(accountId)
+        setHealthResults((prev) => {
+          const next = { ...prev }
+          for (const item of res.accounts) {
+            next[item.id] = item
+          }
+          return next
+        })
+
+        const allOk = res.accounts.every((a) => a.ok)
+        if (allOk) {
+          toast.success(accountId ? `账号 ${accountId} 体检通过，登录态有效` : '号池全量体检通过，所有账号登录态有效')
+        } else {
+          const dead = res.accounts.filter((a) => !a.ok)
+          toast.error(`体检发现 ${dead.length} 个账号异常: ${dead.map((d) => d.id).join(', ')}`)
         }
-        return next
-      })
-      
-      const allOk = res.accounts.every((a) => a.ok)
-      if (allOk) {
-        toast.success(accountId ? `账号 ${accountId} 体检通过，登录态有效` : '号池全量体检通过，所有账号登录态有效')
-      } else {
-        const dead = res.accounts.filter((a) => !a.ok)
-        toast.error(`体检发现 ${dead.length} 个账号异常: ${dead.map((d) => d.id).join(', ')}`)
+        await refreshAccounts()
+      } catch (err: unknown) {
+        toast.error('体检请求失败: ' + (err instanceof Error ? err.message : String(err)))
+      } finally {
+        setCheckingHealth(false)
       }
-      await refreshAccounts()
-    } catch (err: unknown) {
-      toast.error('体检请求失败: ' + (err instanceof Error ? err.message : String(err)))
-    } finally {
-      setCheckingHealth(false)
-    }
-  }
+    },
+    [refreshAccounts]
+  )
 
   const runPointsCheck = useCallback(
-    async (accountId?: string) => {
+    async (accountId?: string, options?: { silent?: boolean }) => {
       try {
         setCheckingPoints(true)
         const res = await kukuApi.getPoolPoints(accountId)
@@ -205,14 +208,33 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
           )
           await refreshAccounts()
         } else {
-          toast.success(
-            accountId
-              ? `账号 ${accountId} 积分已刷新`
-              : `全池积分查询完成，可用总积分: ${res.total_balance_points} pts`
-          )
+          if (!options?.silent) {
+            toast.success(
+              accountId
+                ? `账号 ${accountId} 积分已刷新`
+                : `全池积分查询完成，可用总积分: ${res.total_balance_points} pts`
+            )
+          }
         }
       } catch (err: unknown) {
-        toast.error('查询积分失败: ' + (err instanceof Error ? err.message : String(err)))
+        const errorMsg = err instanceof Error ? err.message : String(err)
+        const isAuthError =
+          errorMsg.toLowerCase().includes('bad api key') ||
+          errorMsg.includes('401') ||
+          errorMsg.toLowerCase().includes('unauthorized')
+
+        if (isAuthError) {
+          if (options?.silent) {
+            return
+          }
+          toast.info(
+            '查询余额接口需要普通 API 密钥：当前仅配置了管理员令牌，请在右上角「连接配置」中配置 API Key，或在「API密钥」页面添加密钥。'
+          )
+          return
+        }
+        if (!options?.silent) {
+          toast.error('查询积分失败: ' + errorMsg)
+        }
       } finally {
         setCheckingPoints(false)
       }
@@ -220,18 +242,21 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
     [refreshAccounts]
   )
 
-  const resetCooldown = async (accountId?: string) => {
-    try {
-      const res = await kukuApi.resetCooldown(accountId)
-      setAccounts(res.accounts || [])
-      toast.success(accountId ? `已重置账号 ${accountId} 的冷却状态` : '已清空全池冷却状态')
-      await refreshAccounts()
-    } catch (err: unknown) {
-      toast.error('重置冷却失败: ' + (err instanceof Error ? err.message : String(err)))
-    }
-  }
+  const resetCooldown = useCallback(
+    async (accountId?: string) => {
+      try {
+        const res = await kukuApi.resetCooldown(accountId)
+        setAccounts(res.accounts || [])
+        toast.success(accountId ? `已重置账号 ${accountId} 的冷却状态` : '已清空全池冷却状态')
+        await refreshAccounts()
+      } catch (err: unknown) {
+        toast.error('重置冷却失败: ' + (err instanceof Error ? err.message : String(err)))
+      }
+    },
+    [refreshAccounts]
+  )
 
-  const resequence = async () => {
+  const resequence = useCallback(async () => {
     try {
       const res = await kukuApi.resequenceAccounts()
       setAccounts(res.accounts || [])
@@ -240,29 +265,32 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
     } catch (err: unknown) {
       toast.error('序号重排失败: ' + (err instanceof Error ? err.message : String(err)))
     }
-  }
+  }, [])
 
-  const deleteAccount = async (id: string) => {
-    try {
-      const res = await kukuApi.deleteAccount(id)
-      setAccounts(res.accounts || [])
-      if (res.gap) {
-        setGap(true)
-        toast.warning(`账号 ${id} 已删除。检测到优先级序号存在空洞，建议顺手重排序号。`, {
-          action: {
-            label: '重排序号',
-            onClick: () => {
-              void resequence()
+  const deleteAccount = useCallback(
+    async (id: string) => {
+      try {
+        const res = await kukuApi.deleteAccount(id)
+        setAccounts(res.accounts || [])
+        if (res.gap) {
+          setGap(true)
+          toast.warning(`账号 ${id} 已删除。检测到优先级序号存在空洞，建议顺手重排序号。`, {
+            action: {
+              label: '重排序号',
+              onClick: () => {
+                void resequence()
+              },
             },
-          },
-        })
-      } else {
-        toast.success(`账号 ${id} 已成功删除`)
+          })
+        } else {
+          toast.success(`账号 ${id} 已成功删除`)
+        }
+      } catch (err: unknown) {
+        toast.error('删除账号失败: ' + (err instanceof Error ? err.message : String(err)))
       }
-    } catch (err: unknown) {
-      toast.error('删除账号失败: ' + (err instanceof Error ? err.message : String(err)))
-    }
-  }
+    },
+    [resequence]
+  )
 
   const claimAccountPoints = useCallback(
     async (accountId: string, chat = false) => {
@@ -280,7 +308,10 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
           } else {
             toast.info(`账号 ${accountId} 本次无新增可领积分: ${acct?.notes ? String(acct.notes) : '已达上限或未满足条件'}`)
           }
-          await Promise.all([refreshAccounts(), runPointsCheck(accountId)])
+          await Promise.all([
+            refreshAccounts(),
+            runPointsCheck(accountId, { silent: true }).catch(() => {}),
+          ])
           return true
         }
         return false
@@ -292,43 +323,79 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
     [refreshAccounts, runPointsCheck]
   )
 
+  const contextValue = React.useMemo<UsersContextType>(
+    () => ({
+      open,
+      setOpen,
+      addTab,
+      setAddTab,
+      openAddDialog,
+      openFreePointsDialog,
+      selectedClaimAccountId,
+      setSelectedClaimAccountId,
+      claimAccountPoints,
+      currentRow,
+      setCurrentRow,
+      accounts,
+      loading,
+      checkingHealth,
+      healthResults,
+      checkingPoints,
+      pointsResults,
+      totalBalancePoints,
+      adminEnabled,
+      activeSessions,
+      apiOpen,
+      apiKeyCount,
+      autoClaimState,
+      setAutoClaimState,
+      gap,
+      setGap,
+      refreshAccounts,
+      runHealthCheck,
+      runPointsCheck,
+      resetCooldown,
+      resequence,
+      deleteAccount,
+    }),
+    [
+      open,
+      setOpen,
+      addTab,
+      setAddTab,
+      openAddDialog,
+      openFreePointsDialog,
+      selectedClaimAccountId,
+      setSelectedClaimAccountId,
+      claimAccountPoints,
+      currentRow,
+      setCurrentRow,
+      accounts,
+      loading,
+      checkingHealth,
+      healthResults,
+      checkingPoints,
+      pointsResults,
+      totalBalancePoints,
+      adminEnabled,
+      activeSessions,
+      apiOpen,
+      apiKeyCount,
+      autoClaimState,
+      setAutoClaimState,
+      gap,
+      setGap,
+      refreshAccounts,
+      runHealthCheck,
+      runPointsCheck,
+      resetCooldown,
+      resequence,
+      deleteAccount,
+    ]
+  )
+
   return (
-    <UsersContext
-      value={{
-        open,
-        setOpen,
-        addTab,
-        setAddTab,
-        openAddDialog,
-        openFreePointsDialog,
-        selectedClaimAccountId,
-        setSelectedClaimAccountId,
-        claimAccountPoints,
-        currentRow,
-        setCurrentRow,
-        accounts,
-        loading,
-        checkingHealth,
-        healthResults,
-        checkingPoints,
-        pointsResults,
-        totalBalancePoints,
-        adminEnabled,
-        activeSessions,
-        apiOpen,
-        apiKeyCount,
-        autoClaimState,
-        setAutoClaimState,
-        gap,
-        setGap,
-        refreshAccounts,
-        runHealthCheck,
-        runPointsCheck,
-        resetCooldown,
-        resequence,
-        deleteAccount,
-      }}
-    >
+    <UsersContext value={contextValue}>
       {children}
     </UsersContext>
   )

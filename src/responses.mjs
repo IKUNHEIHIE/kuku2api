@@ -189,8 +189,9 @@ export class ResponseStream {
     this.res.end();
   }
 
-  failed(message) {
+  failed(message, response = null) {
     this.emit('error', { message, code: null, param: null });
+    if (response) this.emit('response.failed', { response });
     this.res.end();
   }
 }
