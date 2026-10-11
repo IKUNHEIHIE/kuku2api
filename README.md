@@ -41,21 +41,27 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\kuku2api-install.
 
 打开安装器显示的控制台地址（默认 [http://127.0.0.1:8787](http://127.0.0.1:8787)）。首次安装在终端显示一次随机生成的管理员强令牌，**请立即保存**，并用它进入控制台。之后可扫码加号、创建普通 API 密钥，将客户端的 Base URL 配置为对应地址加 `/v1`。
 
-已安装项目中运行脚本会复用当前源码、数据库与令牌；不会自动拉取新版本，也不会覆盖无关的非空目录。源码更新后可重新运行脚本构建。运行前先停止旧服务；数据库升级前应做好一致性备份。
+**上面的远程命令可重复使用：未安装时自动安装，已安装时自动升级并启动。** 升级沿用已保存的端口、账号、管理员令牌和设置，不再询问端口；只有主动传入端口参数时才修改。已经是最新版且构建存在时，跳过重复构建；正在运行则保持运行。
 
-已有 Git 安装目录可先运行 `git pull --ff-only` 获取最新源码，再执行 `install.sh` / `install.ps1` 重建控制台。若有本地代码修改，请先保存；压缩包安装目录需先更新源码，单纯重复运行安装器不会下载覆盖旧代码。全新安装会从 GitHub 的 main 分支下载当前最新前后端。
-
-如果曾遇到 `Unknown installer option: --lang`，表示下载的新入口正在调用安装目录中的旧版 `scripts/install.mjs`。入口现在会在执行前检查兼容版本；发现旧版或不完整源码时停止并提示更新，不会初始化或覆盖数据库、令牌。不要删除旧安装目录或单独替换一个安装文件。
-
-Linux/macOS 通过压缩包安装的默认目录可这样更新（先停止旧服务，并备份自行修改的源码；自定义目录请替换 `$HOME/kuku2api`）：
+安装目录中也有一键升级入口，它每次都会获取最新安装器：
 
 ```bash
-curl -fsSL https://codeload.github.com/IKUNHEIHIE/kuku2api/tar.gz/refs/heads/main -o /tmp/kuku2api-update.tar.gz &&
-tar -xzf /tmp/kuku2api-update.tar.gz -C "$HOME/kuku2api" --strip-components=1 &&
-bash "$HOME/kuku2api/install.sh" --lang zh
+bash ~/kuku2api/upgrade.sh
 ```
 
-源码包不包含本地数据库、令牌及私有运行时，解压更新会替换项目源码，保留现有 `data/`。数据库仍按原有路径读取；如曾设置 `DATABASE_FILE`，更新和启动时沿用相同环境变量。
+```powershell
+& "$env:USERPROFILE\kuku2api\upgrade.ps1"
+```
+
+自定义安装目录请替换上述路径；也可在远程命令后指定 `--dir PATH --upgrade` / `-InstallDir PATH -Upgrade`。已有旧安装缺少升级入口时，重新执行上面的远程安装命令即可自动下载完整新版，修复旧辅助程序不识别 `--lang` 的问题。不要删除安装目录或单独替换辅助文件。
+
+升级先在临时目录下载源码并构建控制台，成功后才停止已验证属于本目录的服务，等待请求及正在执行的定时领取结束。源码和 SQLite 一致性备份保存至 `.runtime/backups/`，再切换新版、初始化数据库并检查启动；初始化或启动失败会尝试恢复旧版和原服务。备份包含账号和令牌，请像数据库一样保管。强制中断或外部并发修改可能需要按备份手动恢复，正常失败会显示恢复结果。
+
+Git 安装只允许干净目录快进到 `origin/main`，有本地修改或分叉时保留现场并停止。压缩包安装会先备份再替换公开源码，无关文件、私有配置、`data/` 和私有运行时保留。数据库仍按原有路径读取；如曾设置 `DATABASE_FILE` 或显式 `ADMIN_TOKEN`，升级和启动时沿用相同环境变量。
+
+首次升级旧版时，如果旧服务没有身份验证及停止接口，请先在原终端按 Ctrl+C；之后脚本可以自动停止并重启本服务。无法确认归属的占用端口不会被脚本强行结束。升级最多等待旧进程退出 120 秒，超时会停止切换源码。
+
+在安装目录直接运行 `install.sh` / `install.ps1` 默认使用当前源码重新安装，适合本地开发；`--install` / `-Install` 可显式选择该行为。使用 `--upgrade` / `-Upgrade` 获取发布的新版。
 
 如果选择其他端口，登录页展开“服务端地址配置”，填写安装器显示的根地址，例如 `http://127.0.0.1:8788`，不要加 `/v1`。管理员可直接读取号池本地状态；模型调用仍使用独立的普通 API 密钥。
 
@@ -78,9 +84,13 @@ cd "$env:USERPROFILE\kuku2api"
 | `--dir PATH` | `-InstallDir PATH` | 自定义目录 |
 | `--port 8788` | `-Port 8788` | 指定并保存服务端口，跳过端口提问 |
 | `--lang zh` / `--lang en` | `-Lang zh` / `-Lang en` | 手动指定中文或英文；默认 `auto` 按时区判断 |
-| `--no-start` | `-NoStart` | 只安装、不启动 |
+| `--upgrade` | `-Upgrade` | 下载最新源码、备份、升级并启动；自动沿用端口 |
+| `--start` | `-Start` | 启动本目录服务；已运行时直接显示地址 |
+| `--restart` | `-Restart` | 验证本目录服务身份后停止并重新启动 |
+| `--install` | `-Install` | 使用当前源码安装/重建，不下载更新 |
+| `--no-start` | `-NoStart` | 安装或升级完成后不启动；升级时仍停止旧服务 |
 | `--backend-only` | `-BackendOnly` | 只初始化后端，不下载前端依赖或构建控制台 |
-| `--skip-dependencies` | `-SkipDependencies` | 用已安装的前端依赖重新构建，适合本地开发 |
+| `--skip-dependencies` | `-SkipDependencies` | 本地安装用现有依赖重建；升级构建不支持此选项 |
 
 例如：`bash install.sh --port 8788 --lang zh`，或 `.\install.ps1 -Port 8788 -Lang zh`。
 
@@ -119,5 +129,5 @@ SQLite 使用 WAL；在线备份请使用 SQLite 一致性备份，或停止服�
 
 ## 验证
 
-后端核心回归共 275 项，另有 6 项安装入口兼容性检查（按平台运行），覆盖旧版/不完整源码拦截及更新后账号、令牌保留。核心检查覆盖管理员与普通密钥隔离、流式失败、独立会话、隐私存储、账号保存故障、安装语言、端口保存及重启行为。安装不包含付费模型验收。
+离线回归覆盖管理员与普通密钥隔离、流式失败、独立会话、隐私存储、账号保存故障，以及安装语言、端口保存、旧版自动升级、Git 修改保护、备份回滚和服务重启。Windows 和 Linux 在 GitHub Actions 分别验证；安装不包含付费模型验收。
 

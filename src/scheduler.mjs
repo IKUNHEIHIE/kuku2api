@@ -118,6 +118,8 @@ export function createAutoClaim({ pool, file = null, store: providedStore = null
     stop() {
       if (timer) clearInterval(timer);
       timer = null;
+      // Shutdown waits for work already in progress without starting another claim.
+      return running ?? Promise.resolve();
     },
   };
 }

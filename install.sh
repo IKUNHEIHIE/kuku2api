@@ -8,6 +8,7 @@ NODE_URL='https://nodejs.org/dist/latest-v24.x'
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 install_dir=''
 language='auto'
+action='auto'
 system_zone="${TZ:-}"
 if [[ -z "$system_zone" ]]; then
   system_zone="$(readlink /etc/localtime 2>/dev/null || true)"
@@ -26,8 +27,9 @@ while (($#)); do
     --dir) [[ $# -ge 2 && -n "$2" ]] || { message '--dir 需要指定目录。' '--dir requires a directory.' >&2; exit 1; }; install_dir="$2"; shift 2 ;;
     --port) [[ $# -ge 2 && "$2" =~ ^[0-9]{1,5}$ ]] && ((10#$2 >= 1 && 10#$2 <= 65535)) || { message '端口必须是 1 到 65535 之间的整数。' 'Port must be an integer between 1 and 65535.' >&2; exit 1; }; options+=("--port" "$2"); shift 2 ;;
     --lang) [[ $# -ge 2 && "$2" =~ ^(auto|zh|en)$ ]] || { message '--lang 必须为 auto、zh 或 en。' '--lang must be auto, zh or en.' >&2; exit 1; }; language="$2"; shift 2 ;;
+    --upgrade|--start|--restart|--install) [[ "$action" == auto ]] || { message '请选择一个操作。' 'Choose one action.' >&2; exit 1; }; action="${1#--}"; shift ;;
     --no-start|--backend-only|--skip-dependencies) options+=("$1"); shift ;;
-    --help) message '用法: bash install.sh [--dir 目录] [--port 端口] [--lang auto|zh|en] [--no-start] [--backend-only] [--skip-dependencies]' 'Usage: bash install.sh [--dir PATH] [--port PORT] [--lang auto|zh|en] [--no-start] [--backend-only] [--skip-dependencies]'; exit 0 ;;
+    --help) message '用法: bash install.sh [--upgrade|--start|--restart|--install] [--dir 目录] [--port 端口] [--lang auto|zh|en] [--no-start] [--backend-only]' 'Usage: bash install.sh [--upgrade|--start|--restart|--install] [--dir PATH] [--port PORT] [--lang auto|zh|en] [--no-start] [--backend-only]'; exit 0 ;;
     *) message "未知安装参数: $1" "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -39,19 +41,30 @@ command -v tar >/dev/null || { message '请先安装 tar。' 'Please install tar
 work="$(mktemp -d "${TMPDIR:-/tmp}/kuku2api.XXXXXX")"
 trap 'rm -rf -- "$work"' EXIT
 download() { curl --fail --location --retry 3 --connect-timeout 20 --max-time 600 --proto '=https' --tlsv1.2 "$1" -o "$2"; }
+download_source() {
+  message '正在下载最新源码…' 'Downloading the latest source…'
+  download "$SOURCE_URL" "$work/source.tar.gz"
+  mkdir "$work/source"
+  tar -xzf "$work/source.tar.gz" -C "$work/source" --strip-components=1
+  [[ -f "$work/source/scripts/manage.mjs" && -f "$work/source/package.json" ]] || { message '项目压缩包无效或版本过旧，请稍后重试。' 'Invalid or outdated project archive; retry shortly.' >&2; exit 1; }
+}
 
+existing=false
+if [[ -f "$install_dir/scripts/install.mjs" || -f "$install_dir/src/server.mjs" ]]; then existing=true; fi
+if [[ "$existing" == false && ( "$action" == start || "$action" == restart ) ]]; then message '尚未安装，请先运行安装器。' 'Not installed; run the installer first.' >&2; exit 1; fi
 if [[ ! -f "$install_dir/scripts/install.mjs" ]]; then
+  if [[ "$existing" == true ]]; then action=upgrade;
+  else
   if [[ -e "$install_dir" && ( ! -d "$install_dir" || -n "$(ls -A "$install_dir")" ) ]]; then
     message "拒绝覆盖非空目录: $install_dir，请用 --dir 指定其他目录。" "Refusing to overwrite a non-empty directory: $install_dir. Use --dir PATH." >&2; exit 1
   fi
   message "正在下载源码到 $install_dir ..." "Downloading source into $install_dir ..."
-  download "$SOURCE_URL" "$work/source.tar.gz"
-  mkdir "$work/source"
-  tar -xzf "$work/source.tar.gz" -C "$work/source" --strip-components=1
-  [[ -f "$work/source/scripts/install.mjs" ]] || { message '项目压缩包无效。' 'Invalid project archive.' >&2; exit 1; }
+  download_source
   mkdir -p -- "$(dirname -- "$install_dir")"
   if [[ -d "$install_dir" ]]; then rmdir -- "$install_dir"; fi
   mv -- "$work/source" "$install_dir"
+  action=install
+  fi
 fi
 install_dir="$(cd -- "$install_dir" && pwd)"
 
@@ -81,17 +94,27 @@ else
   mv "$work/node" "$install_dir/.runtime/node"
   node_bin="$install_dir/.runtime/node/bin/node"
 fi
-if ! "$node_bin" -e 'const fs=require("node:fs"),p=require("node:path"),root=process.argv[1];try{process.exit(fs.readFileSync(p.join(root,"scripts/install.mjs"),"utf8").includes("export const INSTALLER_PROTOCOL = 2;")&&["scripts/install-language.mjs","src/listen-port.mjs"].every(file=>fs.existsSync(p.join(root,file)))?0:1)}catch{process.exit(1)}' "$install_dir"; then
-  message "检测到旧版或不完整的源码目录：$install_dir" "Outdated or incomplete source directory detected: $install_dir" >&2
-  message '请先停止旧服务并备份自定义源码，再更新完整源码。数据库和令牌尚未被改动。' 'Stop the old service and back up custom code before updating the complete source. The database and token have not been changed.' >&2
-  if [[ -e "$install_dir/.git" ]]; then
-    printf 'git -C %q pull --ff-only\n' "$install_dir" >&2
-  else
-    printf 'curl -fsSL %q -o /tmp/kuku2api-update.tar.gz && tar -xzf /tmp/kuku2api-update.tar.gz -C %q --strip-components=1\n' "$SOURCE_URL" "$install_dir" >&2
-  fi
-  printf 'bash %q\n' "$install_dir/install.sh" >&2
+export PATH="$(dirname -- "$node_bin"):$PATH"
+compatible_source() { "$node_bin" -e 'const fs=require("node:fs"),p=require("node:path"),root=process.argv[1];try{process.exit(fs.readFileSync(p.join(root,"scripts/install.mjs"),"utf8").includes("export const INSTALLER_PROTOCOL = 2;")&&["scripts/manage.mjs","scripts/service.mjs","scripts/install-language.mjs","src/listen-port.mjs"].every(file=>fs.existsSync(p.join(root,file)))?0:1)}catch{process.exit(1)}' "$install_dir"; }
+if [[ "$action" == auto ]]; then
+  if [[ "$script_dir" != "$install_dir" ]] || ! compatible_source; then action=upgrade; else action=install; fi
+fi
+if [[ "$action" == start || "$action" == restart ]] && ! compatible_source; then action=upgrade; fi
+if [[ "$action" == upgrade ]]; then
+  download_source
+  message "检测到已有安装，将保留数据并升级：$install_dir" "Existing installation detected; upgrading while preserving data: $install_dir"
+  "$node_bin" "$work/source/scripts/manage.mjs" --root "$install_dir" --upgrade "${options[@]}"
+  exit $?
+fi
+if [[ "$action" == start || "$action" == restart ]]; then
+  manager="$install_dir/scripts/manage.mjs"
+  if [[ ! -f "$manager" ]]; then download_source; manager="$work/source/scripts/manage.mjs"; fi
+  "$node_bin" "$manager" --root "$install_dir" "--$action" "${options[@]}"
+  exit $?
+fi
+if ! compatible_source; then
+  message "旧版或不完整的源码目录：$install_dir；请使用 --upgrade 自动升级。" "Outdated or incomplete source directory: $install_dir; use --upgrade to update automatically." >&2
   exit 1
 fi
-export PATH="$(dirname -- "$node_bin"):$PATH"
 cd -- "$install_dir"
 "$node_bin" scripts/install.mjs "${options[@]}"

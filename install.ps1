@@ -3,6 +3,10 @@ param(
   [string]$InstallDir,
   [ValidateRange(1, 65535)][int]$Port,
   [ValidateSet('auto', 'zh', 'en')][string]$Lang = 'auto',
+  [switch]$Upgrade,
+  [switch]$Start,
+  [switch]$Restart,
+  [switch]$Install,
   [switch]$NoStart,
   [switch]$BackendOnly,
   [switch]$SkipDependencies
@@ -11,6 +15,14 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $taskRepository = 'IKUNHEIHIE/kuku2api'
+$taskAction = 'auto'
+$taskActions = @()
+if ($Upgrade) { $taskActions += 'upgrade' }
+if ($Start) { $taskActions += 'start' }
+if ($Restart) { $taskActions += 'restart' }
+if ($Install) { $taskActions += 'install' }
+if ($taskActions.Count -gt 1) { throw 'Choose one action / 请选择一个操作' }
+if ($taskActions.Count -eq 1) { $taskAction = $taskActions[0] }
 $taskZone = if ($env:TZ) { ($env:TZ -replace '^:', '') -replace '^.*zoneinfo/', '' } else { [TimeZoneInfo]::Local.Id }
 if ($Lang -eq 'auto') {
   $Lang = if ($taskZone -match '^(Asia/(Shanghai|Chongqing|Chungking|Harbin|Urumqi|Kashgar|Hong_Kong|Macao|Macau|Taipei)|PRC|ROC|Hongkong|China Standard Time|Taipei Standard Time)$') { 'zh' } else { 'en' }
@@ -36,21 +48,31 @@ function Test-TaskNode([string]$Executable) {
     return $LASTEXITCODE -eq 0
   } catch { return $false }
 }
+function Get-TaskSource {
+  Write-Host (Get-TaskMessage '正在下载最新源码…' 'Downloading the latest source…')
+  $taskZip = Join-Path $taskTemp 'source.zip'
+  Get-TaskDownload "https://codeload.github.com/$taskRepository/zip/refs/heads/main" $taskZip
+  Expand-Archive -LiteralPath $taskZip -DestinationPath (Join-Path $taskTemp 'source')
+  $taskSourceDirectory = Join-Path $taskTemp 'source/kuku2api-main'
+  if (-not (Test-Path -LiteralPath (Join-Path $taskSourceDirectory 'scripts/manage.mjs'))) { throw (Get-TaskMessage '项目压缩包无效或版本过旧，请稍后重试。' 'Invalid or outdated project archive; retry shortly.') }
+  return $taskSourceDirectory
+}
 try {
+  $taskExisting = (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install.mjs')) -or (Test-Path -LiteralPath (Join-Path $InstallDir 'src/server.mjs'))
+  if (-not $taskExisting -and $taskAction -in @('start', 'restart')) { throw (Get-TaskMessage '尚未安装，请先运行安装器。' 'Not installed; run the installer first.') }
   if (-not (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install.mjs'))) {
+    if ($taskExisting) { $taskAction = 'upgrade' }
+    else {
     if (Test-Path -LiteralPath $InstallDir) {
       if (-not (Test-Path -LiteralPath $InstallDir -PathType Container) -or @(Get-ChildItem -LiteralPath $InstallDir -Force).Count -gt 0) {
         throw (Get-TaskMessage '拒绝覆盖非空目录，请用 -InstallDir 指定其他目录。' 'Refusing to overwrite a non-empty directory. Choose another -InstallDir.')
       }
     }
-    $taskZip = Join-Path $taskTemp 'source.zip'
-    Write-Host (Get-TaskMessage "正在下载源码到 $InstallDir ..." "Downloading source into $InstallDir ...")
-    Get-TaskDownload "https://codeload.github.com/$taskRepository/zip/refs/heads/main" $taskZip
-    Expand-Archive -LiteralPath $taskZip -DestinationPath (Join-Path $taskTemp 'source')
-    $taskSource = Join-Path $taskTemp 'source/kuku2api-main'
-    if (-not (Test-Path -LiteralPath (Join-Path $taskSource 'scripts/install.mjs'))) { throw (Get-TaskMessage '项目压缩包无效。' 'Invalid project archive.') }
+    $taskSource = Get-TaskSource
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Get-ChildItem -LiteralPath $taskSource -Force | Copy-Item -Destination $InstallDir -Recurse -Force
+    $taskAction = 'install'
+    }
   }
   $taskNode = Join-Path $InstallDir '.runtime/node/node.exe'
   if (-not (Test-TaskNode $taskNode)) {
@@ -83,13 +105,19 @@ try {
       $taskNode = Join-Path $taskRuntime 'node.exe'
     }
   }
-  $taskInstallerSource = Get-Content -LiteralPath (Join-Path $InstallDir 'scripts/install.mjs') -Raw
-  if (-not $taskInstallerSource.Contains('export const INSTALLER_PROTOCOL = 2;') -or
-      -not (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install-language.mjs')) -or
-      -not (Test-Path -LiteralPath (Join-Path $InstallDir 'src/listen-port.mjs'))) {
+  $taskInstallerSource = if (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install.mjs')) { Get-Content -LiteralPath (Join-Path $InstallDir 'scripts/install.mjs') -Raw } else { '' }
+  $taskCompatible = $taskInstallerSource.Contains('export const INSTALLER_PROTOCOL = 2;') -and
+      (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/manage.mjs')) -and
+      (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/service.mjs')) -and
+      (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install-language.mjs')) -and
+      (Test-Path -LiteralPath (Join-Path $InstallDir 'src/listen-port.mjs'))
+  if ($taskAction -eq 'auto') {
+    $taskAction = if (-not $taskCompatible -or [IO.Path]::GetFullPath($PSScriptRoot) -ne $InstallDir) { 'upgrade' } else { 'install' }
+  }
+  if ($taskAction -in @('start', 'restart') -and (-not $taskCompatible)) { $taskAction = 'upgrade' }
+  if ($taskAction -eq 'install' -and (-not $taskCompatible)) {
     Write-Host (Get-TaskMessage "检测到旧版或不完整的源码目录：$InstallDir" "Outdated or incomplete source directory detected: $InstallDir")
-    Write-Host (Get-TaskMessage '请先停止旧服务并备份自定义源码，再更新该目录的完整源码。Git 安装可运行 git pull --ff-only；压缩包安装请重新下载并解压完整源码。保留 data 目录、数据库和令牌文件。' 'Stop the old service and back up custom code, then update the complete source in this directory. Git installs can use git pull --ff-only; archive installs must download and extract the complete source again. Preserve data, databases and token files.')
-    throw (Get-TaskMessage '安装入口与源码版本不匹配，已停止；数据库和令牌尚未被改动。' 'Installer/source version mismatch; stopped without changing the database or token.')
+    throw (Get-TaskMessage '请使用 -Upgrade 自动升级；数据库和令牌尚未被改动。' 'Use -Upgrade to update automatically; the database and token have not been changed.')
   }
   $taskArgs = @('--lang', $Lang)
   if ($PSBoundParameters.ContainsKey('Port')) { $taskArgs += @('--port', "$Port") }
@@ -97,7 +125,16 @@ try {
   if ($BackendOnly) { $taskArgs += '--backend-only' }
   if ($SkipDependencies) { $taskArgs += '--skip-dependencies' }
   $env:PATH = (Split-Path $taskNode -Parent) + [IO.Path]::PathSeparator + $env:PATH
-  & $taskNode (Join-Path $InstallDir 'scripts/install.mjs') @taskArgs
+  if ($taskAction -eq 'upgrade') {
+    $taskSource = Get-TaskSource
+    & $taskNode (Join-Path $taskSource 'scripts/manage.mjs') --root $InstallDir --upgrade @taskArgs
+  } elseif ($taskAction -in @('start', 'restart')) {
+    $taskManager = Join-Path $InstallDir 'scripts/manage.mjs'
+    if (-not (Test-Path -LiteralPath $taskManager)) { $taskSource = Get-TaskSource; $taskManager = Join-Path $taskSource 'scripts/manage.mjs' }
+    & $taskNode $taskManager --root $InstallDir "--$taskAction" @taskArgs
+  } else {
+    & $taskNode (Join-Path $InstallDir 'scripts/install.mjs') @taskArgs
+  }
   if ($LASTEXITCODE -ne 0) { throw (Get-TaskMessage "安装失败（退出码 $LASTEXITCODE），请修复后重新安装。" "Installation failed (exit $LASTEXITCODE). Fix the error and rerun.") }
 } finally {
   # Only remove the unique temporary directory created by this invocation.

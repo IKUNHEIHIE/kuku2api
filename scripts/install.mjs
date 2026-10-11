@@ -106,7 +106,12 @@ export async function install(root, args) {
   console.log(t(`正在安装 kuku2api ${version}${options.ui ? '，包含最新控制台' : '（仅后端）'}。`, `Installing kuku2api ${version}${options.ui ? ' with the console' : ' (backend only)'}.`));
   const port = await choosePort({ ...options, savedPort: savedListenPort(root), language });
   console.log(t(`服务端口：${port}；安装成功后将保存，重启自动沿用。`, `Service port: ${port}; saved after a successful install and reused on restart.`));
-  // Build first: a dependency/build failure must not initialize or replace a database/token.
+  await buildConsole(root, options, t);
+  await finishInstall(root, options, port, language);
+}
+
+// Upgrade builds in staging, before stopping or changing the installed service.
+export async function buildConsole(root, options, t = (_zh, en) => en) {
   if (options.ui) {
     if (options.dependencies) {
       const nodeDir = path.dirname(process.execPath);
@@ -123,6 +128,12 @@ export async function install(root, args) {
     }
     await access(path.join(root, 'ui', 'dist', 'index.html'));
   }
+}
+
+async function finishInstall(root, options, port, language) {
+  const t = (zh, en) => language === 'zh' ? zh : en;
+  const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
+  const version = manifest.version ?? t('(本地源码)', '(local source)');
   const { openDatabase } = await import('../src/database.mjs');
   const { resolveAdminToken } = await import('../src/admin-token.mjs');
   // Recheck after a potentially long build, before initializing or changing storage.
@@ -139,7 +150,7 @@ export async function install(root, args) {
   console.log(t(`控制台 / API: ${url}${options.ui ? '' : '（仅后端；未构建控制台）'}`, `Console / API: ${url}${options.ui ? '' : ' (backend only; console not built)'}`));
   if (options.ui) console.log(t(`登录页的“服务端地址配置”应填写 ${url}（不要加 /v1），管理员令牌与普通 API 密钥分别填写。`, `Set the login page server address to ${url} (without /v1). Administrator tokens and model API keys are separate.`));
   console.log(t('自动领取默认关闭。关闭终端会停止前台服务；再次运行 start.sh 或 start.ps1 启动。', 'Automatic claiming is off by default. Closing the terminal stops the service; run start.sh or start.ps1 to restart.'));
-  if (options.start) start(root, { port });
+  if (options.start) return start(root, { port });
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

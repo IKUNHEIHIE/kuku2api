@@ -15,6 +15,8 @@ import { databaseAdminRoute } from './database-api.mjs';
 import { createDesktopLogin } from './desktop-login.mjs';
 import { createStaticUi } from './static-ui.mjs';
 import { listenPort } from './listen-port.mjs';
+import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -395,7 +397,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
   json(res, 200, final);
 }
 
-export function createApp({ pool, apiKeys = [], adminToken = '', store = null, deviceId = '', ledger = null, keyRing = null, autoClaim = null, database = null, logger = console, uiDirectory = path.join(ROOT, 'ui', 'dist') }) {
+export function createApp({ pool, apiKeys = [], adminToken = '', store = null, deviceId = '', ledger = null, keyRing = null, autoClaim = null, database = null, logger = console, runtime = null, uiDirectory = path.join(ROOT, 'ui', 'dist') }) {
   const keys = keyRing ?? createKeyRing({ envKeys: apiKeys });
   const serveUi = createStaticUi(uiDirectory);
   const authed = (req) => {
@@ -454,6 +456,19 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
       if (!admined(req)) return openError(res, 401, 'admin token required', 'authentication_error');
       const body = await readBody(req).catch(() => null);
       if (body === null) return openError(res, 400, 'invalid json body');
+      if (url.pathname === '/pool/admin/runtime' && req.method === 'GET' && runtime) {
+        res.setHeader('cache-control', 'no-store');
+        return json(res, 200, { ok: true, ...runtime.info });
+      }
+      if (url.pathname === '/pool/admin/shutdown' && req.method === 'POST' && runtime) {
+        if (Object.keys(body).some(key => key !== 'instance_id') || body.instance_id !== runtime.info.instance_id) {
+          return openError(res, 409, 'runtime instance mismatch', 'invalid_request_error', 'runtime_instance_mismatch');
+        }
+        res.setHeader('cache-control', 'no-store');
+        json(res, 202, { ok: true, shutting_down: true });
+        setImmediate(() => runtime.shutdown());
+        return;
+      }
       const databaseRoute = databaseAdminRoute({ database, autoClaim, url, method: req.method, body });
       if (databaseRoute) return json(res, databaseRoute.status, databaseRoute.body);
 
@@ -803,6 +818,20 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
   // explicitly asked for it at boot with AUTO_CLAIM=1. It writes to the Baidu account and spends
   // one real turn per account, so it must never be a surprise background behaviour.
   const autoClaim = createAutoClaim({ pool, store: database.store('settings'), logger, envEnabled: process.env.AUTO_CLAIM === '1' });
+  let server;
+  let stopping = false;
+  const pendingRequests = new Set();
+  const shutdown = () => {
+    if (stopping) return;
+    stopping = true;
+    const pendingClaim = autoClaim.stop(); clearInterval(pruneTimer);
+    server.close(async () => {
+      await Promise.allSettled([...pendingRequests, pendingClaim]);
+      database.close(); process.exit(0);
+    });
+  };
+  const runtime = { info: { pid: process.pid, instance_id: randomUUID(), started_at: new Date().toISOString(),
+    root: realpathSync(ROOT), database_file: realpathSync(process.env.DATABASE_FILE || path.join(ROOT, 'data/kukuai.sqlite')) }, shutdown };
   const app = createApp({
     pool,
     keyRing,
@@ -813,6 +842,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
     autoClaim,
     database,
     logger,
+    runtime,
   });
   autoClaim.start();
   database.prune();
@@ -825,8 +855,11 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
   if (acct) await pool.refreshModelIndex(acct);
   const catalog = getCachedCatalog();
   logger.log(`models: ${catalog?.model_list?.length ?? 0}`);
-  const server = createServer(app).listen(port, '127.0.0.1', () => logger.log(`kuku2api on http://127.0.0.1:${port}; storage=sqlite`));
-  const shutdown = () => { autoClaim.stop(); clearInterval(pruneTimer); server.close(() => { database.close(); process.exit(0); }); };
+  server = createServer((req, res) => {
+    const request = app(req, res);
+    pendingRequests.add(request);
+    request.finally(() => pendingRequests.delete(request)).catch(() => {});
+  }).listen(port, '127.0.0.1', () => logger.log(`kuku2api on http://127.0.0.1:${port}; storage=sqlite`));
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
 }
