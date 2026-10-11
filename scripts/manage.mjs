@@ -8,7 +8,7 @@ import path from 'node:path';
 import { buildConsole, installOptions, availablePort } from './install.mjs';
 import { installerLanguage } from './install-language.mjs';
 import { listenPort } from '../src/listen-port.mjs';
-import { installationState, runtimeAt, stopRuntime, launchVerified } from './service.mjs';
+import { installationState, runtimeAt, stopRuntime, launchVerified, samePath } from './service.mjs';
 
 const HERE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const roots = new Set(['src', 'scripts', 'test', 'docs', 'ui', '.github']);
@@ -92,14 +92,14 @@ export async function manage(root, source, action, args, { build = buildConsole,
       if (options.start) await launch(root, port, t);
       return;
     }
-    if (root === source) throw new Error('Upgrade requires a separate staging source directory');
+    if (samePath(root, source)) throw new Error('Upgrade requires a separate staging source directory');
     const manifest = JSON.parse(readFileSync(path.join(source, 'package.json'), 'utf8'));
     if (manifest.name !== 'kuku2api') throw new Error('Invalid upgrade archive');
     installedFiles = publicFiles(source);
     for (const name of ['src/server.mjs', 'scripts/install.mjs', 'scripts/manage.mjs', 'scripts/service.mjs', 'package.json']) if (!installedFiles.has(name)) throw new Error(`Incomplete upgrade archive: ${name}`);
     if (existsSync(path.join(root, '.git'))) {
       if (git(root, ['status', '--porcelain'])) throw new Error(t('Git 目录有本地修改，已保留。请先提交或另存修改后再升级。', 'The Git checkout has local changes. Commit or save them before upgrading; nothing was overwritten.'));
-      if (realpathSync(git(root, ['rev-parse', '--show-toplevel'])) !== root) throw new Error('Installation must be the Git repository root');
+      if (!samePath(git(root, ['rev-parse', '--show-toplevel']), root)) throw new Error('Installation must be the Git repository root');
       previousGit = git(root, ['rev-parse', 'HEAD']);
       console.log(t('正在获取 Git 更新…', 'Fetching Git updates…'));
       git(root, ['fetch', 'origin', 'main']); nextGit = git(root, ['rev-parse', 'FETCH_HEAD']);

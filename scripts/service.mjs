@@ -1,11 +1,19 @@
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { availablePort } from './install.mjs';
 import { start } from './start.mjs';
 import { listenPort } from '../src/listen-port.mjs';
 
 export const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Windows may report the same directory with different casing or DOS short names.
+export function samePath(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string' || !path.isAbsolute(left) || !path.isAbsolute(right)) return false;
+  try {
+    const a = statSync(left, { bigint: true }), b = statSync(right, { bigint: true });
+    return a.ino !== 0n && a.dev === b.dev && a.ino === b.ino;
+  } catch { return false; }
+}
 function processAlive(pid) {
   try { process.kill(pid, 0); return true; }
   catch (error) { return error.code !== 'ESRCH'; }
@@ -38,7 +46,7 @@ export async function runtimeAt(root, state, t = (_zh, en) => en) {
     info = await response.json();
   } catch {}
   if (!response?.ok || !info?.instance_id || !Number.isInteger(info.pid) || info.pid <= 0 ||
-      info.root !== realpathSync(root) || !existsSync(state.file) || info.database_file !== realpathSync(state.file)) {
+      !samePath(info.root, root) || !samePath(info.database_file, state.file)) {
     throw new Error(t(`端口 ${state.port} 正在使用，无法确认是本安装的服务。请先停止旧版服务或检查管理员令牌；脚本不会停止其他进程。`,
       `Port ${state.port} is occupied and this installation could not be verified. Stop a legacy service first or check ADMIN_TOKEN; no other process was stopped.`));
   }

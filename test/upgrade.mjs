@@ -11,7 +11,7 @@ import { openDatabase } from '../src/database.mjs';
 import { createApp } from '../src/server.mjs';
 import { createAutoClaim } from '../src/scheduler.mjs';
 import { manage, publicFiles } from '../scripts/manage.mjs';
-import { installationState, runtimeAt, stopRuntime, launchVerified } from '../scripts/service.mjs';
+import { installationState, runtimeAt, stopRuntime, launchVerified, samePath } from '../scripts/service.mjs';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const token = 'kuku-admin-' + 'U'.repeat(43);
@@ -86,6 +86,20 @@ test('upgrade file selection preserves frontend source data but excludes credent
     const files = publicFiles(f.source);
     assert(files.has('ui/src/features/users/data/data.ts')); assert(files.has('ui/.env.example'));
     for (const name of [...privateFiles, 'ui/dist/index.html']) assert.equal(files.has(name), false, name);
+  } finally { cleanup(f.base); }
+});
+
+test('installation identity accepts directory aliases and Windows casing but rejects other paths', async () => {
+  const f = await fixture();
+  try {
+    const alias = path.join(f.base, 'alias');
+    symlinkSync(f.root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    assert.equal(samePath(alias, f.root), true);
+    assert.equal(samePath(f.root, f.source), false);
+    assert.equal(samePath(f.file, path.join(f.source, 'package.json')), false);
+    assert.equal(samePath('relative', f.root), false);
+    if (process.platform === 'win32') assert.equal(samePath(f.root.toUpperCase(), f.root), true);
+    await assert.rejects(manage(f.root, alias, 'upgrade', offline), /separate staging/);
   } finally { cleanup(f.base); }
 });
 
