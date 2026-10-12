@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,15 +11,25 @@ test('publication excludes private runtime data while keeping frontend source da
   const fixture = mkdtempSync(path.join(tmpdir(),'kuku-publication-test-'));
   try {
     writeFileSync(path.join(fixture,'.gitignore'),readFileSync(path.join(root,'.gitignore')));
+    mkdirSync(path.join(fixture,'ui'));
+    writeFileSync(path.join(fixture,'ui/.gitignore'),readFileSync(path.join(root,'ui/.gitignore')));
     execFileSync('git',['init','--quiet'],{cwd:fixture});
     const privatePaths = ['data/kukuai.sqlite','data/backups/example.sqlite','capture/cookie.txt','analysis/asar/package.json',
       'accounts.json.bak','keys.json','sessions.json','responses.json','admin-token.json','ui/.env','ui/dist/index.html',
-      'ui/node_modules/package/index.js','ui/src/features/users/__screenshots__/test.png'];
+      'ui/node_modules/package/index.js','ui/src/features/users/__screenshots__/test.png','ui/logs/events.json'];
     const publicPaths = ['ui/src/features/users/data/data.ts','ui/src/features/tasks/data/data.ts',
-      'ui/src/components/layout/data/sidebar-data.ts','ui/.env.example','docs/api.md','install.sh'];
+      'ui/src/components/layout/data/sidebar-data.ts','ui/src/routes/_authenticated/logs/index.tsx',
+      'ui/src/features/logs/index.tsx','ui/.env.example','docs/api.md','install.sh'];
     const ignored = execFileSync('git',['check-ignore','--no-index','--stdin'],{
       cwd:fixture,input:[...privatePaths,...publicPaths].join('\n')+'\n',encoding:'utf8',
     }).trim().split(/\r?\n/);
     assert.deepEqual(new Set(ignored),new Set(privatePaths));
   } finally { rmSync(fixture,{recursive:true,force:true}); }
+});
+
+test('the log page route and component are included in the Git source used by release builds', () => {
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const files = ['ui/src/routes/_authenticated/logs/index.tsx', 'ui/src/features/logs/index.tsx'];
+  const tracked = execFileSync('git', ['-C', root, 'ls-files', '--error-unmatch', '--', ...files], { encoding: 'utf8', windowsHide: true });
+  assert.deepEqual(new Set(tracked.trim().split(/\r?\n/)), new Set(files));
 });
