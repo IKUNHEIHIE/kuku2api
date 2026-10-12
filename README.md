@@ -1,145 +1,85 @@
 # kuku2api
 
-将百度「库库AI」的模型转换为 OpenAI 兼容 API，支持多账号池、Chat Completions、Responses 和网页管理控制台。
+将百度「库库AI」接入 OpenAI 兼容客户端，提供多账号池、流式对话和网页管理控制台。
 
-当前版本 **0.2.0**：包含最新控制台、管理员号池状态读取，以及流式失败、独立会话、隐私存储和账号保存一致性修复。续聊请明确传递 `x-kuku-session` 或 `previous_response_id`；无会话标识的请求每次新建对话。
+[快速安装](#快速安装) · [使用说明](docs/usage.md) · [API 文档](docs/api.md) · [全部文档](docs/README.md) · [发布包](https://github.com/IKUNHEIHIE/kuku2api/releases/latest)
 
-- 流式 / 非流式响应、思考深度、真实上游用量统计。
-- 扫码或短信登录加号、账号去重、余额查询、账号间会话隔离。
-- 管理员令牌与普通 API 密钥分别管理。
-- SQLite 保存账号、设置、日志、对话记录和用量。
-- 手动积分领取；每日自动领取默认关闭。
-- 后端运行时零第三方依赖，要求 Node.js >=24.15.0。
+## 功能
 
-## 一键安装
+- 支持 Chat Completions 与 Responses，支持流式输出和思考档位。
+- 扫码、短信登录，多账号去重、调度及会话隔离。
+- 管理员令牌与模型 API 密钥独立，控制台管理账号、积分和密钥。
+- SQLite 保存设置、日志、对话与用量，支持 token 和积分统计。
+- 手动领取积分；每日自动领取默认关闭。
+- 安装与升级下载预编译包，用户服务器无需构建前端。
 
-安装器支持 Windows、Linux/macOS 的 x64/arm64。默认下载已构建的发布包并核对 SHA-256；缺少合适的 Node.js 时，从官方站点下载私有 Node 24 运行时并核对 SHA-256。无需管理员权限，不替换系统 Node.js。
+## 快速安装
 
-Linux / macOS（需要 bash、curl、tar；校验工具 sha256sum 或 shasum）：
+支持 Windows、Linux/macOS 的 x64/arm64。安装器自动选择可用的 Node.js，最低版本为 **24.15.0**；后端运行时无第三方依赖。
+
+**Linux / macOS**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/IKUNHEIHIE/kuku2api/main/install.sh -o /tmp/kuku2api-install.sh && bash /tmp/kuku2api-install.sh
 ```
 
-Windows PowerShell：
+**Windows PowerShell**
 
 ```powershell
-Invoke-WebRequest https://raw.githubusercontent.com/IKUNHEIHIE/kuku2api/main/install.ps1 -OutFile "$env:TEMP\kuku2api-install.ps1"; & "$env:TEMP\kuku2api-install.ps1"
+Invoke-WebRequest https://raw.githubusercontent.com/IKUNHEIHIE/kuku2api/main/install.ps1 -OutFile "$env:TEMP\kuku2api-install.ps1"
+& "$env:TEMP\kuku2api-install.ps1"
 ```
 
-如系统的执行策略禁止运行下载的脚本，可在确认文件内容后使用单次进程启动，不修改系统执行策略：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\kuku2api-install.ps1"
-```
-
-默认目录为用户目录下的 `kuku2api`。控制台在 GitHub Actions 上提前构建；用户服务器只下载、校验、解压和初始化 SQLite，完成后以前台方式启动服务。默认安装和升级均不执行 pnpm、TypeScript 或 Vite，不安装前端依赖，适合构建资源不足的服务器。发布包不可用或校验失败时明确停止，不会自动转为源码构建；运行服务本身仍需足够的内存和磁盘。
-
-安装时会询问服务端口（默认 `8787`，回车沿用）；默认端口被占用时先推荐可用端口，回车即可使用，也可以输入其他端口。输入无效或选定端口不可用时可重新选择。端口在安装成功后写入 SQLite，之后运行 `start.sh`、`start.ps1` 或 `npm start` 自动沿用，无需重复设置环境变量。指定 `--port` / `-Port` 可跳过询问；无人值守安装不会等待输入，默认端口冲突时自动选择后续可用端口并显示结果，不停止占用者。显式指定的端口不可用时仍报错，避免擅自更改指定值。
-
-交互语言根据系统时区自动选择：中国大陆、香港、澳门、台湾时区显示中文，其他时区显示英文；不按 UTC+8 偏移判断，因此新加坡等时区使用英文。可用 `--lang zh|en|auto` / `-Lang zh|en|auto` 覆盖。
-
-首次交互安装只询问 `请选择运行端口（默认8787）：`（端口被占用时提示可用值）。下载进度、版本说明和正常启动日志不再刷屏；错误仍显示。安装或升级完成，并通过启动检查后，仅输出：
+按提示选择运行端口（默认 `8787`），安装完成后会显示：
 
 ```text
 控制台地址：http://服务器IP:端口
 管理员密钥：随机生成的强令牌
 ```
 
-新装默认监听 `0.0.0.0`，允许通过服务器 IP 访问。地址优先读取云服务器绑定的公网 IPv4，再尝试公网出口检测，失败退回本机网卡地址；显式监听具体 IP 时显示该 IP。首次生成的管理员强令牌会保存到 SQLite；重新运行安装或升级入口会在终端重新显示已有密钥，**请妥善保存**。用它进入控制台后可扫码加号、创建普通 API 密钥，将客户端的 Base URL 配置为对应地址加 `/v1`。
+保存管理员密钥，打开控制台即可使用。新安装默认允许通过服务器 IP 访问；安装脚本不会自动开放防火墙端口。系统时区决定默认交互语言，也可手动指定。
 
-**上面的远程命令可重复使用：未安装时自动安装，已安装时自动升级并启动。** 升级沿用已保存的端口、账号、管理员令牌和设置，不再询问端口；只有主动传入端口参数时才修改。已经是最新版且构建存在时，跳过重复构建；正在运行则保持运行。
+端口选择、安装参数、Windows 执行策略及启动方式见 [安装与升级](docs/installation.md)。
 
-安装目录中也有一键升级入口，它每次都会获取最新安装器：
+## 开始使用
 
-```bash
-bash ~/kuku2api/upgrade.sh
-```
+1. 使用管理员密钥登录控制台。首次登录自动填入当前页面的 HTTP/HTTPS 地址，也适用于同源反向代理。
+2. 在「号池」扫码或短信登录，添加自己的账号。
+3. 在「密钥管理」创建普通 API 密钥并保存。
+4. 在兼容客户端中填写下表内容。
 
-```powershell
-& "$env:USERPROFILE\kuku2api\upgrade.ps1"
-```
+| 配置项 | 填写内容 |
+|---|---|
+| Base URL | `http://服务器IP:端口/v1`，或 `https://你的域名/v1` |
+| API Key | 控制台创建的普通 API 密钥 |
+| 模型 | 从 `/v1/models` 获取，例如 `gateway-glm-5.3-flash` |
 
-自定义安装目录请替换上述路径；也可在远程命令后指定 `--dir PATH --upgrade` / `-InstallDir PATH -Upgrade`。已有旧安装缺少升级入口时，重新执行上面的远程安装命令即可自动下载完整新版，修复旧辅助程序不识别 `--lang` 的问题。不要删除安装目录或单独替换辅助文件。
+管理员密钥用于控制台；模型调用使用普通 API 密钥。模型可用性与实际积分消耗以上游返回为准。
 
-源码下载成功但尚未初始化数据库的中断安装，会恢复首次安装的端口选择，支持 `--port` / `-Port`；不会把默认端口上的其他服务当成本项目，也不会因此要求停止其他服务。已有数据库或旧账号配置的安装继续执行原有实例身份检查，避免覆盖仍在运行的旧版。
+## 升级与重启
 
-升级先在临时目录下载成品包，校验归档 SHA-256、发布清单和控制台各文件的 SHA-256，成功后才停止已验证属于本目录的服务，等待请求及正在执行的定时领取结束。源码和 SQLite 一致性备份保存至 `.runtime/backups/`，再切换新版、初始化数据库并检查启动；初始化或启动失败会尝试恢复旧版和原服务。备份包含账号和令牌，请像数据库一样保管。强制中断或外部并发修改可能需要按备份手动恢复，正常失败会显示恢复结果。
+重复执行上方安装命令，会自动识别已有安装并升级，保留账号、密钥、端口和设置。也可在默认安装目录运行：
 
-Git 安装只允许干净目录快进到发布包对应的已验证提交（源码构建模式使用 `origin/main`），有本地修改或分叉时保留现场并停止；不会把较新的源码配上较旧控制台。压缩包安装会先备份再替换公开源码，无关文件、私有配置、`data/` 和私有运行时保留。数据库仍按原有路径读取；如曾设置 `DATABASE_FILE` 或显式 `ADMIN_TOKEN`，升级和启动时沿用相同环境变量。
-
-首次升级旧版时，如果旧服务没有身份验证及停止接口，请先在原终端按 Ctrl+C；之后脚本可以自动停止并重启本服务。无法确认归属的占用端口不会被脚本强行结束。升级最多等待旧进程退出 120 秒，超时会停止切换源码。
-
-在安装目录直接运行 `install.sh` / `install.ps1` 默认同样获取最新预编译发布包。`--install` / `-Install` 可显式复用本地发布包；本地只有源码时会提示下载成品包，不自动编译。开发者确需本机构建，可显式使用 `--build-from-source` / `-BuildFromSource`；固定 pnpm 和锁文件仅在该模式使用。
-
-首次登录自动使用当前页面的协议、域名/IP 和端口，例如 `http://116.205.111.229:8400` 或 `https://kuku2.diestar.cn`；同源部署和 HTTPS 反向代理无需手填。已有自定义后端地址继续保留；前后端分开部署时可展开“服务端地址配置”手动修改，填写根地址，不加 `/v1`。不带协议的手填域名沿用当前页面的 HTTP/HTTPS，其他协议会明确报错。管理员可直接读取号池状态、积分、体检、会话列表及模型目录；模型生成仍使用独立的普通 API 密钥。
-
-手机号加号支持发送短信、发送前图形验证码和登录阶段图形验证码。图形码标识保留在后端会话，前端仅提交输入字符；后台执行 60 秒重发冷却、每会话最多 5 次实际发送和 10 分钟会话过期，重发不延长会话。上游要求滑块时提示改用百度 App 扫码，不自动绕过验证。
-
-关闭终端或按 Ctrl+C 会停止服务。再次启动：
-
-```bash
-cd ~/kuku2api
-bash start.sh
-```
-
-```powershell
-cd "$env:USERPROFILE\kuku2api"
-.\start.ps1
-```
-
-可选安装方式：
-
-| Linux/macOS 参数 | Windows 参数 | 说明 |
+| 操作 | Linux / macOS | Windows PowerShell |
 |---|---|---|
-| `--dir PATH` | `-InstallDir PATH` | 自定义目录 |
-| `--port 8788` | `-Port 8788` | 指定并保存服务端口，跳过端口提问 |
-| `--lang zh` / `--lang en` | `-Lang zh` / `-Lang en` | 手动指定中文或英文；默认 `auto` 按时区判断 |
-| `--upgrade` | `-Upgrade` | 下载最新预编译发布包、备份、升级并启动；自动沿用端口 |
-| `--start` | `-Start` | 启动本目录服务；已运行时直接显示地址 |
-| `--restart` | `-Restart` | 验证本目录服务身份后停止并重新启动 |
-| `--install` | `-Install` | 使用本地发布包安装，不下载更新、不构建 |
-| `--no-start` | `-NoStart` | 安装或升级完成后不启动；升级时仍停止旧服务 |
-| `--backend-only` | `-BackendOnly` | 只初始化后端，不下载前端依赖或构建控制台 |
-| `--build-from-source` | `-BuildFromSource` | 仅供开发者：显式选择源码下载与本机构建；默认关闭 |
-| `--skip-dependencies` | `-SkipDependencies` | 仅在显式源码本地构建时用已有依赖；默认预编译模式无需此参数 |
+| 升级 | `bash ~/kuku2api/upgrade.sh` | `& "$env:USERPROFILE\kuku2api\upgrade.ps1"` |
+| 启动 | `bash ~/kuku2api/start.sh` | `& "$env:USERPROFILE\kuku2api\start.ps1"` |
 
-例如：`bash install.sh --port 8788 --lang zh`，或 `.\install.ps1 -Port 8788 -Lang zh`。
+服务以前台方式运行，关闭终端或按 Ctrl+C 会停止。详细备份与部署说明见 [运行维护](docs/operations.md)。
 
-安装端口的默认值优先级：命令行参数 > `PORT` 环境变量 > SQLite 中已保存的端口 > `8787`。交互安装可修改默认值；`--no-start` / `-NoStart` 仍保存选择，但不检查端口占用。启动时 `PORT` 优先于已保存端口，仅临时覆盖，不改写数据库。启动器清除 HTTP/HTTPS/ALL 代理环境变量，确保账号请求直连。
+## 文档
 
-## 本地开发
+| 我想了解 | 文档 |
+|---|---|
+| 安装、指定端口、升级 | [安装与升级](docs/installation.md) |
+| 登录加号、积分、模型与常见问题 | [使用说明](docs/usage.md) |
+| 接口、鉴权、请求字段与错误码 | [API 文档](docs/api.md) |
+| 环境变量、反向代理、备份恢复 | [运行维护](docs/operations.md) |
+| 本地开发、测试与发布 | [开发说明](docs/development.md) |
+| 旧版改动及验收记录 | [历史归档](docs/archive/README.md) |
 
-```bash
-npm install                 # 首次生成并显示管理员令牌
-npm start                   # API；如有 ui/dist，也提供控制台
-npm test                    # 离线回归，不连接上游或花积分
-```
+## 许可证
 
-前端开发保持现有方式，在 `ui/` 目录安装依赖后运行开发服务器。API 完整契约、请求示例、错误码和思考档位规则见 [docs/api.md](docs/api.md)。
+项目原创代码与文档采用 [0BSD](LICENSE)：允许商用、修改、分发和闭源使用，无署名或公开源码要求。许可证原文见 [OSI Zero-Clause BSD](https://opensource.org/license/0bsd)。
 
-真实上游验收脚本 `npm run accept` 会发送模型请求并消耗积分，应在理解脚本和费用后手动执行；安装器不会运行它。
-
-## 数据与认证
-
-默认数据库：`data/kukuai.sqlite`，可通过 `DATABASE_FILE` 指定路径。重装、重启复用已有数据。账号凭据、数据库、令牌及其备份均已排除在版本管理之外。
-
-管理员接口始终要求管理员令牌；普通 API 密钥与管理员令牌独立。公开监听时，未创建任何普通密钥也禁止匿名模型调用；先在控制台创建普通密钥。仅回环监听的本地开发模式保留未配置普通密钥时的免鉴权行为。
-
-安装器将监听地址保存到 SQLite `installation.host`，重启自动沿用；`LISTEN_HOST` 可临时覆盖，例如反向代理部署使用 `LISTEN_HOST=127.0.0.1`。已有明确保存的地址继续沿用；未经过安装器初始化的本地开发仍默认 `127.0.0.1`。安装器不修改防火墙、不安装系统服务；公网 HTTPS 可通过反向代理配置。
-
-SQLite 使用 WAL；在线备份请使用 SQLite 一致性备份，或停止服务后完整保存数据库目录，避免只复制主文件而遗漏 WAL。
-
-## 限制
-
-- 本项目依赖库库AI现有接口，上游变更可能影响兼容性。
-- 账号隔离是凭据、会话和任务的逻辑隔离；网络出口和本机设备仍共享。
-- 新用户桌面奖励需要真实桌面客户端环境与上游资格，安装器不伪造设备，也不承诺获得奖励。Linux/macOS 安装不会提供 Windows 原生桌面环境。
-- 自动领取默认为关闭；开启后会按配置执行，涉及对话任务时可能消耗积分。
-- 未确认归属的旧会话不能冒用其他账号续聊，需要新建对话。
-- 前端模板的许可和原作者声明保留在 [ui/LICENSE](ui/LICENSE)。
-
-## 验证
-
-离线回归覆盖管理员与普通密钥隔离、流式失败、独立会话、隐私存储、账号保存故障，以及安装语言、端口保存、旧版自动升级、Git 修改保护、备份回滚和服务重启。Windows 和 Linux 在 GitHub Actions 分别验证；安装不包含付费模型验收。
-
+第三方代码继续遵循各自许可；前端基于 Sat Naing 的 Shadcn Admin 模板，其 [MIT 声明](ui/LICENSE) 必须保留。详见 [第三方许可说明](docs/licenses.md)。

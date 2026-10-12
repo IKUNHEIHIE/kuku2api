@@ -2,6 +2,7 @@
   "name": "kuku2api",
   "version": "0.2.0",
   "private": true,
+  "license": "0BSD",
   "type": "module",
   "description": "OpenAI-compatible reverse proxy for Baidu GenFlowPro (库库AI), with an account pool",
   "engines": { "node": ">=24.15.0" },

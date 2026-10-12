@@ -14,7 +14,7 @@ import { quietInstall, progress, installSummary } from './install-output.mjs';
 
 const HERE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const roots = new Set(['src', 'scripts', 'test', 'docs', 'ui', '.github']);
-const rootFiles = new Set(['.gitattributes', '.gitignore', '.npmrc', 'README.md', 'package.json', 'release.json', 'install.sh', 'install.ps1', 'start.sh', 'start.ps1', 'upgrade.sh', 'upgrade.ps1']);
+const rootFiles = new Set(['.gitattributes', '.gitignore', '.npmrc', 'README.md', 'LICENSE', 'package.json', 'release.json', 'install.sh', 'install.ps1', 'start.sh', 'start.ps1', 'upgrade.sh', 'upgrade.ps1']);
 const forbidden = /^(?:data|capture|analysis)(?:\/|$)|^ui\/\.github(?:\/|$)|(?:^|\/)(?:node_modules|dist|coverage|__screenshots__|\.vitest-attachments|\.tanstack|\.vscode|\.idea|\.git|\.runtime|\.agents|\.codex|\.aws)(?:\/|$)|(?:^|\/)\.env(?:$|\.(?!example$))|\.sqlite[^/]*$|\.db(?:-[^/]*)?$|\.(?:bak|tmp|key|pem)$|(?:^|\/)(?:\.DS_Store|Thumbs\.db)$/;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const blobHash = bytes => createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');

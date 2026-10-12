@@ -1,3 +1,7 @@
+# 前端模板更新记录
+
+本文来自 Sat Naing 的 Shadcn Admin 模板，记录的是上游模板版本，不是 kuku2api 的发布记录。原作者许可见 [ui/LICENSE](../../ui/LICENSE)。
+
 ## v2.2.1 (2025-11-06)
 
 ### Fix

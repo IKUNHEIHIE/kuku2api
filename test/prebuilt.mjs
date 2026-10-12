@@ -118,6 +118,8 @@ test('invalid prebuilt update cannot replace source, console or database', async
 test('release staging takes committed public source and excludes private files and node_modules', () => {
   const root = fixture(), destination = path.join(root, '.runtime/package');
   try {
+    put(root, 'LICENSE', readFileSync(path.join(ROOT, 'LICENSE'), 'utf8'));
+    put(root, 'ui/LICENSE', readFileSync(path.join(ROOT, 'ui/LICENSE'), 'utf8'));
     put(root, '.gitignore', '/data/\n/.runtime/\n/release.json\nui/dist/\nnode_modules/\n');
     put(root, 'ui/src/routeTree.gen.ts', 'committed route tree');
     const git = args => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
@@ -127,6 +129,7 @@ test('release staging takes committed public source and excludes private files a
     put(root, 'ui/src/routeTree.gen.ts', 'build generated order');
     for (const name of ['accounts.json', 'capture/password.txt', 'data/secret.sqlite', 'ui/node_modules/pkg/index.js', 'ui/.env']) put(root, name, 'private');
     const release = stageRelease(root, destination);
+    for (const name of ['LICENSE', 'ui/LICENSE']) assert.equal(readFileSync(path.join(destination, name), 'utf8').replace(/\r\n/g, '\n'), readFileSync(path.join(root, name), 'utf8').replace(/\r\n/g, '\n'));
     assert.equal(release.commit, sha); assert.equal(validatePrebuilt(destination).commit, sha);
     assert.equal(readFileSync(path.join(destination, 'ui/src/routeTree.gen.ts'), 'utf8'), 'committed route tree');
     for (const name of ['accounts.json', 'capture', 'data', 'ui/node_modules', 'ui/.env', '.git']) assert.equal(existsSync(path.join(destination, name)), false, name);
