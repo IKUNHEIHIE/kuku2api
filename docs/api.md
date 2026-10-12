@@ -1,6 +1,6 @@
 # API 文档
 
-版本：0.2.0 · 更新：2026-10-12
+版本：1.0.0 · 更新：2026-10-12
 
 本文描述当前接口。旧版差异与验收过程见 [历史归档](archive/api-history.md)，安装参数和环境变量见 [安装与升级](installation.md)、[运行维护](operations.md)。
 
@@ -332,7 +332,7 @@ JSON 请求使用 `Content-Type: application/json`。`OPTIONS` 预检返回 204�
 ```json
 {
   "ok": true,
-  "settings": {"site_name":"kuku2api","log_retention_days":30,"conversation_retention_days":0},
+  "settings": {"site_name":"kuku2api","log_retention_days":7,"conversation_retention_days":0},
   "auto_claim": {"enabled":false,"hour":9,"last_run_at":null,"last_result":null,"next_run_at":null,"running":false},
   "storage": {"engine":"sqlite","schema_version":1}
 }
@@ -341,6 +341,8 @@ JSON 请求使用 `Content-Type: application/json`。`OPTIONS` 预检返回 204�
 `PATCH /pool/admin/settings` 直接提交 settings 的字段，例如 `{"site_name":"我的号池","log_retention_days":30}`。只允许站点名称（去空白后 1–80 字符）与两个保留天数（整数 0–3650，0 为长期保留）。省略字段保持原值，未知字段拒绝。
 
 修改策略会立即清理已过期数据，之后启动/每小时继续执行；可能移除旧续聊映射，累计用量保留。每日领取通过独立 auto-claim 接口配置。这里不能读取/写入管理员令牌、Cookie、浏览器连接信息或任意数据库 settings 键。
+
+v1.0.0 起，新安装的日志默认保留 7 天，对话默认长期保留。升级沿用数据库已有保留设置，包括此前保存的 30 天或 0，不强制覆盖。接口字段、允许范围与鉴权不变。
 
 ## 运行实例管理
 

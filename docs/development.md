@@ -60,7 +60,9 @@ npm exec --yes --package=pnpm@10.34.0 -- pnpm test
 
 ## 发布流程
 
-`.github/workflows/ci.yml` 在 Windows/Linux 验证后端与安装逻辑，再构建控制台，打包已提交源码并执行无构建工具安装验证。main 推送通过检查后发布 `build-<commit>`，资产为 `kuku2api.tar.gz`、`kuku2api.zip` 和 `SHA256SUMS`。
+`.github/workflows/ci.yml` 在 Windows/Linux 验证后端与安装逻辑，再构建控制台，打包已提交源码并执行无构建工具安装验证。main 推送通过检查后按根目录 `package.json` 的版本号发布正式版 `v<version>`，资产为 `kuku2api.tar.gz`、`kuku2api.zip` 和 `SHA256SUMS`，发布说明读取 `docs/releases/v<version>.md`。
+
+正式版版本号使用 `主版本.次版本.修订号`。已发布版本不覆盖；后续发布必须提高版本号并补充相应发布说明。历史 `build-<commit>` 为正式版之前的构建记录。一键安装与升级使用最新正式版资产，服务器无需构建。
 
 安装器使用最新已验证发布包，校验归档与控制台清单。发布包包含项目 [0BSD](../LICENSE) 和前端模板 [MIT](../ui/LICENSE) 声明。
 

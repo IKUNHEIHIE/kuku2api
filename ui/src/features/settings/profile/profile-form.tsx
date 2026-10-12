@@ -57,7 +57,7 @@ export function ProfileForm() {
   const [savingServerSettings, setSavingServerSettings] = useState(false)
   const [serverForm, setServerForm] = useState({
     site_name: 'kuku2api',
-    log_retention_days: '30',
+    log_retention_days: '7',
     conversation_retention_days: '0',
   })
   const [confirmRetentionOpen, setConfirmRetentionOpen] = useState(false)
@@ -71,7 +71,7 @@ export function ProfileForm() {
       setServerSettingsData(res)
       setServerForm({
         site_name: res.settings?.site_name ?? 'kuku2api',
-        log_retention_days: String(res.settings?.log_retention_days ?? 30),
+        log_retention_days: String(res.settings?.log_retention_days ?? 7),
         conversation_retention_days: String(res.settings?.conversation_retention_days ?? 0),
       })
     } catch (err: unknown) {
@@ -90,7 +90,7 @@ export function ProfileForm() {
           setServerSettingsData(res)
           setServerForm({
             site_name: res.settings?.site_name ?? 'kuku2api',
-            log_retention_days: String(res.settings?.log_retention_days ?? 30),
+            log_retention_days: String(res.settings?.log_retention_days ?? 7),
             conversation_retention_days: String(res.settings?.conversation_retention_days ?? 0),
           })
         }
@@ -300,7 +300,7 @@ export function ProfileForm() {
       setServerSettingsData(res)
       setServerForm({
         site_name: res.settings?.site_name ?? 'kuku2api',
-        log_retention_days: String(res.settings?.log_retention_days ?? 30),
+        log_retention_days: String(res.settings?.log_retention_days ?? 7),
         conversation_retention_days: String(res.settings?.conversation_retention_days ?? 0),
       })
       toast.success('服务器设置已成功保存并应用')

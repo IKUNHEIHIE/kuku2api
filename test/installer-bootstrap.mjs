@@ -179,7 +179,7 @@ for (const [name, executable] of runners) {
       mkdirSync(path.join(source, 'ui/dist/assets'), { recursive: true });
       writeFileSync(path.join(source, 'ui/dist/index.html'), '<!doctype html><script src="/assets/app.js"></script>');
       writeFileSync(path.join(source, 'ui/dist/assets/app.js'), 'console.log("prebuilt")');
-      writeFileSync(path.join(source, 'release.json'), JSON.stringify({ format: 1, commit: 'c'.repeat(40), version: '0.2.0', console: consoleFiles(source) }));
+      writeFileSync(path.join(source, 'release.json'), JSON.stringify({ format: 1, commit: 'c'.repeat(40), version: JSON.parse(readFileSync(path.join(source, 'package.json'))).version, console: consoleFiles(source) }));
       const archive = path.join(base, name === 'Bash' ? 'kuku2api.tar.gz' : 'kuku2api.zip'), checksums = path.join(base, 'SHA256SUMS');
       if (name === 'Bash') execFileSync('tar', ['-czf', archive, '-C', source, '.'], { windowsHide: true });
       else execFileSync(executable, ['-NoProfile', '-Command', `Compress-Archive -Path '${source.replaceAll("'", "''")}/*' -DestinationPath '${archive.replaceAll("'", "''")}'`], { windowsHide: true });

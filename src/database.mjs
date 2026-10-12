@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { responseRecordForStorage } from './ledger.mjs';
 
-export const SYSTEM_DEFAULTS = { site_name: 'kuku2api', log_retention_days: 30, conversation_retention_days: 0 };
+export const SYSTEM_DEFAULTS = { site_name: 'kuku2api', log_retention_days: 7, conversation_retention_days: 0 };
 const parse = (s) => {
   try { return JSON.parse(s); }
   catch { throw new Error('Stored database record is invalid JSON; restore a verified backup'); }

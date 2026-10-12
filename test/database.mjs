@@ -19,6 +19,33 @@ function fixture(t) {
 const fakeAccount = { id: 'fake', alias: 'fake alias', priority: 0, bduss: 'FAKE-BDUSS', stoken: 'FAKE-STOKEN' };
 function memory(t) { const database = openDatabase({ file: ':memory:' }); t.after(() => database.close()); return database; }
 const silent = { log() {}, warn() {}, error() {} };
+
+test('new databases retain seven days of logs and prune only older records', (t) => {
+  const database = memory(t), now = Date.now();
+  database.addLog({ created_at: now - 8 * 86400000, message: 'expired' });
+  database.addLog({ created_at: now - 7 * 86400000, message: 'boundary' });
+  database.addLog({ created_at: now - 6 * 86400000, message: 'recent' });
+  assert.equal(database.systemSettings().log_retention_days, 7);
+  database.prune(now);
+  assert.deepEqual(database.logs().data.map(row => row.message), ['recent', 'boundary']);
+});
+
+test('reopening databases preserves existing thirty-day and unlimited log retention', (t) => {
+  for (const days of [30, 0]) {
+    const root = fixture(t), now = Date.now();
+    let database = openDatabase({ root });
+    database.updateSystemSettings({ log_retention_days: days });
+    database.addLog({ created_at: now - (days === 0 ? 100 : 8) * 86400000, message: 'preserved' });
+    database.close();
+    database = openDatabase({ root });
+    try {
+      assert.equal(database.systemSettings().log_retention_days, days);
+      database.prune(now);
+      assert.equal(database.logs().total, 1);
+    } finally { database.close(); }
+  }
+});
+
 function appFor(database) {
   const pool = new Pool([fakeAccount], { database, sessionStore: database.store('sessions'), logger: silent });
   const logger = createDatabaseLogger(database, { secrets: () => ['fake-admin', 'FAKE-BDUSS', 'FAKE-STOKEN'], consoleOutput: silent });

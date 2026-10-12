@@ -49,15 +49,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="build-$GITHUB_SHA"
+          version="$(node -p "JSON.parse(require('fs').readFileSync('package.json')).version")"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'A stable semantic version is required.' >&2; exit 1; }
+          tag="v$version"
+          notes="docs/releases/$tag.md"
+          test -f "$notes"
           if [[ "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" != "$GITHUB_SHA" ]]; then
             echo 'A newer commit exists; this build will not replace the latest release.'
             exit 0
           fi
           if gh release view "$tag" --json isDraft > .runtime/release/existing.json 2>/dev/null; then
-            if [[ "$(node -p "JSON.parse(require('fs').readFileSync('.runtime/release/existing.json')).isDraft")" != true ]]; then exit 0; fi
+            if [[ "$(node -p "JSON.parse(require('fs').readFileSync('.runtime/release/existing.json')).isDraft")" != true ]]; then
+              echo "$tag is already published; bump package.json and add release notes to publish a new version."
+              exit 0
+            fi
             gh release upload "$tag" .runtime/release/kuku2api.tar.gz .runtime/release/kuku2api.zip .runtime/release/SHA256SUMS --clobber
           else
-            gh release create "$tag" .runtime/release/kuku2api.tar.gz .runtime/release/kuku2api.zip .runtime/release/SHA256SUMS --draft --target "$GITHUB_SHA" --title "kuku2api ${GITHUB_SHA:0:7}" --notes 'Prebuilt console and backend. No frontend build or dependency installation is required on the server. SHA256SUMS included.'
+            gh release create "$tag" .runtime/release/kuku2api.tar.gz .runtime/release/kuku2api.zip .runtime/release/SHA256SUMS --draft --target "$GITHUB_SHA" --title "kuku2api $tag" --notes-file "$notes"
           fi
           gh release edit "$tag" --draft=false --latest

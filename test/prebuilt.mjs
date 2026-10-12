@@ -29,7 +29,7 @@ function fixture() {
   return root;
 }
 function seal(root, sha = commit) {
-  put(root, 'release.json', JSON.stringify({ format: 1, commit: sha, version: '0.2.0', console: consoleFiles(root) }));
+  put(root, 'release.json', JSON.stringify({ format: 1, commit: sha, version: JSON.parse(readFileSync(path.join(root, 'package.json'))).version, console: consoleFiles(root) }));
 }
 function cleanup(root) {
   assert.equal(path.dirname(root), tmpdir()); assert.match(path.basename(root), /^kuku-prebuilt-test-/);
