@@ -1,6 +1,12 @@
 import { DatabaseSync } from 'node:sqlite';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { isIP } from 'node:net';
+
+export function listenHost(value = '127.0.0.1') {
+  if (typeof value !== 'string' || !isIP(value)) throw new Error('LISTEN_HOST must be an IPv4 or IPv6 address');
+  return value;
+}
 
 export function listenPort(value = 8787) {
   if (!/^[0-9]+$/.test(String(value)) || !Number.isSafeInteger(Number(value)) || Number(value) < 1 || Number(value) > 65535) {

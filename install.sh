@@ -45,10 +45,9 @@ command -v curl >/dev/null || { message '请先安装 curl。' 'Please install c
 command -v tar >/dev/null || { message '请先安装 tar。' 'Please install tar first.' >&2; exit 1; }
 work="$(mktemp -d "${TMPDIR:-/tmp}/kuku2api.XXXXXX")"
 trap 'rm -rf -- "$work"' EXIT
-download() { curl --fail --location --retry 3 --connect-timeout 20 --max-time 600 --proto '=https' --tlsv1.2 "$1" -o "$2"; }
+download() { curl --silent --show-error --fail --location --retry 3 --connect-timeout 20 --max-time 600 --proto '=https' --tlsv1.2 "$1" -o "$2"; }
 download_source() {
   if [[ "$source_build" == false && "$backend_only" == false ]]; then
-    message '正在下载预编译发布包；服务器无需构建…' 'Downloading the prebuilt release; no server-side build required…'
     download "$RELEASE_URL/SHA256SUMS" "$work/release-checksums.txt" || { message '预编译发布包暂不可用，请稍后重试；不会转为本机构建。' 'Prebuilt release unavailable; retry later. No local build will run.' >&2; exit 1; }
     download "$RELEASE_URL/kuku2api.tar.gz" "$work/source.tar.gz"
     expected="$(awk '$2=="kuku2api.tar.gz" {print $1}' "$work/release-checksums.txt")"
@@ -60,7 +59,6 @@ download_source() {
     tar -xzf "$work/source.tar.gz" -C "$work/source"
     [[ -f "$work/source/release.json" && -f "$work/source/ui/dist/index.html" && -f "$work/source/scripts/prebuilt.mjs" ]] || { message '预编译发布包不完整，已停止安装。' 'Incomplete prebuilt release; installation stopped.' >&2; exit 1; }
   else
-  message '正在下载最新源码…' 'Downloading the latest source…'
   download "$SOURCE_URL" "$work/source.tar.gz"
   mkdir "$work/source"
   tar -xzf "$work/source.tar.gz" -C "$work/source" --strip-components=1
@@ -77,7 +75,6 @@ if [[ ! -f "$install_dir/scripts/install.mjs" ]]; then
   if [[ -e "$install_dir" && ( ! -d "$install_dir" || -n "$(ls -A "$install_dir")" ) ]]; then
     message "拒绝覆盖非空目录: $install_dir，请用 --dir 指定其他目录。" "Refusing to overwrite a non-empty directory: $install_dir. Use --dir PATH." >&2; exit 1
   fi
-  message "正在下载源码到 $install_dir ..." "Downloading source into $install_dir ..."
   download_source
   mkdir -p -- "$(dirname -- "$install_dir")"
   if [[ -d "$install_dir" ]]; then rmdir -- "$install_dir"; fi
@@ -95,7 +92,6 @@ elif command -v node >/dev/null && usable_node "$(command -v node)"; then
 else
   case "$(uname -s)" in Linux) platform=linux ;; Darwin) platform=darwin ;; *) message 'Windows 请使用 install.ps1；Unix 支持 Linux/macOS。' 'Use install.ps1 on Windows; supported Unix systems: Linux/macOS.' >&2; exit 1 ;; esac
   case "$(uname -m)" in x86_64|amd64) arch=x64 ;; aarch64|arm64) arch=arm64 ;; *) message '支持的架构: x64/arm64。' 'Supported architectures: x64/arm64.' >&2; exit 1 ;; esac
-  message '正在安装并校验私有 Node.js 运行时...' 'Installing and verifying a private Node.js runtime...'
   download "$NODE_URL/SHASUMS256.txt" "$work/SHASUMS256.txt"
   archive="$(awk -v suffix="-$platform-$arch.tar.gz" 'index($2,suffix) == length($2)-length(suffix)+1 && $2 ~ /^node-v24\./ {print $2}' "$work/SHASUMS256.txt")"
   [[ "$archive" =~ ^node-v24\.[0-9]+\.[0-9]+-(linux|darwin)-(x64|arm64)\.tar\.gz$ ]] || { message '未找到匹配的官方 Node.js 程序。' 'No matching official Node.js binary.' >&2; exit 1; }
@@ -114,14 +110,14 @@ else
   node_bin="$install_dir/.runtime/node/bin/node"
 fi
 export PATH="$(dirname -- "$node_bin"):$PATH"
-compatible_source() { "$node_bin" -e 'const fs=require("node:fs"),p=require("node:path"),root=process.argv[1];try{process.exit(fs.readFileSync(p.join(root,"scripts/install.mjs"),"utf8").includes("export const INSTALLER_PROTOCOL = 3;")&&["scripts/manage.mjs","scripts/service.mjs","scripts/install-language.mjs","scripts/prebuilt.mjs","src/listen-port.mjs"].every(file=>fs.existsSync(p.join(root,file)))?0:1)}catch{process.exit(1)}' "$install_dir"; }
+export KUKU_INSTALLER_QUIET=1
+compatible_source() { "$node_bin" -e 'const fs=require("node:fs"),p=require("node:path"),root=process.argv[1];try{process.exit(fs.readFileSync(p.join(root,"scripts/install.mjs"),"utf8").includes("export const INSTALLER_PROTOCOL = 4;")&&["scripts/manage.mjs","scripts/service.mjs","scripts/install-language.mjs","scripts/prebuilt.mjs","scripts/install-output.mjs","src/listen-port.mjs"].every(file=>fs.existsSync(p.join(root,file)))?0:1)}catch{process.exit(1)}' "$install_dir"; }
 if [[ "$action" == auto ]]; then
   if [[ "$script_dir" != "$install_dir" ]] || ! compatible_source || [[ "$source_build" == false && "$backend_only" == false ]]; then action=upgrade; else action=install; fi
 fi
 if [[ "$action" == start || "$action" == restart ]] && ! compatible_source; then action=upgrade; fi
 if [[ "$action" == upgrade ]]; then
   download_source
-  message "检测到已有安装，将保留数据并升级：$install_dir" "Existing installation detected; upgrading while preserving data: $install_dir"
   "$node_bin" "$work/source/scripts/manage.mjs" --root "$install_dir" --upgrade "${options[@]}"
   exit $?
 fi

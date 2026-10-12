@@ -3,9 +3,13 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { availablePort } from './install.mjs';
 import { start } from './start.mjs';
-import { listenPort } from '../src/listen-port.mjs';
+import { listenPort, listenHost } from '../src/listen-port.mjs';
 
 export const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+const runtimeUrl = state => {
+  const host = state.host === '0.0.0.0' ? '127.0.0.1' : state.host === '::' ? '::1' : state.host ?? '127.0.0.1';
+  return `http://${host.includes(':') ? `[${host}]` : host}:${state.port}`;
+};
 // Windows may report the same directory with different casing or DOS short names.
 export function samePath(left, right) {
   if (typeof left !== 'string' || typeof right !== 'string' || !path.isAbsolute(left) || !path.isAbsolute(right)) return false;
@@ -33,14 +37,14 @@ export function installationState(root) {
     admin = JSON.parse(readFileSync(path.join(root, 'admin-token.json'), 'utf8'));
   }
   return { file, settings, token: process.env.ADMIN_TOKEN?.trim() ? process.env.ADMIN_TOKEN : admin.token,
-    port: listenPort(process.env.PORT ?? settings.port ?? 8787) };
+    port: listenPort(process.env.PORT ?? settings.port ?? 8787), host: listenHost(process.env.LISTEN_HOST ?? settings.host ?? '127.0.0.1') };
 }
 
 export async function runtimeAt(root, state, t = (_zh, en) => en) {
-  try { await availablePort(state.port); return null; } catch {}
+  try { await availablePort(state.port, 'en', state.host); return null; } catch {}
   let response, info;
   try {
-    response = await fetch(`http://127.0.0.1:${state.port}/pool/admin/runtime`, {
+    response = await fetch(`${runtimeUrl(state)}/pool/admin/runtime`, {
       headers: { 'x-admin-token': state.token ?? '' }, signal: AbortSignal.timeout(3000), redirect: 'error',
     });
     info = await response.json();
@@ -54,7 +58,7 @@ export async function runtimeAt(root, state, t = (_zh, en) => en) {
 }
 
 export async function stopRuntime(state, info, t = (_zh, en) => en, timeout = 120000) {
-  const response = await fetch(`http://127.0.0.1:${state.port}/pool/admin/shutdown`, {
+  const response = await fetch(`${runtimeUrl(state)}/pool/admin/shutdown`, {
     method: 'POST', headers: { 'x-admin-token': state.token, 'content-type': 'application/json' },
     body: JSON.stringify({ instance_id: info.instance_id }), signal: AbortSignal.timeout(5000), redirect: 'error',
   });
@@ -70,14 +74,16 @@ export async function stopRuntime(state, info, t = (_zh, en) => en, timeout = 12
 }
 
 export async function launchVerified(root, port, t = (_zh, en) => en, timeout = 120000) {
-  await availablePort(port);
-  const child = start(root, { port, env: { ...process.env, DATABASE_FILE: installationState(root).file } });
+  // Read configuration before spawning: repeatedly opening SQLite while the child
+  // initializes WAL can briefly lock its database during the startup check.
+  const state = installationState(root); state.port = port;
+  await availablePort(port, 'en', state.host);
+  const child = start(root, { port, env: { ...process.env, DATABASE_FILE: state.file } });
   const closed = new Promise(resolve => { child.once('error', resolve); child.once('close', resolve); });
   let ended = false;
   closed.then(() => { ended = true; });
   const deadline = Date.now() + timeout;
   while (!ended && Date.now() < deadline) {
-    const state = installationState(root); state.port = port;
     try {
       const info = await runtimeAt(root, state);
       if (info?.pid === child.pid) return child;

@@ -10,6 +10,7 @@ import { installerLanguage } from './install-language.mjs';
 import { listenPort } from '../src/listen-port.mjs';
 import { installationState, runtimeAt, stopRuntime, launchVerified, samePath } from './service.mjs';
 import { validatePrebuilt } from './prebuilt.mjs';
+import { quietInstall, progress, installSummary } from './install-output.mjs';
 
 const HERE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const roots = new Set(['src', 'scripts', 'test', 'docs', 'ui', '.github']);
@@ -74,6 +75,10 @@ export async function manage(root, source, action, args, { build = buildConsole,
   const options = installOptions(args), language = installerLanguage(options.lang);
   const t = (zh, en) => language === 'zh' ? zh : en;
   const state = installationState(root);
+  const summary = async port => {
+    const current = installationState(root);
+    if (quietInstall()) await installSummary({ port, token: current.token, host: current.host, language });
+  };
   let port = listenPort(options.port ?? state.port);
   const incomplete = !existsSync(state.file) && !['accounts.json', 'keys.json', 'settings.json', 'admin-token.json'].some(name => existsSync(path.join(root, name)));
   const runtimeDirectory = path.join(root, '.runtime');
@@ -87,16 +92,17 @@ export async function manage(root, source, action, args, { build = buildConsole,
   let backupDirectory, originalFiles, installedFiles, previousGit, nextGit, release, databaseSaved = false, changed = false, distChanged = false, oldStopped = false, previousRuntime;
   try {
     if (action === 'upgrade' && incomplete) {
-      console.log(t('检测到尚未完成的安装，重新选择可用端口；不会停止占用默认端口的服务。', 'An incomplete installation was detected. Selecting an available port without stopping the service on the default port.'));
+      progress(t('检测到尚未完成的安装，重新选择可用端口；不会停止占用默认端口的服务。', 'An incomplete installation was detected. Selecting an available port without stopping the service on the default port.'));
       port = await choosePort({ ...options, savedPort: state.port, language, start: true, autoAvailable: true, ...portSelection });
     } else previousRuntime = await runtimeAt(root, state, t);
     if (action === 'start' && previousRuntime) {
-      console.log(t(`服务已经运行：http://127.0.0.1:${state.port}`, `Service is already running: http://127.0.0.1:${state.port}`)); return;
+      progress(t(`服务已经运行：http://127.0.0.1:${state.port}`, `Service is already running: http://127.0.0.1:${state.port}`)); await summary(state.port); return;
     }
     if (action !== 'upgrade') {
       if (options.port !== undefined && port !== state.port) throw new Error(t('请在安装或升级时修改端口，启动/重启沿用已保存端口。', 'Change the port during installation or upgrade; start/restart reuse the saved port.'));
       if (previousRuntime) await stopRuntime(state, previousRuntime, t);
       if (options.start) await launch(root, port, t);
+      await summary(port);
       return;
     }
     if (samePath(root, source)) throw new Error('Upgrade requires a separate staging source directory');
@@ -109,7 +115,7 @@ export async function manage(root, source, action, args, { build = buildConsole,
       if (git(root, ['status', '--porcelain'])) throw new Error(t('Git 目录有本地修改，已保留。请先提交或另存修改后再升级。', 'The Git checkout has local changes. Commit or save them before upgrading; nothing was overwritten.'));
       if (!samePath(git(root, ['rev-parse', '--show-toplevel']), root)) throw new Error('Installation must be the Git repository root');
       previousGit = git(root, ['rev-parse', 'HEAD']);
-      console.log(t('正在获取 Git 更新…', 'Fetching Git updates…'));
+      progress(t('正在获取 Git 更新…', 'Fetching Git updates…'));
       git(root, ['fetch', 'origin', release?.commit ?? 'main']); nextGit = git(root, ['rev-parse', 'FETCH_HEAD']);
       if (release && nextGit !== release.commit) throw new Error('Git update and release commit differ');
       git(root, ['merge-base', '--is-ancestor', previousGit, nextGit]);
@@ -139,13 +145,14 @@ export async function manage(root, source, action, args, { build = buildConsole,
       catch { consoleReady = false; }
     }
     if (!incomplete && (sameSource || (previousGit && previousGit === nextGit)) && port === state.port && (!options.ui || consoleReady)) {
-      console.log(t('源码已是最新版本，沿用现有构建与端口。', 'Source is already current; reusing the existing build and port.'));
+      progress(t('源码已是最新版本，沿用现有构建与端口。', 'Source is already current; reusing the existing build and port.'));
       if (options.start && !previousRuntime) await launch(root, port, t);
+      await summary(port);
       return { port, unchanged: true };
     }
     if (port !== state.port || !previousRuntime) await availablePort(port, language);
     if (options.ui && existsSync(path.join(root, 'ui/dist')) && lstatSync(path.join(root, 'ui/dist')).isSymbolicLink()) throw new Error('Linked console build directory is not supported');
-    console.log(options.sourceBuild ? t('正在临时目录构建新版；现有服务暂不停止…', 'Building the update in staging; the existing service remains running…')
+    progress(options.sourceBuild ? t('正在临时目录构建新版；现有服务暂不停止…', 'Building the update in staging; the existing service remains running…')
       : t('正在校验新版预编译控制台；现有服务暂不停止…', 'Verifying the prebuilt update; the existing service remains running…'));
     if (!options.dependencies && options.ui && options.sourceBuild) throw new Error(t('源码升级需要重新安装前端依赖，请去掉 --skip-dependencies。', 'Source upgrades require staging dependencies; omit --skip-dependencies.'));
     await build(source, options, t);
@@ -153,7 +160,7 @@ export async function manage(root, source, action, args, { build = buildConsole,
     if (previousRuntime) {
       const current = await runtimeAt(root, state, t);
       if (current?.instance_id !== previousRuntime.instance_id) throw new Error('Running service changed during the build');
-      console.log(t('正在等待现有请求完成并停止本服务…', 'Draining requests and stopping this service…'));
+      progress(t('正在等待现有请求完成并停止本服务…', 'Draining requests and stopping this service…'));
       await stopRuntime(state, current, t); oldStopped = true;
     }
     await availablePort(port, language);
@@ -164,7 +171,7 @@ export async function manage(root, source, action, args, { build = buildConsole,
     copyPublic(root, path.join(backupDirectory, 'source'), originalFiles);
     databaseSaved = await databaseBackup(state.file, path.join(backupDirectory, 'database.sqlite'));
     writeFileSync(path.join(backupDirectory, 'upgrade.json'), JSON.stringify({ version: manifest.version, database_file: state.file, previous_git: previousGit, original_files: [...originalFiles.keys()], new_files: [...installedFiles.keys()] }, null, 2), { mode: 0o600 });
-    console.log(t(`备份已保存：${backupDirectory}`, `Backup saved: ${backupDirectory}`));
+    progress(t(`备份已保存：${backupDirectory}`, `Backup saved: ${backupDirectory}`));
     changed = true;
     if (previousGit) {
       git(root, ['merge', '--ff-only', nextGit]);
@@ -187,11 +194,12 @@ export async function manage(root, source, action, args, { build = buildConsole,
     }
     // Run the installed version's initialization so legacy JSON imports use the installed root.
     const result = spawnSync(process.execPath, [path.join(root, 'scripts/install.mjs'), '--backend-only', '--no-start', '--port', String(port), '--lang', language], {
-      cwd: root, env: { ...process.env, DATABASE_FILE: state.file }, stdio: 'inherit', windowsHide: true,
+      cwd: root, env: { ...process.env, DATABASE_FILE: state.file, KUKU_INSTALLER_SUMMARY: '0' }, stdio: 'inherit', windowsHide: true,
     });
     if (result.status !== 0) throw new Error('Updated database initialization failed');
     if (options.start) await launch(root, port, t);
-    console.log(t(`升级完成：http://127.0.0.1:${port}`, `Upgrade complete: http://127.0.0.1:${port}`));
+    progress(t(`升级完成：http://127.0.0.1:${port}`, `Upgrade complete: http://127.0.0.1:${port}`));
+    await summary(port);
     return { backupDirectory, port };
   } catch (error) {
     if (changed) {

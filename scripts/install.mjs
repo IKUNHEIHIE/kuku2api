@@ -5,13 +5,14 @@ import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
-import { listenPort, savedListenPort } from '../src/listen-port.mjs';
+import { listenPort, listenHost, savedListenPort } from '../src/listen-port.mjs';
 import { installerLanguage } from './install-language.mjs';
 import { directEnvironment, start } from './start.mjs';
 import { validatePrebuilt } from './prebuilt.mjs';
+import { quietInstall, progress, installSummary } from './install-output.mjs';
 
 export const PNPM_VERSION = '10.34.0';
-export const INSTALLER_PROTOCOL = 3;
+export const INSTALLER_PROTOCOL = 4;
 export function supportedNode(version) {
   const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version);
   return !!m && (Number(m[1]) > 24 || (Number(m[1]) === 24 && Number(m[2]) >= 15));
@@ -31,14 +32,17 @@ export function installOptions(args) {
   return { ...values, ...(args.includes('--build-from-source') ? { sourceBuild: true } : {}), start: !args.includes('--no-start'), ui: !args.includes('--backend-only'),
     dependencies: !args.includes('--skip-dependencies') };
 }
-export async function availablePort(port, language = 'en') {
+export async function availablePort(port, language = 'en', host = process.env.LISTEN_HOST ?? '0.0.0.0') {
   port = listenPort(port);
-  await new Promise((resolve, reject) => {
+  host = listenHost(host);
+  // Windows can bind a wildcard socket over an existing loopback listener.
+  // Check both so maintenance never mistakes an occupied port for a free one.
+  for (const address of new Set([host === '::' ? '::1' : '127.0.0.1', host])) await new Promise((resolve, reject) => {
     const server = createServer();
     server.once('error', error => reject(new Error(language === 'zh'
       ? `端口 ${port} 无法使用（${error.code}），请指定其他端口或先停止旧服务。`
       : `Port ${port} is in use or unavailable (${error.code}). Choose another port or stop the existing service.`)));
-    server.listen(port, '127.0.0.1', () => server.close(resolve));
+    server.listen(port, address, () => server.close(resolve));
   });
 }
 
@@ -58,7 +62,7 @@ export async function choosePort({ port, envPort = process.env.PORT, savedPort, 
         alternative = candidate; break;
       }
       if (alternative === undefined) throw error;
-      warn(t(`端口 ${selected} 已占用或不可用，自动选择 ${alternative}；原服务保持运行。`, `Port ${selected} is occupied or unavailable; selected ${alternative} automatically. The existing service is unchanged.`));
+      warn(t(`端口 ${selected} 不可用，改用 ${alternative}。`, `Port ${selected} unavailable; using ${alternative}.`));
       fallback = alternative;
     }
     if (!interactive) return listenPort(fallback);
@@ -88,7 +92,7 @@ export async function choosePort({ port, envPort = process.env.PORT, savedPort, 
   }
   try {
     while (true) {
-      const answer = await ask(t(`请输入服务端口 [${fallback}]（回车沿用）：`, `Service port [${fallback}] (Enter to keep): `));
+      const answer = await ask(t(`请选择运行端口（默认${fallback}）：`, `Choose port (default ${fallback}): `));
       let selected;
       try {
         selected = listenPort(answer.trim() || fallback);
@@ -121,9 +125,9 @@ export async function install(root, args) {
   const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
   if (manifest.name !== 'kuku2api') throw new Error(t('当前目录不是 kuku2api 源码目录。', 'This is not a kuku2api source directory'));
   const version = manifest.version ?? t('(本地源码)', '(local source)');
-  console.log(t(`正在安装 kuku2api ${version}${options.ui ? '，包含最新控制台' : '（仅后端）'}。`, `Installing kuku2api ${version}${options.ui ? ' with the console' : ' (backend only)'}.`));
+  progress(t(`正在安装 kuku2api ${version}${options.ui ? '，包含最新控制台' : '（仅后端）'}。`, `Installing kuku2api ${version}${options.ui ? ' with the console' : ' (backend only)'}.`));
   const port = await choosePort({ ...options, savedPort: savedListenPort(root), language, autoAvailable: true });
-  console.log(t(`服务端口：${port}；安装成功后将保存，重启自动沿用。`, `Service port: ${port}; saved after a successful install and reused on restart.`));
+  progress(t(`服务端口：${port}；安装成功后将保存，重启自动沿用。`, `Service port: ${port}; saved after a successful install and reused on restart.`));
   await buildConsole(root, options, t);
   await finishInstall(root, options, port, language);
 }
@@ -133,7 +137,7 @@ export async function buildConsole(root, options, t = (_zh, en) => en) {
   if (options.ui) {
     if (!options.sourceBuild) {
       validatePrebuilt(root, t);
-      console.log(t('已校验预编译控制台；无需安装前端依赖或本机构建。', 'Prebuilt console verified; no frontend dependencies or local build required.'));
+      progress(t('已校验预编译控制台；无需安装前端依赖或本机构建。', 'Prebuilt console verified; no frontend dependencies or local build required.'));
       return;
     }
     if (options.dependencies) {
@@ -162,12 +166,22 @@ async function finishInstall(root, options, port, language) {
   // Recheck after a potentially long build, before initializing or changing storage.
   if (options.start) await availablePort(port, language);
   const database = openDatabase({ root });
+  let token, host;
   try {
-    resolveAdminToken({ store: database.store('admin'), language });
+    token = resolveAdminToken({ store: database.store('admin'), language, ...(quietInstall() ? { logger: { log() {} } } : {}) });
     const settings = database.store('installation');
-    settings.save({ ...settings.load(), port });
+    host = listenHost(process.env.LISTEN_HOST ?? settings.load().host ?? (quietInstall() ? '0.0.0.0' : '127.0.0.1'));
+    settings.save({ ...settings.load(), port, ...(quietInstall() || process.env.LISTEN_HOST !== undefined || settings.load().host !== undefined ? { host } : {}) });
   }
   finally { database.close(); }
+  if (quietInstall()) {
+    if (options.start) {
+      const { launchVerified } = await import('./service.mjs');
+      await launchVerified(root, port, t);
+    }
+    if (process.env.KUKU_INSTALLER_SUMMARY !== '0') await installSummary({ port, host, token, language });
+    return;
+  }
   const url = `http://127.0.0.1:${port}`;
   console.log(t(`kuku2api ${version} 安装完成。请保存上方首次生成的管理员令牌；再次安装会复用已有数据库与令牌。`, `kuku2api ${version} installed. Save the administrator token shown on first install; reinstalling preserves the database and token.`));
   console.log(t(`控制台 / API: ${url}${options.ui ? '' : '（仅后端；未构建控制台）'}`, `Console / API: ${url}${options.ui ? '' : ' (backend only; console not built)'}`));

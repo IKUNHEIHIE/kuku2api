@@ -45,7 +45,7 @@ function invoke(name, executable, root, database) {
     ? [path.join(ROOT, 'install.sh').replaceAll('\\', '/'), '--install', '--dir', root.replaceAll('\\', '/'), '--backend-only', '--no-start', '--port', '19777', '--lang', 'en']
     : ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(ROOT, 'install.ps1'), '-Install', '-InstallDir', root, '-BackendOnly', '-NoStart', '-Port', '19777', '-Lang', 'en'];
   return spawnSync(executable, args, { cwd: root, encoding: 'utf8', windowsHide: true, timeout: 30000,
-    env: { ...process.env, PATH: path.dirname(process.execPath) + path.delimiter + process.env.PATH, ADMIN_TOKEN: '', DATABASE_FILE: database } });
+    env: { ...process.env, PATH: path.dirname(process.execPath) + path.delimiter + process.env.PATH, ADMIN_TOKEN: '', DATABASE_FILE: database, LISTEN_HOST: '127.0.0.1' } });
 }
 function updateSource(root) {
   for (const directory of ['src', 'scripts']) cpSync(path.join(ROOT, directory), path.join(root, directory), { recursive: true });
@@ -76,9 +76,9 @@ for (const [name, executable] of runners) {
       updateSource(root);
       const result = invoke(name, executable, root, database);
       assert.equal(result.status, 0, result.stderr);
-      assert.match(result.stdout, /installed/);
+      assert.equal(result.stdout.trim().split(/\r?\n/).length, 2);
       assert.match(result.stdout, /127\.0\.0\.1:19777/);
-      assert.equal(result.stdout.includes(token), false);
+      assert.equal(result.stdout.includes(token), true);
       const db = openDatabase({ root, file: database });
       try {
         assert.equal(db.store('admin').load().token, token);
@@ -123,7 +123,7 @@ for (const [name, executable] of runners) {
       const archive = path.join(root, name === 'Bash' ? 'fixture.tar.gz' : 'fixture.zip');
       const mocks = path.join(root, 'fixture-bin'); mkdirSync(mocks);
       const environment = { ...process.env, PATH: mocks + path.delimiter + path.dirname(process.execPath) + path.delimiter + process.env.PATH,
-        ADMIN_TOKEN: '', DATABASE_FILE: database, KUKU_TEST_ARCHIVE: archive.replaceAll('\\', '/'), KUKU_TEST_ROOT: root,
+        ADMIN_TOKEN: '', DATABASE_FILE: database, LISTEN_HOST: '127.0.0.1', KUKU_TEST_ARCHIVE: archive.replaceAll('\\', '/'), KUKU_TEST_ROOT: root,
         KUKU_TEST_ENTRY: path.join(ROOT, name === 'Bash' ? 'install.sh' : 'install.ps1'), KUKU_TEST_MOCKS: mocks };
       let result;
       if (name === 'Bash') {
@@ -139,8 +139,8 @@ function Invoke-WebRequest { param($Uri, $OutFile, [switch]$UseBasicParsing, $Ti
           { cwd: root, encoding: 'utf8', windowsHide: true, timeout: 60000, env: environment });
       }
       assert.equal(result.status, 0, result.stderr);
-      assert.match(result.stdout, /Upgrade complete/);
-      assert.equal(result.stdout.includes(token), false);
+      assert.equal(result.stdout.trim().split(/\r?\n/).length, 2);
+      assert.equal(result.stdout.includes(token), true);
       assert.equal(existsSync(path.join(root, 'legacy-installer-executed')), false);
       assert(existsSync(path.join(root, 'scripts/manage.mjs')));
       const upgraded = openDatabase({ root, file: database });
@@ -186,7 +186,7 @@ for (const [name, executable] of runners) {
       const hash = createHash('sha256').update(readFileSync(archive)).digest('hex');
       writeFileSync(checksums, `${hash}  ${path.basename(archive)}\n`);
       const environment = { ...process.env, PATH: mocks + path.delimiter + path.dirname(process.execPath) + path.delimiter + process.env.PATH,
-        ADMIN_TOKEN: '', DATABASE_FILE: path.join(root, 'data/kukuai.sqlite'), PORT: undefined, NPM_CONFIG_OFFLINE: 'true',
+        ADMIN_TOKEN: '', DATABASE_FILE: path.join(root, 'data/kukuai.sqlite'), PORT: undefined, LISTEN_HOST: '127.0.0.1', NPM_CONFIG_OFFLINE: 'true',
         KUKU_TEST_ARCHIVE: archive.replaceAll('\\', '/'), KUKU_TEST_CHECKSUMS: checksums.replaceAll('\\', '/'), KUKU_TEST_ROOT: root,
         KUKU_TEST_ENTRY: path.join(ROOT, name === 'Bash' ? 'install.sh' : 'install.ps1'), KUKU_TEST_MOCKS: mocks };
       if (name === 'Bash') writeFileSync(path.join(mocks, 'curl'), `#!/usr/bin/env bash
@@ -205,11 +205,11 @@ else { throw 'Unexpected source or dependency download' } }
           cwd: base, encoding: 'utf8', windowsHide: true, timeout: 30000, env: environment,
         });
       };
-      const first = invoke(true); assert.equal(first.status, 0, first.stderr); assert.match(first.stdout, /no frontend dependencies or local build/);
+      const first = invoke(true); assert.equal(first.status, 0, first.stderr); assert.match(first.stdout, /^Console address: http:\/\/127\.0\.0\.1:19778\r?\nAdministrator key: kuku-admin-[A-Za-z0-9_-]{43}\r?\n$/);
       const db = openDatabase({ root }); const token = db.store('admin').load().token;
       db.store('accounts').save({ accounts: [{ id: 'keep-account', bduss: 'fake-cookie' }] }); db.close();
-      const repeated = invoke(false); assert.equal(repeated.status, 0, repeated.stderr); assert.match(repeated.stdout, /already current/);
-      assert(!repeated.stdout.includes(token)); assert.equal(existsSync(path.join(root, 'ui/node_modules')), false);
+      const repeated = invoke(false); assert.equal(repeated.status, 0, repeated.stderr); assert.equal(repeated.stdout, first.stdout);
+      assert(repeated.stdout.includes(token)); assert.equal(existsSync(path.join(root, 'ui/node_modules')), false);
       const before = readFileSync(environment.DATABASE_FILE);
       writeFileSync(checksums, `${'0'.repeat(64)}  ${path.basename(archive)}\n`);
       const rejected = invoke(false); assert.notEqual(rejected.status, 0); assert.match(rejected.stdout + rejected.stderr, /checksum mismatch/);

@@ -14,7 +14,7 @@ import { openDatabase, createDatabaseLogger } from './database.mjs';
 import { databaseAdminRoute } from './database-api.mjs';
 import { createDesktopLogin } from './desktop-login.mjs';
 import { createStaticUi } from './static-ui.mjs';
-import { listenPort } from './listen-port.mjs';
+import { listenPort, listenHost } from './listen-port.mjs';
 import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 
@@ -397,12 +397,12 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
   json(res, 200, final);
 }
 
-export function createApp({ pool, apiKeys = [], adminToken = '', store = null, deviceId = '', ledger = null, keyRing = null, autoClaim = null, database = null, logger = console, runtime = null, uiDirectory = path.join(ROOT, 'ui', 'dist') }) {
+export function createApp({ pool, apiKeys = [], adminToken = '', store = null, deviceId = '', ledger = null, keyRing = null, autoClaim = null, database = null, logger = console, runtime = null, allowUnkeyedModels = true, uiDirectory = path.join(ROOT, 'ui', 'dist') }) {
   const keys = keyRing ?? createKeyRing({ envKeys: apiKeys });
   const serveUi = createStaticUi(uiDirectory);
   const authed = (req) => {
-    // No keys configured at all = local single-user mode, the same rule as before key management.
-    if (keys.count() === 0) return true;
+    // Unkeyed single-user mode is permitted only for a loopback-bound server.
+    if (keys.count() === 0) return allowUnkeyedModels;
     const h = req.headers.authorization ?? '';
     const key = h.startsWith('Bearer ') ? h.slice(7) : req.headers['x-api-key'] ?? '';
     return keys.ok(key);
@@ -735,7 +735,7 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
         sessions: pool.sessions.size,
         admin_enabled: Boolean(adminToken),
         // The UI needs to be able to say "this server is currently unauthenticated".
-        api_open: keys.count() === 0,
+        api_open: allowUnkeyedModels && keys.count() === 0,
         api_key_count: keys.count(),
         // Scheduler state is not secret and the UI has to show whether daily claiming is on.
         auto_claim: autoClaim ? autoClaim.state : { configured: false, enabled: false },
@@ -803,13 +803,14 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   const database = openDatabase({ root: ROOT });
   const port = listenPort(process.env.PORT ?? database.store('installation').load().port ?? 8787);
+  const host = listenHost(process.env.LISTEN_HOST ?? database.store('installation').load().host ?? '127.0.0.1');
   const accountStore = database.store('accounts');
   const loaded = accountStore.load();
   const deviceId = loaded.default_device_id ?? '';
   const adminToken = resolveAdminToken({ store: database.store('admin') });
   const envKeys = (process.env.API_KEYS ?? '').split(',').filter(Boolean);
   const keyRing = createKeyRing({ store: database.store('keys'), envKeys });
-  const logger = createDatabaseLogger(database, { secrets: () => [adminToken, ...envKeys,
+  const logger = createDatabaseLogger(database, { ...(process.env.KUKU_INSTALLER_QUIET === '1' ? { consoleOutput: { log() {}, warn: console.warn, error: console.error } } : {}), secrets: () => [adminToken, ...envKeys,
     ...database.store('keys').load().keys.map((k) => k.key), ...(pool?.accounts ?? []).flatMap((a) => [a.client.bduss, a.client.stoken])] });
   const pool = new Pool(loaded.accounts, { sessionStore: database.store('sessions'), database, logger });
   for (const a of pool.accounts) a.deviceId = deviceId;
@@ -834,6 +835,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
     root: realpathSync(ROOT), database_file: realpathSync(process.env.DATABASE_FILE || path.join(ROOT, 'data/kukuai.sqlite')) }, shutdown };
   const app = createApp({
     pool,
+    allowUnkeyedModels: host === '127.0.0.1' || host === '::1',
     keyRing,
     adminToken,
     store: accountStore,
@@ -859,7 +861,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
     const request = app(req, res);
     pendingRequests.add(request);
     request.finally(() => pendingRequests.delete(request)).catch(() => {});
-  }).listen(port, '127.0.0.1', () => logger.log(`kuku2api on http://127.0.0.1:${port}; storage=sqlite`));
+  }).listen(port, host, () => logger.log(`kuku2api on http://${host}:${port}; storage=sqlite`));
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
 }

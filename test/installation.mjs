@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, writeFileSync, cpSync, rmSync, symlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
@@ -12,7 +12,8 @@ import { createApp } from '../src/server.mjs';
 import { installOptions, supportedNode, availablePort, choosePort } from '../scripts/install.mjs';
 import { directEnvironment } from '../scripts/start.mjs';
 import { installerLanguage } from '../scripts/install-language.mjs';
-import { listenPort, savedListenPort } from '../src/listen-port.mjs';
+import { listenPort, listenHost, savedListenPort } from '../src/listen-port.mjs';
+import { consoleAddress } from '../scripts/install-output.mjs';
 import { openDatabase } from '../src/database.mjs';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -52,6 +53,62 @@ test('launcher disables every case of upstream proxy variables without changing 
   assert.equal(Object.keys(out).some(k => /^(http|https|all)_proxy$/i.test(k)), false);
   assert.equal(out.ADMIN_TOKEN, input.ADMIN_TOKEN); assert.equal(out.API_KEYS, input.API_KEYS);
   assert.equal(input.HTTPS_PROXY, 'private');
+});
+
+test('console address uses the public IPv4, tolerates discovery failure and respects explicit bindings', async () => {
+  const interfaces = { eth0: [{ address: '10.0.0.7', internal: false }], lo: [{ address: '127.0.0.1', internal: true }] };
+  const options = { host: '0.0.0.0', interfaces };
+  assert.equal(await consoleAddress(8789, { ...options, request: async () => new Response('203.0.113.8\n') }), 'http://203.0.113.8:8789');
+  for (const request of [async () => { throw new Error('offline'); }, async () => new Response('<html>proxy error</html>'), async () => new Response('203.0.113.8', { status: 503 })]) {
+    assert.equal(await consoleAddress(8789, { ...options, request }), 'http://10.0.0.7:8789');
+  }
+  const request = async () => { throw new Error('explicit bindings must not discover a different address'); };
+  assert.equal(await consoleAddress(8789, { host: '127.0.0.1', request }), 'http://127.0.0.1:8789');
+  assert.equal(await consoleAddress(8789, { host: '::1', request }), 'http://[::1]:8789');
+  for (const host of ['0.0.0.0', '::', '127.0.0.1', '192.168.1.2']) assert.equal(listenHost(host), host);
+  for (const host of ['localhost', 'http://127.0.0.1', '', null]) assert.throws(() => listenHost(host), /LISTEN_HOST/);
+});
+
+test('a publicly bound backend requires a model key even before the first key is created', async () => {
+  const pool = { accounts: [], sessions: new Map() };
+  await http(createApp({ pool, adminToken: 'test-admin', allowUnkeyedModels: false }), async base => {
+    assert.equal((await fetch(base + '/pool/state')).status, 401);
+    assert.equal((await fetch(base + '/v1/models', { headers: { 'x-admin-token': 'test-admin' } })).status, 401);
+    const state = await fetch(base + '/pool/state', { headers: { 'x-admin-token': 'test-admin' } });
+    assert.equal(state.status, 200); assert.equal((await state.json()).api_open, false);
+  });
+});
+
+test('quiet installation persists public listening and only prints the two requested Chinese lines', async () => {
+  const root = fixture();
+  try {
+    for (const directory of ['src', 'scripts']) cpSync(path.join(ROOT, directory), path.join(root, directory), { recursive: true });
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'kuku2api', type: 'module' }));
+    // Avoid external IP discovery while exercising the default public binding.
+    const preload = path.join(root, 'offline-ip.mjs');
+    writeFileSync(preload, "globalThis.fetch = async () => new Response('203.0.113.8');");
+    const env = directEnvironment({ ...process.env, KUKU_INSTALLER_QUIET: '1', KUKU_INSTALLER_SUMMARY: undefined, LISTEN_HOST: undefined, ADMIN_TOKEN: '', DATABASE_FILE: path.join(root, 'data/kukuai.sqlite') });
+    const invoke = () => spawnSync(process.execPath, ['--import', pathToFileURL(preload).href, path.join(root, 'scripts/install.mjs'), '--backend-only', '--no-start', '--port', '19876', '--lang', 'zh'], { cwd: root, env, encoding: 'utf8', timeout: 15000 });
+    const first = invoke(); assert.equal(first.status, 0, first.stderr);
+    assert.match(first.stdout, /^控制台地址：http:\/\/203\.0\.113\.8:19876\r?\n管理员密钥：kuku-admin-[A-Za-z0-9_-]{43}\r?\n$/);
+    const db = openDatabase({ root, file: env.DATABASE_FILE });
+    try { assert.equal(db.store('installation').load().host, '0.0.0.0'); } finally { db.close(); }
+    const second = invoke(); assert.equal(second.status, 0, second.stderr); assert.equal(second.stdout, first.stdout);
+    const port = await freePort();
+    const child = spawn(process.execPath, [path.join(root, 'src/server.mjs')], { cwd: root, env: { ...env, KUKU_INSTALLER_QUIET: undefined, PORT: String(port) }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    try {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('Public backend did not start')), 10000);
+        child.once('exit', () => { clearTimeout(timer); reject(new Error('Public backend exited before listening')); });
+        child.stdout.on('data', data => { if (data.toString().includes(`http://0.0.0.0:${port}`)) { clearTimeout(timer); resolve(); } });
+      });
+      assert.equal((await fetch(`http://127.0.0.1:${port}/v1/models`)).status, 401);
+      const token = first.stdout.match(/kuku-admin-[A-Za-z0-9_-]{43}/)[0];
+      assert.equal((await fetch(`http://127.0.0.1:${port}/pool/state`, { headers: { 'x-admin-token': token } })).status, 200);
+    } finally {
+      const closed = new Promise(resolve => child.once('close', resolve)); child.kill(); await closed;
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('installer detects occupied and invalid ports without disturbing the running service', async () => {

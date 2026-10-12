@@ -57,7 +57,6 @@ function Test-TaskNode([string]$Executable) {
 }
 function Get-TaskSource {
   if (-not $BuildFromSource -and -not $BackendOnly) {
-    Write-Host (Get-TaskMessage '正在下载预编译发布包；服务器无需构建…' 'Downloading the prebuilt release; no server-side build required…')
     $taskReleaseUrl = "https://github.com/$taskRepository/releases/latest/download"
     $taskChecksum = Join-Path $taskTemp 'release-checksums.txt'
     $taskZip = Join-Path $taskTemp 'release.zip'
@@ -73,7 +72,6 @@ function Get-TaskSource {
     }
     return $taskSourceDirectory
   }
-  Write-Host (Get-TaskMessage '正在下载最新源码…' 'Downloading the latest source…')
   $taskZip = Join-Path $taskTemp 'source.zip'
   Get-TaskDownload "https://codeload.github.com/$taskRepository/zip/refs/heads/main" $taskZip
   Expand-Archive -LiteralPath $taskZip -DestinationPath (Join-Path $taskTemp 'source')
@@ -106,7 +104,6 @@ try {
       $taskArchitecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
       $taskArchitecture = $taskArchitecture.ToLowerInvariant() -replace '^amd64$','x64'
       if ($taskArchitecture -notin @('x64','arm64')) { throw (Get-TaskMessage 'Windows 支持的架构: x64/arm64。' 'Supported Windows architectures: x64/arm64') }
-      Write-Host (Get-TaskMessage '正在安装并校验私有 Node.js 运行时...' 'Installing and verifying a private Node.js runtime...')
       $taskNodeUrl = 'https://nodejs.org/dist/latest-v24.x'
       $taskChecksumFile = Join-Path $taskTemp 'SHASUMS256.txt'
       Get-TaskDownload "$taskNodeUrl/SHASUMS256.txt" $taskChecksumFile
@@ -130,19 +127,19 @@ try {
     }
   }
   $taskInstallerSource = if (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install.mjs')) { Get-Content -LiteralPath (Join-Path $InstallDir 'scripts/install.mjs') -Raw } else { '' }
-  $taskCompatible = $taskInstallerSource.Contains('export const INSTALLER_PROTOCOL = 3;') -and
+  $taskCompatible = $taskInstallerSource.Contains('export const INSTALLER_PROTOCOL = 4;') -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/manage.mjs')) -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/service.mjs')) -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install-language.mjs')) -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/prebuilt.mjs')) -and
+      (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install-output.mjs')) -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'src/listen-port.mjs'))
   if ($taskAction -eq 'auto') {
     $taskAction = if (-not $taskCompatible -or [IO.Path]::GetFullPath($PSScriptRoot) -ne $InstallDir -or (-not $BuildFromSource -and -not $BackendOnly)) { 'upgrade' } else { 'install' }
   }
   if ($taskAction -in @('start', 'restart') -and (-not $taskCompatible)) { $taskAction = 'upgrade' }
   if ($taskAction -eq 'install' -and (-not $taskCompatible)) {
-    Write-Host (Get-TaskMessage "检测到旧版或不完整的源码目录：$InstallDir" "Outdated or incomplete source directory detected: $InstallDir")
-    throw (Get-TaskMessage '请使用 -Upgrade 自动升级；数据库和令牌尚未被改动。' 'Use -Upgrade to update automatically; the database and token have not been changed.')
+    throw (Get-TaskMessage '源码目录版本过旧或不完整，请使用 -Upgrade 自动升级；数据库和令牌尚未被改动。' 'Outdated or incomplete source directory. Use -Upgrade to update automatically; the database and token have not been changed.')
   }
   $taskArgs = @('--lang', $Lang)
   if ($PSBoundParameters.ContainsKey('Port')) { $taskArgs += @('--port', "$Port") }
@@ -151,6 +148,7 @@ try {
   if ($SkipDependencies) { $taskArgs += '--skip-dependencies' }
   if ($BuildFromSource) { $taskArgs += '--build-from-source' }
   $env:PATH = (Split-Path $taskNode -Parent) + [IO.Path]::PathSeparator + $env:PATH
+  $env:KUKU_INSTALLER_QUIET = '1'
   if ($taskAction -eq 'upgrade') {
     $taskSource = Get-TaskSource
     & $taskNode (Join-Path $taskSource 'scripts/manage.mjs') --root $InstallDir --upgrade @taskArgs

@@ -220,7 +220,7 @@ for (const mode of ['explicit', 'interactive', 'unattended']) {
       const selected = mode === 'unattended' ? undefined : await freePort();
       const args = [...offline, ...(mode === 'explicit' ? ['--port', String(selected)] : [])];
       const result = await manage(f.root, f.source, 'upgrade', args, {
-        portSelection: { interactive: mode === 'interactive', ask: async prompt => { assert.match(prompt, /Service port/); return String(selected); } },
+        portSelection: { interactive: mode === 'interactive', ask: async prompt => { assert.match(prompt, /Choose port/); return String(selected); } },
       });
       assert.notEqual(result.port, f.port);
       if (selected) assert.equal(result.port, selected);
