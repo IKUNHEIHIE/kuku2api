@@ -7,6 +7,8 @@ import {
   verifyAdminToken,
   sanitizeHeaderValue,
   safeSetHeader,
+  getDefaultBaseUrl,
+  normalizeBaseUrl,
 } from './kuku-api'
 
 const store = new Map<string, string>()
@@ -36,9 +38,35 @@ describe('kuku-api client', () => {
   describe('settings management & header safety', () => {
     it('returns default settings when localStorage is empty', () => {
       const settings = getApiSettings()
-      expect(settings.baseUrl).toBe('http://127.0.0.1:8787')
+      expect(settings.baseUrl).toBe(window.location.origin)
       expect(settings.apiKey).toBe('')
       expect(settings.adminToken).toBe('')
+    })
+
+    it('detects the page protocol, host and port while excluding page paths and query strings', () => {
+      expect(getDefaultBaseUrl('http://116.205.111.229:8400/users?tab=sms')).toBe('http://116.205.111.229:8400')
+      expect(getDefaultBaseUrl('https://kuku2.diestar.cn/users')).toBe('https://kuku2.diestar.cn')
+      expect(getDefaultBaseUrl('https://[2001:db8::1]:8443/')).toBe('https://[2001:db8::1]:8443')
+      expect(getDefaultBaseUrl('file:///tmp/index.html')).toBe('http://127.0.0.1:8787')
+    })
+
+    it('normalizes bare domains and protocol-relative URLs without downgrading HTTPS', () => {
+      expect(normalizeBaseUrl('kuku2.diestar.cn/', 'https://console.test')).toBe('https://kuku2.diestar.cn')
+      expect(normalizeBaseUrl('//kuku2.diestar.cn/', 'https://console.test')).toBe('https://kuku2.diestar.cn')
+      expect(normalizeBaseUrl('localhost:8400', 'http://console.test')).toBe('http://localhost:8400')
+      expect(normalizeBaseUrl('https://proxy.test/kuku/')).toBe('https://proxy.test/kuku')
+      for (const address of ['javascript:alert(1)', 'file:///etc/passwd', 'ftp://example.com', 'https://user:secret@example.com', 'https://example.com?token=secret']) {
+        expect(() => normalizeBaseUrl(address)).toThrow()
+      }
+    })
+
+    it('uses the page address for absent, empty or corrupt settings and preserves a saved custom HTTPS backend', () => {
+      for (const value of ['broken-json', '{}', JSON.stringify({ baseUrl: ' ' })]) {
+        store.set('kuku_api_settings', value)
+        expect(getApiSettings().baseUrl).toBe(window.location.origin)
+      }
+      saveApiSettings({ baseUrl: 'https://custom.test:8443/api/', adminToken: 'test-admin', apiKey: '' })
+      expect(getApiSettings().baseUrl).toBe('https://custom.test:8443/api')
     })
 
     it('saves and retrieves updated settings', () => {
@@ -783,7 +811,7 @@ describe('kuku-api client', () => {
       expect(res.ok).toBe(true)
       expect(res.minted_stoken).toBe(true)
       expect(fetchSpy).toHaveBeenCalledWith(
-        'http://127.0.0.1:8787/pool/admin/accounts',
+        `${window.location.origin}/pool/admin/accounts`,
         expect.objectContaining({
           method: 'POST',
           body: JSON.stringify({
@@ -854,7 +882,7 @@ describe('kuku-api client', () => {
       const controller = new AbortController()
       await kukuApi.pollLoginQr('lq-test', { signal: controller.signal })
       expect(fetchSpy).toHaveBeenCalledWith(
-        'http://127.0.0.1:8787/pool/admin/login/qr/lq-test',
+        `${window.location.origin}/pool/admin/login/qr/lq-test`,
         expect.objectContaining({
           method: 'GET',
           signal: controller.signal,
@@ -876,7 +904,7 @@ describe('kuku-api client', () => {
       const blobUrl = await kukuApi.getAdminBlobUrl('/pool/admin/login/qr/lq-1.png')
       expect(blobUrl).toBe('blob:http://localhost/test-blob-id')
       expect(fetchSpy).toHaveBeenCalledWith(
-        'http://127.0.0.1:8787/pool/admin/login/qr/lq-1.png',
+        `${window.location.origin}/pool/admin/login/qr/lq-1.png`,
         expect.objectContaining({
           headers: expect.any(Headers),
         })

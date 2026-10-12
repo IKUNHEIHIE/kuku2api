@@ -385,7 +385,10 @@ export function UsersActionDialog({
 
             {/* SMS Code Tab */}
             <TabsContent value='sms' forceMount className='data-[state=inactive]:hidden'>
-              <AddAccountSms onSuccess={() => onOpenChange(false)} />
+              <AddAccountSms
+                onSuccess={() => onOpenChange(false)}
+                onSwitchToQr={() => setAddTab('qr')}
+              />
             </TabsContent>
 
             {/* Manual Entry Tab */}

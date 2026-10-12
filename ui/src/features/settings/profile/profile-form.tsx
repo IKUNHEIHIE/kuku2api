@@ -28,6 +28,8 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { toast } from 'sonner'
 import {
   getApiSettings,
+  getDefaultBaseUrl,
+  normalizeBaseUrl,
   saveApiSettings,
   sanitizeHeaderValue,
   kukuApi,
@@ -111,7 +113,8 @@ export function ProfileForm() {
   const handleSaveClientSettings = () => {
     const cleanAdmin = sanitizeHeaderValue(settings.adminToken)
     const cleanKey = sanitizeHeaderValue(settings.apiKey)
-    const cleanBase = settings.baseUrl.trim().replace(/\/+$/, '') || 'http://127.0.0.1:8787'
+    let cleanBase: string
+    try { cleanBase = normalizeBaseUrl(settings.baseUrl) } catch (error) { toast.error((error as Error).message); return }
     const clean = { baseUrl: cleanBase, apiKey: cleanKey, adminToken: cleanAdmin }
     setSettings(clean)
     saveApiSettings(clean)
@@ -120,7 +123,7 @@ export function ProfileForm() {
 
   const handleResetClientSettings = () => {
     const defaults = {
-      baseUrl: 'http://127.0.0.1:8787',
+      baseUrl: getDefaultBaseUrl(),
       apiKey: '',
       adminToken: '',
     }
@@ -130,10 +133,11 @@ export function ProfileForm() {
   }
 
   const handleTestConnection = async () => {
-    setIsTesting(true)
     const cleanAdmin = sanitizeHeaderValue(settings.adminToken)
     const cleanKey = sanitizeHeaderValue(settings.apiKey)
-    const cleanBase = settings.baseUrl.trim().replace(/\/+$/, '') || 'http://127.0.0.1:8787'
+    let cleanBase: string
+    try { cleanBase = normalizeBaseUrl(settings.baseUrl) } catch (error) { toast.error((error as Error).message); return }
+    setIsTesting(true)
     const clean = { baseUrl: cleanBase, apiKey: cleanKey, adminToken: cleanAdmin }
     setSettings(clean)
     saveApiSettings(clean)
@@ -341,11 +345,11 @@ export function ProfileForm() {
               <Input
                 value={settings.baseUrl}
                 onChange={(e) => setSettings({ ...settings, baseUrl: e.target.value })}
-                placeholder='例如: http://127.0.0.1:8787'
+                placeholder={getDefaultBaseUrl()}
                 className='font-mono text-xs'
               />
               <p className='text-[11px] text-muted-foreground'>
-                后端服务监听的地址与端口，默认为 <code className='font-mono'>http://127.0.0.1:8787</code>。
+                默认使用当前页面地址 <code className='font-mono'>{getDefaultBaseUrl()}</code>，也可指定其他后端。
               </p>
             </div>
 

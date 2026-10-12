@@ -21,6 +21,8 @@ import {
   getApiSettings,
   saveApiSettings,
   verifyAdminToken,
+  getDefaultBaseUrl,
+  normalizeBaseUrl,
 } from '@/lib/kuku-api'
 import { toast } from 'sonner'
 
@@ -36,7 +38,7 @@ export function AdminAuthGate({
   const currentSettings = getApiSettings()
   const [token, setToken] = useState('')
   const [baseUrl, setBaseUrl] = useState(
-    currentSettings.baseUrl || 'http://127.0.0.1:8787'
+    currentSettings.baseUrl
   )
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [isVerifying, setIsVerifying] = useState(false)
@@ -58,12 +60,13 @@ export function AdminAuthGate({
     setIsVerifying(true)
     setErrorMessage(null)
 
-    const cleanBaseUrl = baseUrl.trim().replace(/\/+$/, '') || 'http://127.0.0.1:8787'
-    const result = await verifyAdminToken(trimmedToken, cleanBaseUrl)
+    const result = await verifyAdminToken(trimmedToken, baseUrl)
 
     setIsVerifying(false)
 
     if (result.ok) {
+      const cleanBaseUrl = normalizeBaseUrl(baseUrl)
+      setBaseUrl(cleanBaseUrl)
       saveApiSettings({
         baseUrl: cleanBaseUrl,
         apiKey: currentSettings.apiKey || '',
@@ -169,12 +172,12 @@ export function AdminAuthGate({
                     id='base-url-input'
                     value={baseUrl}
                     onChange={(e) => setBaseUrl(e.target.value)}
-                    placeholder='http://127.0.0.1:8787'
+                    placeholder={getDefaultBaseUrl()}
                     className='font-mono text-xs h-8'
                     disabled={isVerifying}
                   />
                   <p className='text-[10px] text-muted-foreground'>
-                    默认为 <code className='font-mono'>http://127.0.0.1:8787</code>
+                    已自动识别当前页面地址：<code className='font-mono'>{getDefaultBaseUrl()}</code>。也可手动填写其他后端地址。
                   </p>
                 </div>
               )}

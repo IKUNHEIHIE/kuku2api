@@ -26,6 +26,14 @@ vi.mock('@tanstack/react-router', async (importOriginal) => {
 describe('SignOutDialog', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    localStorage.clear()
+  })
+
+  it('keeps the selected backend while clearing credentials', async () => {
+    localStorage.setItem('kuku_api_settings', JSON.stringify({ baseUrl: 'https://custom.test', adminToken: 'test-admin', apiKey: 'test-key' }))
+    const screen = await render(<SignOutDialog open onOpenChange={vi.fn()} />)
+    await userEvent.click(screen.getByRole('button', { name: /^确认清除$/ }))
+    expect(JSON.parse(localStorage.getItem('kuku_api_settings') || '{}')).toEqual({ baseUrl: 'https://custom.test', adminToken: '', apiKey: '' })
   })
 
   it('calls auth.reset and navigates to / upon confirm', async () => {

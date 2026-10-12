@@ -79,7 +79,12 @@ test('a publicly bound backend requires a model key even before the first key is
   const pool = { accounts: [], sessions: new Map(), pick: () => null };
   await http(createApp({ pool, adminToken: 'test-admin', allowUnkeyedModels: false }), async base => {
     assert.equal((await fetch(base + '/pool/state')).status, 401);
-    assert.equal((await fetch(base + '/v1/models', { headers: { 'x-admin-token': 'test-admin' } })).status, 401);
+    assert.equal((await fetch(base + '/v1/models', { headers: { 'x-admin-token': 'test-admin' } })).status, 200);
+    for (const route of ['/v1/chat/completions', '/v1/responses']) {
+      for (const headers of [{}, { 'x-admin-token': 'test-admin' }]) {
+        assert.equal((await fetch(base + route, { method: 'POST', headers })).status, 401);
+      }
+    }
     const state = await fetch(base + '/pool/state', { headers: { 'x-admin-token': 'test-admin' } });
     assert.equal(state.status, 200); assert.equal((await state.json()).api_open, false);
     const headers = { 'x-admin-token': 'test-admin', 'content-type': 'application/json' };

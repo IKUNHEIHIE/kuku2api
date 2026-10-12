@@ -96,15 +96,15 @@ PORT=8787 API_KEYS=a,b ADMIN_TOKEN=xxx node src/server.mjs
 | 方法 + 路径 | 鉴权 | 说明 |
 |---|---|---|
 | `GET /healthz` | 无 | 进程活着 |
-| `GET /v1/models` | `API_KEYS` | 上游模型目录 |
+| `GET /v1/models` | `API_KEYS` 或有效 `ADMIN_TOKEN` | 上游模型目录 |
 | `POST /v1/chat/completions` | `API_KEYS` | Chat Completions |
 | `POST /v1/responses` | `API_KEYS` | Responses（含流式） |
 | `GET /v1/responses` | `API_KEYS` | Responses 列表 + 游标分页 |
 | `GET /v1/responses/:id` · `DELETE` | `API_KEYS` | 回查 / 删除单条 |
 | `GET /pool/state` | `API_KEYS` 或有效 `ADMIN_TOKEN` | 号池本地状态；管理员无需普通 API 密钥 |
-| `GET /pool/health` | `API_KEYS`（**不是**管理令牌） | 号池上游体检 |
-| `GET /pool/points` | `API_KEYS` | 账号剩余积分（真上游，零积分） |
-| `GET /pool/sessions` | `API_KEYS` | 上游会话列表（真上游，零积分） |
+| `GET /pool/health` | `API_KEYS` 或有效 `ADMIN_TOKEN` | 号池上游体检 |
+| `GET /pool/points` | `API_KEYS` 或有效 `ADMIN_TOKEN` | 账号剩余积分（真上游，零积分） |
+| `GET /pool/sessions` | `API_KEYS` 或有效 `ADMIN_TOKEN` | 上游会话列表（真上游，零积分） |
 | `POST/PATCH/DELETE /pool/admin/*` | `ADMIN_TOKEN`（普通 `API_KEYS` 进不来） | 号池写操作 |
 | `POST/GET /pool/admin/login/*` | `ADMIN_TOKEN` | **登录加号**：扫码 / 短信验证码，详见 §14 |
 | `GET/POST/DELETE /pool/admin/keys*` | `ADMIN_TOKEN` | 运行时密钥增删查，详见 §14.5 |
@@ -112,7 +112,7 @@ PORT=8787 API_KEYS=a,b ADMIN_TOKEN=xxx node src/server.mjs
 | `GET/POST /pool/admin/auto-claim[​/run]` | `ADMIN_TOKEN` | 每日自动领取的开关与立即执行，**默认关闭**，详见 §14.9 |
 | `OPTIONS *` | 无 | 预检，204 |
 
-未匹配任何路由 → 404 `not found`。`API_KEYS` 为空时**所有 `API_KEYS` 门形同不存在**（本机自用）。
+未匹配任何路由 → 404 `not found`。仅绑定 `127.0.0.1` / `::1` 的本机模式在普通密钥为空时允许普通接口免鉴权；公开监听不会因空密钥而开放模型调用。管理员读取例外见 §30。
 
 **请求**
 - `content-type: application/json; charset=utf-8`
@@ -470,13 +470,13 @@ event: response.completed          最后   response = 完整对象（含 usage�
 
 ## 8. 号池状态与体检（只读）
 
-`GET /pool/state` 接受普通 API 密钥或有效管理员令牌；`GET /pool/health` 仍走普通 `API_KEYS`。实测（本机当前池内一个号）：
+`GET /pool/state`、`GET /pool/health` 接受普通 API 密钥或有效管理员令牌（2026-10-12 扩展，详见 §30）。以下为此前实测（本机当时池内一个号）：
 
 ### `GET /pool/state`
 
 鉴权更新（2026-10-11）：管理员可使用 `x-admin-token: <管理员令牌>` 或 `Authorization: Bearer <管理员令牌>` 读取状态，无需另外配置普通 API 密钥。有效的 `x-admin-token` 独立验证，即使同时携带过期的普通 API 密钥，也能读取状态。普通 API 密钥及未配置任何普通密钥时的本机免鉴权规则保持不变。
 
-此管理员例外仅适用于精确路径 `GET /pool/state`，不适用于 `/v1/*` 模型调用、`/pool/health`、`/pool/points` 等接口；已配置普通 API 密钥时，这些接口仍要求有效的普通 API 密钥。响应字段不变，不返回任何令牌。
+管理员读取范围于 2026-10-12 扩展为精确路径 `GET /pool/state`、`GET /pool/health`、`GET /pool/points`、`GET /pool/sessions`、`GET /v1/models`。模型生成、Responses 历史读取/删除和其他方法不在此范围，仍要求普通 API 密钥。响应字段不变，不返回任何令牌，详见 §30。
 
 ```json
 {
@@ -837,10 +837,10 @@ GET  /login/qr/:id  轮询   → scanned      （手机已扫、还没点确认�
 | `?getapi` 取 token | ✅ 实测（两个坑已写进代码：必须带 `Referer`，必须已有 `BAIDUID`，否则 200 里塞的是错误句） |
 | `bdusslogin` | ✅ **真扫实测**：成功时响应是 `{data, errInfo}`、**没有 errno 字段**；只有失败才带 errno（假票据回 `{"errno":-9999}`）。真 BDUSS(192) / PTOKEN(32) / STOKEN 由这一步 **Set-Cookie** 下发 |
 | `/v3/login/api/auth` 换 STOKEN | ✅ **真扫实测通过**，账号已入池并成功服务真实推理。契约见 §14.7 |
-| `senddpass` 发验证码 | ⚠️ 仅合同实测（未放号的 `10000000000` 回 `errno:1 "手机号格式错误"`，说明参数被接受）；**真下发/图形码分支仍待你用自己的号验一次** |
-| `?login`（isdpass=1 短信完成登录） | ⚠️ 未实测（要真短信码） |
+| `senddpass` 发验证码 | ✅ 2026-10-12 用户确认已收到真实短信。旧 `countrycode=86` 格式错误样本不能证明参数被接受，相关修复见 §30 |
+| `?login`（isdpass=1 短信完成登录） | ✅ 2026-10-12 用户确认修复后真实短信登录成功；HTML 回调解析及完整回调地址修复见 §31 |
 
-**扫码那条已经是完整可用链路**：出码 → 百度App 扫 → 手机确认 → 换 STOKEN → 真打一次库库登录探针 → 入池。2026-10-05 07:46 用真号验收，`{"state":"added","account_id":"kuku-1","login_type":"qr"}`，随后该号真实服务了一次推理（扣 0.01 分）。剩下两个 ⚠️ 只影响短信登录。
+**扫码那条已经是完整可用链路**：出码 → 百度App 扫 → 手机确认 → 换 STOKEN → 真打一次库库登录探针 → 入池。2026-10-05 07:46 用真号验收，`{"state":"added","account_id":"kuku-1","login_type":"qr"}`，随后该号真实服务了一次推理（扣 0.01 分）。短信发送及完成登录于 2026-10-12 经用户真实操作确认成功。
 
 ### 14.4 兜底：粘 cookie 也能加号（而且现在只要两个值）
 
@@ -1572,3 +1572,100 @@ SQLite 的会话映射保存所属账号、已验证上游用户身份和外部�
 - **鉴权边界**：公开监听时，不再使用“普通密钥为空则免鉴权”的本机规则；未创建普通密钥的模型及其他普通密钥路由返回 401 `bad api key`。管理员可用原令牌登录管理台、创建普通密钥及读取 `GET /pool/state`，管理员令牌仍不能代替模型 API 密钥。仅绑定 `127.0.0.1` / `::1` 时保留本地空密钥免鉴权行为。
 - `GET /pool/state` 的既有 `api_open`、`GET /pool/admin/keys` 的 `open` 和删除密钥响应中的 `api_now_unauthenticated` 字段现在准确反映免鉴权是否开启：公开监听时始终为 `false`，回环监听且未配置任何普通密钥时为 `true`。删除最后一条密钥也不会使公开监听进入匿名模式。响应结构不变。
 - 安装协议为 `INSTALLER_PROTOCOL = 4`，同时检查输出辅助文件。正常启动信息仍存入 SQLite 日志，仅安装器拉起的服务隐藏终端 info 日志；告警和错误仍可见。默认继续下载预编译发布包，不在服务器构建前端。
+
+## 29. 首次登录地址识别与短信加号完善（2026-10-12）
+
+### 29.1 控制台连接地址
+
+浏览器没有保存连接设置，或设置为空、损坏时，默认读取当前页面 `URL.origin`，保留 HTTP/HTTPS、域名/IP、IPv6 和非默认端口，去除页面路径、查询参数及片段。例如 `http://116.205.111.229:8400/users` 默认连接 `http://116.205.111.229:8400`；`https://kuku2.diestar.cn/` 默认连接 `https://kuku2.diestar.cn`。开发服务器使用既有同源代理；已有合法自定义地址不覆盖。
+
+手动输入裸域名或 `//域名` 时沿用当前页面协议；完整 HTTP/HTTPS 地址保留明确协议和可选路径前缀。拒绝 FTP、file、javascript 等非 HTTP 协议及含用户密码、查询参数、片段的地址，校验失败不发送管理员凭据。重置连接设置使用当前页面地址，退出登录清除令牌及普通密钥并保留已选后端地址。HTTP API 路径及管理员/模型密钥边界不变。
+
+### 29.2 短信会话响应扩展
+
+原 §14 路径保持不变。`POST /pool/admin/login/sms` 的 `phone` 要求 11 位中国大陆手机号；`POST /pool/admin/login/sms/verify` 的 `code` 要求 6 位数字。非法输入返回 HTTP 400，稳定错误码分别为 `invalid_phone`、`invalid_sms_code`，不请求上游。
+
+发送、重发及图形验证码响应新增可选字段，旧客户端可忽略：
+
+```json
+{
+  "state": "sent",
+  "login_id": "ls-...",
+  "expires_in_ms": 599200,
+  "retry_after_ms": 60000,
+  "sends_remaining": 4
+}
+```
+
+- 会话从创建起固定 10 分钟；重发不延长有效期。过期的重发/验证返回 HTTP 404、`error.code: "login_session_expired"`；过期验证码图片返回 404。前端使用返回的剩余有效期和冷却显示倒计时，超时后禁用提交并提供重新发起入口，不自动发送新短信。
+- 每次实际成功发送后有 60 秒服务端冷却；提前重发返回 429、`sms_cooldown`。每会话最多实际发送 5 次，图形验证码挑战不算发送成功；达到上限返回 429、`sms_send_limit`。
+- 同一会话不并行重发和验证；冲突操作返回 409、`login_in_progress`。并发验证共用当前验证任务，成功/终态失败在会话有效期内幂等重放，避免重复入池。已完成会话不能重发，返回 409、`login_session_finished`。
+
+### 29.3 图形验证码分阶段提交
+
+`state: "captcha_required"` 新增 `captcha_stage: "send" | "verify"`。`captcha_path` 仍为带管理员鉴权的后端图片地址；图形码的 `vcodestr`、`vcodesign` 保存在服务端并按会话使用，客户端无需取得，也不能用传入值覆盖服务端保存值。
+
+发送前图形验证码提交到原重发接口：
+
+```http
+POST /pool/admin/login/sms/resend
+x-admin-token: <管理员令牌>
+Content-Type: application/json
+
+{"login_id":"ls-...","captcha":{"code":"ABCD"}}
+```
+
+登录阶段图形验证码提交到验证接口，**继续使用原短信验证码**，不重发短信：
+
+```http
+POST /pool/admin/login/sms/verify
+x-admin-token: <管理员令牌>
+Content-Type: application/json
+
+{"login_id":"ls-...","code":"123456","captcha":{"code":"ABCD"}}
+```
+
+缺少当前阶段要求的图形验证码返回 400、`captcha_required`；短信尚未成功发送时直接验证返回 409、`sms_not_sent`。上游返回新图形码时前端刷新对应图片；图片加载失败显示可重试错误，刷新/切换手机号/卸载组件时丢弃旧图片回包并释放 Blob URL。若 `slide: true`，前端提示改用百度 App 扫码，不把滑块当作普通图形码自动提交。
+
+终态失败响应可能使用既有 `reason`、`code`、`account_id` 字段，前端显示具体失败原因（包括账号已存在）并允许重新发起。成功时别名和优先级沿用会话创建参数，不额外 PATCH 账号。手机号、短信验证码和图形码输入不写入前端本地存储；登录成功后后端释放临时手机号、令牌和图形验证状态。后端所需账号凭据继续按原规则保存 SQLite。
+
+验证覆盖本地模拟上游与 Chromium 页面交互，不包含真实手机号短信下发或真实验证码登录验收。
+
+## 30. 前端对接反馈修复：大陆短信参数与管理台读取权限（2026-10-12）
+
+### 30.1 大陆短信国家码
+
+`POST /pool/admin/login/sms` 仍只接收 11 位大陆手机号，不新增国际号码支持或 `countrycode` 公共参数。后端短信会话固定保存 `countrycode: ""`，首次发送、发送前图形码提交及重发均沿用该值；底层 `sendSmsCode` 默认值也由 `"86"` 改为 `""`，避免当前 Passport 大陆流程将合法手机号判为格式错误。
+
+前端继续提交原请求，无需另加 `86`。短信下发仍可能受到上游图形码、滑块、频控和账号状态限制。新增测试检查真实请求构造中的国家码、手机号及图形码字段；使用模拟传输，不向真实手机号发送短信，也不表示真实短信登录已验收。
+
+### 30.2 管理员读取范围
+
+以下精确路径的 **GET** 请求接受有效普通 API 密钥或有效管理员令牌：
+
+- `/pool/state`
+- `/pool/health`
+- `/pool/points`
+- `/pool/sessions`
+- `/v1/models`
+
+管理员令牌支持 `x-admin-token` 或 `Authorization: Bearer`。有效的 `x-admin-token` 独立验证，不受同时携带的失效普通密钥影响；查询参数（例如 `?account=kuku-0`）不改变权限。响应形状不变，管理台可以只配置管理员令牌读取这些数据。
+
+例外不扩展到其他路径或方法。`POST /v1/chat/completions`、`POST /v1/responses`、Responses 列表/详情/删除仍走独立普通 API 密钥鉴权；`/pool/admin/*` 仍要求管理员令牌，普通密钥不能执行管理写操作。未配置管理员令牌时，不接受空管理员凭证；公开监听且普通密钥为空时，以上管理读取仍可由有效管理员访问，匿名访问和匿名模型调用均拒绝。
+
+本节扩展并替代 §28 仅允许管理员读取 `/pool/state` 的范围说明。相关回归使用空号池/模拟上游，不消费真实账号积分。
+
+## 31. 短信完成登录的 HTML 回调兼容（2026-10-12）
+
+用户确认已接收到短信，但提交验证码显示 `login refused (errInfo -1)`。`-1` 是旧实现没有从响应读取到业务码时使用的兜底值，不能据此判定短信验证码错误。
+
+匿名协议检查（空手机号和空验证码，不调用 `senddpass`）确认：Passport `POST /v2/api/?login` 返回 HTTP 200 / `text/html`，通过脚本中的 `href += "err_no=...&codeString=...&isslide=..."` 交付登录回调参数。后端现在读取该字符串字面量并按 URL 查询参数解析，兼容既有 JSON/JSONP；不会执行上游 JavaScript、打开回调 URL或把回调中的令牌交给前端。`staticPage` 使用官方登录页面配置的完整地址 `https://kuku.baidu.com/m-static/genflow-login/thirdparty/pass_v3_jump.html`。
+
+`POST /pool/admin/login/sms/verify` 请求保持不变；响应仍沿用既有 `state`、`code`、`message`、`captcha_stage` 等字段：
+
+- 已识别业务失败时，`code` 为真实数字错误码；缺少上游文案时显示带该错误码的中文提示，不再统一显示兜底 `-1`。
+- HTML 回调的普通图形码和滑块标志分别继续进入既有验证及扫码提示流程，不自动重新发送短信。
+- 未识别的响应返回 `state: "refused"`、`code: "login_response_unrecognized"`，明确提示无法解析，不猜测成功。非 2xx 上游登录响应按网关错误返回。
+- 只有业务成功码且登录会话实际取得 BDUSS 后才进入既有换 STOKEN、上游校验、去重及入池流程；仅有 HTTP 200、成功码或回调文本都不能代替真实凭据。
+
+短信业务失败日志仅保留 `state`、错误码及 HTTP 状态；不记录手机号、短信验证码、Cookie、上游 HTML 或回调令牌。专项回归覆盖 HTML 成功/失败/图形码/滑块、无法识别的响应、缺失凭据及 JSON/JSONP 兼容。2026-10-12，用户在修复后提交自己的短信验证码，确认真实短信登录成功。该验收不代表其他账号可以绕过上游图形码、滑块或频控要求。

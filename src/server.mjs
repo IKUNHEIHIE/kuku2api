@@ -400,6 +400,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
 export function createApp({ pool, apiKeys = [], adminToken = '', store = null, deviceId = '', ledger = null, keyRing = null, autoClaim = null, database = null, logger = console, runtime = null, allowUnkeyedModels = true, uiDirectory = path.join(ROOT, 'ui', 'dist') }) {
   const keys = keyRing ?? createKeyRing({ envKeys: apiKeys });
   const serveUi = createStaticUi(uiDirectory);
+  const adminReadPaths = new Set(['/pool/state', '/pool/health', '/pool/points', '/pool/sessions', '/v1/models']);
   const authed = (req) => {
     // Unkeyed single-user mode is permitted only for a loopback-bound server.
     if (keys.count() === 0) return allowUnkeyedModels;
@@ -440,7 +441,7 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
   const addAccount = accountManager.add;
 
   // Login sessions (QR / SMS). Inert until the admin routes are called.
-  const logins = createLoginManager({ addAccount, listAccounts: () => pool.accounts, deviceId });
+  const logins = createLoginManager({ addAccount, listAccounts: () => pool.accounts, deviceId, logger });
 
   const route = async function (req, res) {
     const url = new URL(req.url, 'http://localhost');
@@ -555,14 +556,16 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
       }
       if (url.pathname === '/pool/admin/login/sms' && req.method === 'POST') {
         try {
-          return json(res, 200, await logins.startSms(body));
+          const r = await logins.startSms(body);
+          if (r.error) return openError(res, r.status ?? 400, r.error, 'invalid_request_error', r.code);
+          return json(res, 200, r);
         } catch (e) {
           return openError(res, 502, `验证码发送失败：${e.message}`, 'upstream_error', 'login_sms_failed');
         }
       }
       if (url.pathname === '/pool/admin/login/sms/resend' && req.method === 'POST') {
         const r = await logins.resendSms(body.login_id, body.captcha ?? null);
-        if (r.error) return openError(res, r.status ?? 404, r.error);
+        if (r.error) return openError(res, r.status ?? 404, r.error, 'invalid_request_error', r.code);
         return json(res, 200, r);
       }
       const capImg = /^\/pool\/admin\/login\/sms\/captcha\/([^/]+)$/.exec(url.pathname);
@@ -574,7 +577,7 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
       }
       if (url.pathname === '/pool/admin/login/sms/verify' && req.method === 'POST') {
         const r = await logins.verifySms(body);
-        if (r.error) return openError(res, r.status ?? 404, r.error);
+        if (r.error) return openError(res, r.status ?? 404, r.error, 'invalid_request_error', r.code);
         return json(res, 200, r);
       }
 
@@ -631,11 +634,11 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
     }
 
     if (await serveUi(req, res)) return;
-    // Console state is readable by admins even when a stale ordinary key is also sent.
-    // Keep this exception scoped to GET state; model and upstream routes still require API keys.
-    const adminState = req.method === 'GET' && url.pathname === '/pool/state' && adminToken &&
+    // Console reads accept admins even alongside a stale ordinary key. Generation and
+    // response history remain independently keyed; only these exact GET routes are allowed.
+    const adminRead = req.method === 'GET' && adminReadPaths.has(url.pathname) && adminToken &&
       (req.headers['x-admin-token'] === adminToken || admined(req));
-    if (!adminState && !authed(req)) return openError(res, 401, 'bad api key');
+    if (!adminRead && !authed(req)) return openError(res, 401, 'bad api key');
 
     if (url.pathname === '/v1/models') {
       let d = getCachedCatalog();

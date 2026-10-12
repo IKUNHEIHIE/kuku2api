@@ -48,6 +48,28 @@ describe('AdminAuthGate', () => {
     expect(stored.adminToken).toBe('my-secret-admin-token')
   })
 
+  it('prefills the current page backend and uses it for first-login verification', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ keys: [] }), { status: 200 }))
+    const screen = await render(<AdminAuthGate />)
+    await userEvent.click(screen.getByRole('button', { name: '服务端地址配置' }))
+    await expect.element(screen.getByLabelText('服务端基准地址 (Base URL)')).toHaveValue(window.location.origin)
+    await userEvent.fill(screen.getByPlaceholder('请输入后端 ADMIN_TOKEN 凭证'), 'test-admin')
+    await userEvent.click(screen.getByRole('button', { name: '验证并进入控制台' }))
+    expect(fetchSpy).toHaveBeenCalledWith(`${window.location.origin}/pool/admin/keys`, expect.anything())
+    expect(JSON.parse(localStorage.getItem('kuku_api_settings') || '{}').baseUrl).toBe(window.location.origin)
+  })
+
+  it('shows invalid URL errors without sending credentials', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const screen = await render(<AdminAuthGate />)
+    await userEvent.click(screen.getByRole('button', { name: '服务端地址配置' }))
+    await userEvent.fill(screen.getByLabelText('服务端基准地址 (Base URL)'), 'ftp://example.com')
+    await userEvent.fill(screen.getByPlaceholder('请输入后端 ADMIN_TOKEN 凭证'), 'test-admin')
+    await userEvent.click(screen.getByRole('button', { name: '验证并进入控制台' }))
+    await expect.element(screen.getByText(/后端地址必须使用 HTTP 或 HTTPS/)).toBeVisible()
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
   it('displays error alert when verification fails', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       new Response(

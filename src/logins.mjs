@@ -21,12 +21,15 @@ import {
 
 const QR_TTL_MS = 4 * 60_000;
 const SMS_TTL_MS = 10 * 60_000;
+const SMS_RESEND_MS = 60_000;
+const PASSPORT = { seedDeviceCookie, getApiToken, createQr, qrImage, captchaImage, pollQr, bdussLogin, exchangeStoken, verifyKukuLogin, sendSmsCode, smsLogin };
 
-export function createLoginManager({ addAccount, listAccounts = () => [], deviceId = '', onAdded = () => {} } = {}) {
+export function createLoginManager({ addAccount, listAccounts = () => [], deviceId = '', onAdded = () => {}, passport = PASSPORT, now = Date.now, logger = null } = {}) {
+  const { seedDeviceCookie, getApiToken, createQr, qrImage, captchaImage, pollQr, bdussLogin, exchangeStoken, verifyKukuLogin, sendSmsCode, smsLogin } = passport;
   const sessions = new Map();
 
   const sweep = () => {
-    for (const [id, s] of sessions) if (Date.now() > s.expires_at && s.state !== 'added') sessions.delete(id);
+    for (const [id, s] of sessions) if (now() > s.expires_at && !s.inflight) sessions.delete(id);
   };
 
   const nextAccountId = () => {
@@ -43,6 +46,7 @@ export function createLoginManager({ addAccount, listAccounts = () => [], device
     const fail = (reason, code = null) => {
       s.state = 'failed';
       s.failure = { state: 'failed', reason, code, ...(diag ? { diag } : {}) };
+      s.jar = null; s.phone = ''; s.token = ''; s.vcode = null; s.loginVcode = null; s.captchaUrl = '';
       return s.failure;
     };
     if (!bduss) return fail('the login did not hand back a BDUSS');
@@ -72,6 +76,7 @@ export function createLoginManager({ addAccount, listAccounts = () => [], device
     // The pool now owns the credential; the jar that minted it (BDUSS/PTOKEN/STOKEN cookies) has
     // no reason to stay reachable in memory for the rest of the process' life.
     s.jar = null;
+    s.phone = ''; s.token = ''; s.vcode = null; s.loginVcode = null; s.captchaUrl = '';
     s.sign = '';
     s.failure = null;
     s.desktop_login = added.desktop_login ?? null;
@@ -142,62 +147,89 @@ export function createLoginManager({ addAccount, listAccounts = () => [], device
 
   async function startSms(spec = {}) {
     sweep();
+    if (!/^1[3-9]\d{9}$/.test(String(spec.phone ?? ''))) return { error: '请输入正确的11位中国大陆手机号', status: 400, code: 'invalid_phone' };
     const jar = await seedDeviceCookie({});
     const token = await getApiToken({ jar });
     const id = `ls-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-    const s = { id, kind: 'sms', jar, token, phone: String(spec.phone ?? ''), alias: spec.alias, priority: spec.priority, vcode: null, state: 'new', created_at: Date.now(), expires_at: Date.now() + SMS_TTL_MS, sends: 0 };
+    // Passport uses an empty country code for this mainland-only login flow.
+    const s = { id, kind: 'sms', jar, token, phone: String(spec.phone), countrycode: '', alias: spec.alias, priority: spec.priority, vcode: null, loginVcode: null, state: 'new', created_at: now(), expires_at: now() + SMS_TTL_MS, sends: 0, retry_at: 0, inflight: null };
     sessions.set(id, s);
-    return applySend(s, spec.captcha);
+    return runSms(s, 'send', () => applySend(s, null));
+  }
+
+  const smsTiming = s => ({ expires_in_ms: Math.max(0, s.expires_at - now()), retry_after_ms: Math.max(0, s.retry_at - now()), sends_remaining: Math.max(0, 5 - s.sends) });
+  function smsSession(id) {
+    const s = sessions.get(id);
+    if (!s || s.kind !== 'sms' || now() >= s.expires_at) {
+      if (s?.kind === 'sms' && !s.inflight) sessions.delete(id);
+      return null;
+    }
+    return s;
+  }
+  const expiredSms = () => ({ error: '短信登录会话已过期，请重新发起', status: 404, code: 'login_session_expired' });
+  function runSms(s, operation, run) {
+    if (s.inflight) return operation === 'verify' && s.operation === operation ? s.inflight : Promise.resolve({ error: '短信登录操作正在处理中，请稍后重试', status: 409, code: 'login_in_progress' });
+    s.operation = operation;
+    s.inflight = Promise.resolve().then(run).finally(() => { s.inflight = null; s.operation = null; });
+    return s.inflight;
   }
 
   async function applySend(s, captcha) {
-    const r = await sendSmsCode({ phone: s.phone, token: s.token, jar: s.jar, countrycode: s.countrycode, captcha });
-    s.sends += 1;
+    const challenge = s.vcode ? { ...s.vcode, code: captcha?.code ?? '' } : null;
+    if (s.state === 'captcha_required' && (typeof challenge?.code !== 'string' || !challenge.code.trim())) return { error: '请输入图形验证码', status: 400, code: 'captcha_required' };
+    const r = await sendSmsCode({ phone: s.phone, token: s.token, jar: s.jar, countrycode: s.countrycode, captcha: challenge });
     if (r.state === 'captcha_required') {
       s.vcode = { vcodestr: r.vcodestr, vcodesign: r.vcodesign };
       s.captchaUrl = r.captcha_url;
       s.state = 'captcha_required';
       // The image is served by us on purpose: passport binds it to this process's device cookie.
-      return { state: 'captcha_required', login_id: s.id, captcha_path: `/pool/admin/login/sms/captcha/${s.id}`, message: r.message };
+      return { state: 'captcha_required', login_id: s.id, captcha_stage: 'send', captcha_path: r.captcha_url ? `/pool/admin/login/sms/captcha/${s.id}` : undefined, message: r.message, ...smsTiming(s) };
     }
-    if (r.state !== 'sent') return { state: r.state, login_id: s.id, message: r.message ?? '', errno: r.errno };
+    if (r.state !== 'sent') return { state: r.state, login_id: s.id, message: r.message ?? '', errno: r.errno, ...smsTiming(s) };
+    s.sends += 1; s.retry_at = now() + SMS_RESEND_MS; s.loginVcode = null; s.captchaUrl = '';
     s.state = 'sent';
-    return { state: 'sent', login_id: s.id, message: '验证码已发送到该手机号' };
+    return { state: 'sent', login_id: s.id, message: '验证码已发送到该手机号', ...smsTiming(s) };
   }
 
   async function resendSms(id, captcha) {
-    const s = sessions.get(id);
-    if (!s || s.kind !== 'sms') return { error: 'unknown or expired login session', status: 404 };
-    if (s.sends >= 5) return { error: 'too many code requests for this session', status: 429 };
-    return applySend(s, captcha ?? s.vcode);
+    const s = smsSession(id);
+    if (!s) return expiredSms();
+    if (['added', 'failed'].includes(s.state)) return { error: '本次登录已结束，请重新发起', status: 409, code: 'login_session_finished' };
+    if (s.sends >= 5) return { error: '本会话短信发送次数已达上限，请重新发起', status: 429, code: 'sms_send_limit', ...smsTiming(s) };
+    if (now() < s.retry_at) return { error: `请等待 ${Math.ceil((s.retry_at - now()) / 1000)} 秒后重发`, status: 429, code: 'sms_cooldown', ...smsTiming(s) };
+    return runSms(s, 'send', () => applySend(s, captcha));
   }
 
-  async function verifySmsSession({ login_id: id, code }) {
-    const s = sessions.get(id);
-    if (!s || s.kind !== 'sms') return { error: 'unknown or expired login session', status: 404 };
+  async function verifySmsSession({ login_id: id, code, captcha }) {
+    const s = smsSession(id);
+    if (!s) return expiredSms();
     if (s.state === 'added') return { state: 'added', account_id: s.account_id, login_type: s.kind, ...(s.desktop_login ? { desktop_login: s.desktop_login } : {}) };
     if (s.state === 'failed') return s.failure;
-    if (!code) return { error: 'code is required', status: 400 };
-    const r = await smsLogin({ phone: s.phone, code, token: s.token, jar: s.jar, vcode: s.vcode ?? {} });
+    if (!/^\d{6}$/.test(String(code ?? ''))) return { error: '请输入6位数字短信验证码', status: 400, code: 'invalid_sms_code' };
+    if (!s.sends) return { error: '请先完成图形验证并发送短信', status: 409, code: 'sms_not_sent' };
+    if (s.loginVcode && (typeof captcha?.code !== 'string' || !captcha.code.trim())) return { error: '请输入登录图形验证码', status: 400, code: 'captcha_required' };
+    const r = await smsLogin({ phone: s.phone, code, token: s.token, jar: s.jar, vcode: s.vcode ?? {}, captcha: s.loginVcode ? { ...s.loginVcode, code: captcha.code } : null });
     if (r.state !== 'logged_in') {
+      // Business refusals often use HTTP 200. Keep a diagnostic without phone, OTP,
+      // cookies, raw HTML or callback tokens so a later report has the real error code.
+      logger?.warn('sms login verification:', JSON.stringify({ state: r.state, code: r.code ?? null, status: r.status ?? null }));
       if (r.state !== 'captcha_required') return r;
-      s.vcode = { vcodestr: r.vcodestr, vcodesign: '' };
+      s.loginVcode = { vcodestr: r.vcodestr, vcodesign: r.vcodesign ?? '' };
       s.captchaUrl = r.captcha_url;
-      return { state: r.state, login_id: id, captcha_path: `/pool/admin/login/sms/captcha/${id}`, message: r.message, slide: r.slide };
+      return { state: r.state, login_id: id, captcha_stage: 'verify', captcha_path: r.captcha_url ? `/pool/admin/login/sms/captcha/${id}` : undefined, message: r.message, slide: r.slide, ...smsTiming(s) };
     }
     return finish(s, r);
   }
 
   function verifySms(spec) {
-    const s = sessions.get(spec.login_id);
-    if (!s || s.kind !== 'sms') return Promise.resolve({ error: 'unknown or expired login session', status: 404 });
-    if (s.inflight) return s.inflight;
-    s.inflight = verifySmsSession(spec).finally(() => { s.inflight = null; });
-    return s.inflight;
+    const s = smsSession(spec.login_id);
+    if (!s) return Promise.resolve(expiredSms());
+    return runSms(s, 'verify', () => verifySmsSession(spec));
   }
 
   async function captcha(id) {
     const s = sessions.get(id);
+    if (s?.kind === 'sms' && !smsSession(id)) return null;
     if (!s?.captchaUrl) return null;
     return captchaImage({ url: s.captchaUrl, jar: s.jar });
   }

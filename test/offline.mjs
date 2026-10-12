@@ -336,12 +336,18 @@ const stub = createServer(async (req, res) => {
   if (url.pathname === '/v2/api/' && url.search.includes('login')) {
     bump('login');
     const body2 = JSON.parse(JSON.stringify(body ?? {}));
-    if (mode.smsBadCode) return pjam({ errInfo: { no: '400056' }, data: { codeString: 'vcstub', msg: '验证码错误' } });
+    // Real form submissions return an HTML script containing the callback query.
+    const callback = (query) => '<!DOCTYPE html><html><script>var href=decodeURIComponent("https:\\/\\/kuku.baidu.com\\/m-static\\/genflow-login\\/thirdparty\\/pass_v3_jump.html")+"?";\n'
+      + `href += ${JSON.stringify(new URLSearchParams(query).toString())}; window.location.replace(href);</script></html>`;
+    if (mode.smsBadCode) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=UTF-8' });
+      return res.end(callback({ err_no: '400056', codeString: 'vcstub', err_msg: '验证码错误' }));
+    }
     res.writeHead(200, {
-      'content-type': 'application/javascript; charset=UTF-8',
+      'content-type': 'text/html; charset=UTF-8',
       'set-cookie': ['BDUSS=STUBBDUSSVALUE-abcdefghijklmnop; Path=/; Domain=.baidu.com', 'PTOKEN=STUBPTOKENVALUE-abcdefghijklmnop; Path=/; Domain=.baidu.com'],
     });
-    return res.end(`${url.searchParams.get('callback') ?? 'cb'}(${JSON.stringify({ errInfo: { no: '0' }, data: { u: body2.u ?? '' } })})`);
+    return res.end(callback({ err_no: '0', u: body2.u ?? '' }));
   }
   if (url.pathname === '/v2/api/getqrcode') {
     bump('getqrcode');
@@ -1391,7 +1397,8 @@ await t('a passport network blip on the unwrapped SMS legs answers 502 instead o
   try {
     // resendSms has no try/catch of its own; the app-level guard is what keeps this in-process.
     const r = await call(app, 'POST', '/pool/admin/login/sms/resend', { login_id: started.json.login_id }, { authorization: 'Bearer adm' });
-    assert.equal(r.res.statusCode, 502, `expected a 502, got ${r.res.statusCode} ${r.res.body}`);
+    assert.equal(r.res.statusCode, 429, 'the resend cooldown must reject before contacting the unavailable upstream');
+    assert.equal(r.json.error.code, 'sms_cooldown');
     const v = await call(app, 'POST', '/pool/admin/login/sms/verify', { login_id: started.json.login_id, code: '123456' }, { authorization: 'Bearer adm' });
     assert.equal(v.res.statusCode, 502, 'verify must survive the same blip');
   } finally {
@@ -1445,7 +1452,7 @@ await t('sms login stops for a captcha, then lands the account on the typed code
   reset();
   mode.smsNeedCaptcha = true;
   const bad = await call(app, 'POST', '/pool/admin/login/sms', { phone: '12' }, { authorization: 'Bearer adm' });
-  assert.equal(bad.res.statusCode, 502, 'a phone that is not digits must not even reach passport');
+  assert.equal(bad.res.statusCode, 400, 'an invalid phone must not even reach passport');
   const start = await call(app, 'POST', '/pool/admin/login/sms', { phone: '13800000000', alias: '短信来的' }, { authorization: 'Bearer adm' });
   assert.equal(start.json.state, 'captcha_required', JSON.stringify(start.json));
   assert.equal(start.json.captcha_path, `/pool/admin/login/sms/captcha/${start.json.login_id}`, 'the image must come from us: passport binds it to this process device cookie');
@@ -1460,7 +1467,7 @@ await t('sms login stops for a captcha, then lands the account on the typed code
   assert.equal(wrong.json.state, 'captcha_required', 'a wrong code asks for a graphic captcha again');
   assert.match(wrong.json.message, /验证码/);
   mode.smsBadCode = false;
-  const done = await call(app, 'POST', '/pool/admin/login/sms/verify', { login_id: start.json.login_id, code: '123456' }, { authorization: 'Bearer adm' });
+  const done = await call(app, 'POST', '/pool/admin/login/sms/verify', { login_id: start.json.login_id, code: '123456', captcha: { code: '9x7q' } }, { authorization: 'Bearer adm' });
   assert.equal(done.json.state, 'added', JSON.stringify(done.json));
   const acct = p.accounts.find((a) => a.id === done.json.account_id);
   assert.equal(acct.client.bduss, 'STUBBDUSSVALUE-abcdefghijklmnop', 'the jar cookie is what becomes the account');

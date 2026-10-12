@@ -1,7 +1,7 @@
 import { useNavigate } from '@tanstack/react-router'
 import { toast } from 'sonner'
 import { useAuthStore } from '@/stores/auth-store'
-import { saveApiSettings } from '@/lib/kuku-api'
+import { getApiSettings, saveApiSettings } from '@/lib/kuku-api'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 
 interface SignOutDialogProps {
@@ -17,7 +17,7 @@ export function SignOutDialog({ open, onOpenChange }: SignOutDialogProps) {
     auth.reset()
     // Reset stored credentials to default clean state
     saveApiSettings({
-      baseUrl: 'http://127.0.0.1:8787',
+      baseUrl: getApiSettings().baseUrl,
       apiKey: '',
       adminToken: '',
     })

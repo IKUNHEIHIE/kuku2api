@@ -243,7 +243,14 @@ export interface LoginQrPollResponse {
   probe?: unknown
 }
 
-export interface LoginSmsStartResponse {
+interface LoginSmsTiming {
+  expires_in_ms?: number
+  retry_after_ms?: number
+  sends_remaining?: number
+  captcha_stage?: 'send' | 'verify'
+}
+
+export interface LoginSmsStartResponse extends LoginSmsTiming {
   state: 'sent' | 'captcha_required' | 'refused' | 'unregistered'
   login_id: string
   captcha_path?: string
@@ -251,12 +258,14 @@ export interface LoginSmsStartResponse {
   errno?: number
 }
 
-export interface LoginSmsVerifyResponse {
+export interface LoginSmsVerifyResponse extends LoginSmsTiming {
   state: 'added' | 'captcha_required' | 'refused' | 'failed'
   account_id?: string
   login_id?: string
   captcha_path?: string
   message?: string
+  reason?: string
+  code?: string | number | null
   slide?: unknown
 }
 
@@ -637,6 +646,28 @@ export function createSafeHeaders(rawHeaders?: HeadersInit): Headers {
   return headers
 }
 
+export function getDefaultBaseUrl(pageUrl = typeof window === 'undefined' ? '' : window.location.href): string {
+  try {
+    const url = new URL(pageUrl)
+    if (url.protocol === 'http:' || url.protocol === 'https:') return url.origin
+  } catch { /* Non-browser environments retain the local development default. */ }
+  return 'http://127.0.0.1:8787'
+}
+
+export function normalizeBaseUrl(value: string, fallback = getDefaultBaseUrl()): string {
+  const input = value.trim()
+  if (!input) return fallback
+  const protocol = new URL(fallback).protocol
+  const hasScheme = /^[a-z][a-z\d+.-]*:/i.test(input) && !/^[^/]+:\d+(?:\/|$)/.test(input)
+  const candidate = input.startsWith('//') ? `${protocol}${input}` : hasScheme ? input : `${protocol}//${input}`
+  let url: URL
+  try { url = new URL(candidate) } catch { throw new Error('请输入有效的 HTTP 或 HTTPS 后端地址') }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error('后端地址必须使用 HTTP 或 HTTPS，且不能包含账号、密码、查询参数或片段')
+  }
+  return url.href.replace(/\/+$/, '')
+}
+
 export function getApiSettings(): ApiSettings {
   try {
     const saved = localStorage.getItem(SETTINGS_KEY)
@@ -644,10 +675,10 @@ export function getApiSettings(): ApiSettings {
       const parsed = JSON.parse(saved)
       const cleanAdminToken = sanitizeHeaderValue(parsed.adminToken)
       const cleanApiKey = sanitizeHeaderValue(parsed.apiKey)
-      const cleanBaseUrl = String(parsed.baseUrl ?? 'http://127.0.0.1:8787').trim().replace(/\/+$/, '')
+      const cleanBaseUrl = normalizeBaseUrl(String(parsed.baseUrl ?? ''))
 
       return {
-        baseUrl: cleanBaseUrl || 'http://127.0.0.1:8787',
+        baseUrl: cleanBaseUrl,
         apiKey: cleanApiKey,
         adminToken: cleanAdminToken,
       }
@@ -656,7 +687,7 @@ export function getApiSettings(): ApiSettings {
     // fallback
   }
   return {
-    baseUrl: 'http://127.0.0.1:8787',
+    baseUrl: getDefaultBaseUrl(),
     apiKey: '',
     adminToken: '',
   }
@@ -664,7 +695,7 @@ export function getApiSettings(): ApiSettings {
 
 export function saveApiSettings(settings: ApiSettings): void {
   const cleanSettings: ApiSettings = {
-    baseUrl: settings.baseUrl ? settings.baseUrl.trim().replace(/\/+$/, '') : 'http://127.0.0.1:8787',
+    baseUrl: normalizeBaseUrl(settings.baseUrl),
     apiKey: sanitizeHeaderValue(settings.apiKey),
     adminToken: sanitizeHeaderValue(settings.adminToken),
   }
@@ -683,8 +714,8 @@ export async function verifyAdminToken(
     return { ok: false, message: '请输入管理员令牌' }
   }
   const settings = getApiSettings()
-  const cleanBase = (baseUrl || settings.baseUrl || 'http://127.0.0.1:8787').trim().replace(/\/+$/, '')
   try {
+    const cleanBase = normalizeBaseUrl(baseUrl ?? settings.baseUrl)
     const headers = new Headers()
     safeSetHeader(headers, 'x-admin-token', cleanToken)
     safeSetHeader(headers, 'Authorization', `Bearer ${cleanToken}`)
@@ -981,6 +1012,7 @@ export const kukuApi = {
   async verifyLoginSms(params: {
     login_id: string
     code: string
+    captcha?: { code: string }
   }): Promise<LoginSmsVerifyResponse> {
     return apiRequest<LoginSmsVerifyResponse>(
       '/pool/admin/login/sms/verify',

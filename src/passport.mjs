@@ -104,6 +104,28 @@ const unwrapJsonp = (text) => {
   }
 };
 
+// Form submissions to ?login return an HTML redirect script, not JSONP. Read only
+// the literal callback query; never execute upstream JavaScript or follow its URLs.
+function parseLoginReply(json, text) {
+  const direct = json ?? unwrapJsonp(text);
+  if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct;
+  for (const match of String(text ?? '').matchAll(/\bhref\s*\+=\s*("(?:\\.|[^"\\])*")/g)) {
+    let query;
+    try { query = new URLSearchParams(JSON.parse(match[1])); } catch { continue; }
+    const no = query.get('err_no');
+    if (!/^-?\d+$/.test(no ?? '')) continue;
+    return {
+      errInfo: { no },
+      data: {
+        codeString: query.get('codeString') ?? '',
+        isslide: query.get('isslide') ?? '',
+        msg: query.get('err_msg') ?? query.get('msg') ?? '',
+      },
+    };
+  }
+  return null;
+}
+
 // passport hands out a real token only to a jar that already carries a device cookie; without
 // BAIDUID the `token` field comes back containing an error string instead.
 export async function seedDeviceCookie({ jar = createJar() } = {}) {
@@ -238,7 +260,7 @@ export async function bdussLogin({ bduss, jar, u = 'https://kuku.baidu.com' }) {
  * Not exercised end to end yet — sending a code to a real phone is a real-world side effect,
  * so the first run must be the user's own number on purpose.
  */
-export async function sendSmsCode({ phone, token, countrycode = '86', jar, captcha = null }) {
+export async function sendSmsCode({ phone, token, countrycode = '', jar, captcha = null }) {
   if (!/^\d{6,15}$/.test(String(phone))) throw new PassportError('phone must be digits only');
   const p = {
     gid: '',
@@ -285,7 +307,7 @@ export async function sendSmsCode({ phone, token, countrycode = '86', jar, captc
  * `?login` with `isdpass=1`, so no RSA is involved on this path — RSA only guards typed
  * passwords, and 库库 has password login switched off.
  */
-export async function smsLogin({ phone, code, token, jar, vcode = {}, u = 'https://kuku.baidu.com' }) {
+export async function smsLogin({ phone, code, token, jar, vcode = {}, captcha = null, u = 'https://kuku.baidu.com' }) {
   const body = new URLSearchParams({
     username: String(phone),
     password: String(code),
@@ -293,6 +315,7 @@ export async function smsLogin({ phone, code, token, jar, vcode = {}, u = 'https
     isdpass: '1',
     smsVcodestr: vcode.vcodestr ?? '',
     smsVcodesign: vcode.vcodesign ?? '',
+    ...(captcha ? { codestring: captcha.vcodestr ?? '', verifycode: captcha.code ?? '' } : {}),
     switchuname: '',
     subpro: '',
     idc: '',
@@ -301,7 +324,7 @@ export async function smsLogin({ phone, code, token, jar, vcode = {}, u = 'https
     is_voice_sms: '0',
     voice_sms_flag: '0',
     u,
-    staticPage: '/m-static/genflow-login/thirdparty/pass_v3_jump.html',
+    staticPage: 'https://kuku.baidu.com/m-static/genflow-login/thirdparty/pass_v3_jump.html',
     loginMerge: '1',
     memberPass: 'true',
     isPhone: '1',
@@ -320,18 +343,22 @@ export async function smsLogin({ phone, code, token, jar, vcode = {}, u = 'https
       referer: `${passportBase()}/v2/?logintype=sms`,
     },
   });
-  const parsed = json ?? unwrapJsonp(text) ?? {};
+  if (status < 200 || status >= 300) throw new PassportError(`百度登录接口 HTTP ${status}`, { code: 'passport_http_error', status });
+  const parsed = parseLoginReply(json, text);
+  const rawCode = parsed?.errInfo?.no ?? parsed?.errInfo?.errno ?? parsed?.errno;
+  const no = /^-?\d+$/.test(String(rawCode)) ? Number(rawCode) : null;
+  if (no === null) return { state: 'refused', code: 'login_response_unrecognized', message: `无法解析百度登录响应（HTTP ${status}），请稍后重试或改用百度 App 扫码登录`, status };
   const d = parsed.data ?? {};
-  const no = Number(parsed.errInfo?.no ?? parsed.errno ?? -1);
   if (no !== 0) {
     const vc = String(d.codeString ?? d.verifyStr ?? '');
+    const slide = String(d.isslide ?? '') === '1';
     return {
-      state: vc ? 'captcha_required' : 'refused',
+      state: vc || slide ? 'captcha_required' : 'refused',
       code: no,
-      message: String(d.msg ?? parsed.msg ?? `login refused (errInfo ${no})`),
+      message: String(d.msg || parsed.errInfo?.msg || parsed.msg || `百度登录未通过（错误码 ${no}），请按上游提示完成验证或改用百度 App 扫码登录`),
       vcodestr: vc,
       captcha_url: vc ? `${passportBase()}/cgi-bin/genimage?${vc}` : '',
-      slide: String(d.isslide ?? '') === '1',
+      slide,
       status,
     };
   }
