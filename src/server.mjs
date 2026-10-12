@@ -579,7 +579,7 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
       }
 
       if (url.pathname === '/pool/admin/keys' && req.method === 'GET') {
-        return json(res, 200, { open: keys.count() === 0, keys: keys.list() });
+        return json(res, 200, { open: allowUnkeyedModels && keys.count() === 0, keys: keys.list() });
       }
 
       if (url.pathname === '/pool/admin/keys' && req.method === 'POST') {
@@ -594,9 +594,8 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
         // Env keys are the operator's own config; an admin token must not be able to erase it.
         if (id.startsWith('env-')) return openError(res, 400, `key '${id}' comes from API_KEYS and cannot be revoked here`);
         if (!keys.remove(id)) return openError(res, 404, `unknown key ${id}`);
-        // Deleting the last key puts /v1/* back into "no api key required" mode — the caller has
-        // to be able to see that happening, and ADMIN_TOKEN is what still guards the admin side.
-        return json(res, 200, { ok: true, keys: keys.list(), api_now_unauthenticated: keys.count() === 0 });
+        // Only a loopback-bound server returns to unkeyed mode after deleting the last key.
+        return json(res, 200, { ok: true, keys: keys.list(), api_now_unauthenticated: allowUnkeyedModels && keys.count() === 0 });
       }
 
       // ---- 免费积分（读取免费，领取是对账号的写操作）----

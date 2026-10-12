@@ -9,13 +9,17 @@ export async function consoleAddress(port, { host = '127.0.0.1', interfaces = ne
   if (host === '0.0.0.0' || host === '::') {
     const local = Object.values(interfaces).flat().filter(entry => !entry.internal && isIP(entry.address) === 4).map(entry => entry.address);
     address = local[0] ?? '127.0.0.1';
-    try {
-      const response = await request('https://api.ipify.org', { signal: AbortSignal.timeout(2000), redirect: 'error' });
-      if (response.ok) {
-        const detected = (await response.text()).trim();
-        if (isIP(detected) === 4) address = detected;
-      }
-    } catch { /* IP discovery must not fail an otherwise successful install. */ }
+    // A cloud instance's inbound public IP may differ from its outbound NAT IP.
+    // Read only the public-IP metadata field before consulting an external service.
+    for (const [url, timeout] of [['http://169.254.169.254/latest/meta-data/public-ipv4', 800], ['https://api.ipify.org', 1200]]) {
+      try {
+        const response = await request(url, { signal: AbortSignal.timeout(timeout), redirect: 'error' });
+        if (response.ok) {
+          const detected = (await response.text()).trim();
+          if (isIP(detected) === 4) { address = detected; break; }
+        }
+      } catch { /* IP discovery must not fail an otherwise successful install. */ }
+    }
   }
   return `http://${isIP(address) === 6 ? `[${address}]` : address}:${port}`;
 }

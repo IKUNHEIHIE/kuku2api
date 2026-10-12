@@ -59,6 +59,12 @@ test('console address uses the public IPv4, tolerates discovery failure and resp
   const interfaces = { eth0: [{ address: '10.0.0.7', internal: false }], lo: [{ address: '127.0.0.1', internal: true }] };
   const options = { host: '0.0.0.0', interfaces };
   assert.equal(await consoleAddress(8789, { ...options, request: async () => new Response('203.0.113.8\n') }), 'http://203.0.113.8:8789');
+  const requested = [];
+  assert.equal(await consoleAddress(8789, { ...options, request: async url => {
+    requested.push(url); return new Response(url.includes('169.254.169.254') ? '203.0.113.9' : '203.0.113.8');
+  } }), 'http://203.0.113.9:8789');
+  assert.deepEqual(requested, ['http://169.254.169.254/latest/meta-data/public-ipv4']);
+  assert.equal(await consoleAddress(8789, { ...options, request: async url => new Response(url.includes('169.254.169.254') ? '' : '203.0.113.8') }), 'http://203.0.113.8:8789');
   for (const request of [async () => { throw new Error('offline'); }, async () => new Response('<html>proxy error</html>'), async () => new Response('203.0.113.8', { status: 503 })]) {
     assert.equal(await consoleAddress(8789, { ...options, request }), 'http://10.0.0.7:8789');
   }
@@ -70,12 +76,19 @@ test('console address uses the public IPv4, tolerates discovery failure and resp
 });
 
 test('a publicly bound backend requires a model key even before the first key is created', async () => {
-  const pool = { accounts: [], sessions: new Map() };
+  const pool = { accounts: [], sessions: new Map(), pick: () => null };
   await http(createApp({ pool, adminToken: 'test-admin', allowUnkeyedModels: false }), async base => {
     assert.equal((await fetch(base + '/pool/state')).status, 401);
     assert.equal((await fetch(base + '/v1/models', { headers: { 'x-admin-token': 'test-admin' } })).status, 401);
     const state = await fetch(base + '/pool/state', { headers: { 'x-admin-token': 'test-admin' } });
     assert.equal(state.status, 200); assert.equal((await state.json()).api_open, false);
+    const headers = { 'x-admin-token': 'test-admin', 'content-type': 'application/json' };
+    assert.equal((await (await fetch(base + '/pool/admin/keys', { headers })).json()).open, false);
+    const issued = await (await fetch(base + '/pool/admin/keys', { method: 'POST', headers, body: JSON.stringify({ label: 'test-public-key' }) })).json();
+    assert.equal((await fetch(base + '/v1/models', { headers: { 'x-api-key': issued.key.secret } })).status, 200);
+    const revoked = await (await fetch(base + '/pool/admin/keys/' + issued.key.id, { method: 'DELETE', headers })).json();
+    assert.equal(revoked.api_now_unauthenticated, false);
+    assert.equal((await fetch(base + '/v1/models')).status, 401);
   });
 });
 
