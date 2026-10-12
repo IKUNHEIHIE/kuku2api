@@ -126,7 +126,10 @@ export async function manage(root, source, action, args, { build = buildConsole,
     for (const relative of installedFiles.keys()) safeTarget(root, relative);
     originalFiles = publicFiles(root);
     for (const relative of originalFiles.keys()) safeTarget(root, relative);
-    const sameSource = installedFiles.size === originalFiles.size && [...installedFiles].every(([name, record]) => originalFiles.get(name)?.hash === record.hash);
+    // The console build regenerates this derived file from ui/src/routes and may
+    // change its ordering. Compare all inputs, but not that generated content.
+    const sameSource = installedFiles.size === originalFiles.size && [...installedFiles].every(([name, record]) =>
+      originalFiles.has(name) && (name === 'ui/src/routeTree.gen.ts' || originalFiles.get(name).hash === record.hash));
     if (!incomplete && (sameSource || (previousGit && previousGit === nextGit)) && port === state.port && (!options.ui || existsSync(path.join(root, 'ui/dist/index.html')))) {
       console.log(t('源码已是最新版本，沿用现有构建与端口。', 'Source is already current; reusing the existing build and port.'));
       if (options.start && !previousRuntime) await launch(root, port, t);

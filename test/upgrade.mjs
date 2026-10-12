@@ -143,6 +143,25 @@ test('staging build failure leaves installed source, database and console intact
   } finally { cleanup(f.base); }
 });
 
+test('a generated route tree does not rebuild an unchanged console, while route changes do', async () => {
+  const f = await fixture();
+  try {
+    put(f.source, 'src/release.txt', 'old');
+    for (const root of [f.root, f.source]) put(root, 'ui/src/routes/index.tsx', 'same route input');
+    put(f.root, 'ui/src/routeTree.gen.ts', 'build generated route order');
+    put(f.source, 'ui/src/routeTree.gen.ts', 'published route order');
+    const before = readFileSync(f.file);
+    const result = await manage(f.root, f.source, 'upgrade', ['--no-start'], { build: () => assert.fail('unnecessary console build') });
+    assert.equal(result.unchanged, true); assert.deepEqual(readFileSync(f.file), before);
+    assert.equal(readFileSync(path.join(f.root, 'ui/dist/index.html'), 'utf8'), 'old console');
+    put(f.source, 'ui/src/routes/index.tsx', 'updated route input');
+    let builds = 0;
+    const update = await manage(f.root, f.source, 'upgrade', ['--no-start'], { build: () => { builds++; } });
+    assert.equal(builds, 1); assert.equal(update.unchanged, undefined);
+    assert.equal(readFileSync(path.join(f.root, 'ui/dist/index.html'), 'utf8'), 'new console');
+  } finally { cleanup(f.base); }
+});
+
 test('failed startup restores source, database initialization changes and the old console', async () => {
   const f = await fixture();
   try {
