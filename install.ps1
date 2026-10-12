@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [string]$InstallDir,
   [ValidateRange(1, 65535)][int]$Port,
