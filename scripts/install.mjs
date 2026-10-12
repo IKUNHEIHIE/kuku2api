@@ -42,9 +42,26 @@ export async function availablePort(port, language = 'en') {
 }
 
 export async function choosePort({ port, envPort = process.env.PORT, savedPort, interactive = !!(process.stdin.isTTY && process.stdout.isTTY),
-  language = 'en', check = availablePort, start: shouldStart = true, ask, warn = console.error } = {}) {
+  language = 'en', check = availablePort, start: shouldStart = true, autoAvailable = false, ask, warn = console.error } = {}) {
   const t = (zh, en) => language === 'zh' ? zh : en;
-  const fallback = port ?? envPort ?? savedPort ?? 8787;
+  let fallback = port ?? envPort ?? savedPort ?? 8787;
+  if (port === undefined && autoAvailable && shouldStart) {
+    const selected = listenPort(fallback);
+    try { await check(selected, language); }
+    catch (error) {
+      let alternative;
+      for (let offset = 1; offset <= 100; offset++) {
+        const candidate = (Math.max(selected, 1023) - 1024 + offset) % 64512 + 1024;
+        try { await check(candidate, language); }
+        catch { continue; }
+        alternative = candidate; break;
+      }
+      if (alternative === undefined) throw error;
+      warn(t(`端口 ${selected} 已占用或不可用，自动选择 ${alternative}；原服务保持运行。`, `Port ${selected} is occupied or unavailable; selected ${alternative} automatically. The existing service is unchanged.`));
+      fallback = alternative;
+    }
+    if (!interactive) return listenPort(fallback);
+  }
   if (port !== undefined || !interactive) {
     const selected = listenPort(fallback);
     if (shouldStart) await check(selected, language);
@@ -104,7 +121,7 @@ export async function install(root, args) {
   if (manifest.name !== 'kuku2api') throw new Error(t('当前目录不是 kuku2api 源码目录。', 'This is not a kuku2api source directory'));
   const version = manifest.version ?? t('(本地源码)', '(local source)');
   console.log(t(`正在安装 kuku2api ${version}${options.ui ? '，包含最新控制台' : '（仅后端）'}。`, `Installing kuku2api ${version}${options.ui ? ' with the console' : ' (backend only)'}.`));
-  const port = await choosePort({ ...options, savedPort: savedListenPort(root), language });
+  const port = await choosePort({ ...options, savedPort: savedListenPort(root), language, autoAvailable: true });
   console.log(t(`服务端口：${port}；安装成功后将保存，重启自动沿用。`, `Service port: ${port}; saved after a successful install and reused on restart.`));
   await buildConsole(root, options, t);
   await finishInstall(root, options, port, language);

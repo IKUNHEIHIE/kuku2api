@@ -5,7 +5,7 @@ import { existsSync, lstatSync, realpathSync, readFileSync, readdirSync, writeFi
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { buildConsole, installOptions, availablePort } from './install.mjs';
+import { buildConsole, installOptions, availablePort, choosePort } from './install.mjs';
 import { installerLanguage } from './install-language.mjs';
 import { listenPort } from '../src/listen-port.mjs';
 import { installationState, runtimeAt, stopRuntime, launchVerified, samePath } from './service.mjs';
@@ -68,11 +68,13 @@ async function databaseBackup(file, destination) {
   return true;
 }
 
-export async function manage(root, source, action, args, { build = buildConsole, launch = launchVerified } = {}) {
+export async function manage(root, source, action, args, { build = buildConsole, launch = launchVerified, portSelection = {} } = {}) {
   root = realpathSync(root); source = realpathSync(source);
   const options = installOptions(args), language = installerLanguage(options.lang);
   const t = (zh, en) => language === 'zh' ? zh : en;
-  const state = installationState(root), port = listenPort(options.port ?? state.port);
+  const state = installationState(root);
+  let port = listenPort(options.port ?? state.port);
+  const incomplete = !existsSync(state.file) && !['accounts.json', 'keys.json', 'settings.json', 'admin-token.json'].some(name => existsSync(path.join(root, name)));
   const runtimeDirectory = path.join(root, '.runtime');
   if (existsSync(runtimeDirectory) && lstatSync(runtimeDirectory).isSymbolicLink()) throw new Error('Linked .runtime directory is not supported');
   mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 });
@@ -83,7 +85,10 @@ export async function manage(root, source, action, args, { build = buildConsole,
   writeFileSync(lockFile, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }));
   let backupDirectory, originalFiles, installedFiles, previousGit, nextGit, databaseSaved = false, changed = false, distChanged = false, oldStopped = false, previousRuntime;
   try {
-    previousRuntime = await runtimeAt(root, state, t);
+    if (action === 'upgrade' && incomplete) {
+      console.log(t('检测到尚未完成的安装，重新选择可用端口；不会停止占用默认端口的服务。', 'An incomplete installation was detected. Selecting an available port without stopping the service on the default port.'));
+      port = await choosePort({ ...options, savedPort: state.port, language, start: true, autoAvailable: true, ...portSelection });
+    } else previousRuntime = await runtimeAt(root, state, t);
     if (action === 'start' && previousRuntime) {
       console.log(t(`服务已经运行：http://127.0.0.1:${state.port}`, `Service is already running: http://127.0.0.1:${state.port}`)); return;
     }
@@ -122,7 +127,7 @@ export async function manage(root, source, action, args, { build = buildConsole,
     originalFiles = publicFiles(root);
     for (const relative of originalFiles.keys()) safeTarget(root, relative);
     const sameSource = installedFiles.size === originalFiles.size && [...installedFiles].every(([name, record]) => originalFiles.get(name)?.hash === record.hash);
-    if ((sameSource || (previousGit && previousGit === nextGit)) && port === state.port && (!options.ui || existsSync(path.join(root, 'ui/dist/index.html')))) {
+    if (!incomplete && (sameSource || (previousGit && previousGit === nextGit)) && port === state.port && (!options.ui || existsSync(path.join(root, 'ui/dist/index.html')))) {
       console.log(t('源码已是最新版本，沿用现有构建与端口。', 'Source is already current; reusing the existing build and port.'));
       if (options.start && !previousRuntime) await launch(root, port, t);
       return { port, unchanged: true };

@@ -189,6 +189,48 @@ test('upgrade refuses an unrelated service and never sends it a shutdown request
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); cleanup(f.base); }
 });
 
+for (const mode of ['explicit', 'interactive', 'unattended']) {
+  test(`incomplete installation recovers with ${mode} port selection while leaving the unrelated service untouched`, async () => {
+    const f = await fixture(), requests = [];
+    const server = createServer((req, res) => { requests.push(req.url); res.end('unrelated service'); });
+    const previousPort = process.env.PORT, previousToken = process.env.ADMIN_TOKEN;
+    try {
+      rmSync(f.file); // Source downloaded successfully, initialization never completed.
+      await new Promise(resolve => server.listen(f.port, '127.0.0.1', resolve));
+      process.env.PORT = String(f.port); process.env.ADMIN_TOKEN = token;
+      const selected = mode === 'unattended' ? undefined : await freePort();
+      const args = [...offline, ...(mode === 'explicit' ? ['--port', String(selected)] : [])];
+      const result = await manage(f.root, f.source, 'upgrade', args, {
+        portSelection: { interactive: mode === 'interactive', ask: async prompt => { assert.match(prompt, /Service port/); return String(selected); } },
+      });
+      assert.notEqual(result.port, f.port);
+      if (selected) assert.equal(result.port, selected);
+      assert.equal(state(f.root).installation.port, result.port);
+      assert.deepEqual(requests, [], 'do not send admin credentials or shutdown requests to the unrelated default port');
+      assert.equal(await (await fetch(`http://127.0.0.1:${f.port}`)).text(), 'unrelated service');
+    } finally {
+      if (previousPort === undefined) delete process.env.PORT; else process.env.PORT = previousPort;
+      if (previousToken === undefined) delete process.env.ADMIN_TOKEN; else process.env.ADMIN_TOKEN = previousToken;
+      server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); cleanup(f.base);
+    }
+  });
+}
+
+test('incomplete installation initializes SQLite even when all source files are already current', async () => {
+  const f = await fixture(), previousPort = process.env.PORT, previousToken = process.env.ADMIN_TOKEN;
+  try {
+    rmSync(f.file); put(f.source, 'src/release.txt', 'old');
+    process.env.PORT = String(f.port); process.env.ADMIN_TOKEN = token;
+    const result = await manage(f.root, f.source, 'upgrade', [...offline, '--port', String(f.port)]);
+    assert.equal(result.unchanged, undefined); assert(existsSync(f.file));
+    assert.equal(state(f.root).installation.port, f.port);
+  } finally {
+    if (previousPort === undefined) delete process.env.PORT; else process.env.PORT = previousPort;
+    if (previousToken === undefined) delete process.env.ADMIN_TOKEN; else process.env.ADMIN_TOKEN = previousToken;
+    cleanup(f.base);
+  }
+});
+
 test('runtime control requires the administrator token and the current instance id', async () => {
   let calls = 0;
   const server = createServer(createApp({ pool: {}, adminToken: token, apiKeys: ['fixture-model-key'],

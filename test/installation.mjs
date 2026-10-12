@@ -63,6 +63,16 @@ test('installer detects occupied and invalid ports without disturbing the runnin
   await assert.rejects(availablePort(0), /PORT/);
 });
 
+test('unattended installation chooses a free port on conflict but respects an explicit port', async () => {
+  const checked = [], warnings = [];
+  const check = async port => { checked.push(port); if (port === 8787 || port === 8788) throw new Error('in use'); };
+  assert.equal(await choosePort({ envPort: undefined, interactive: false, autoAvailable: true, check, warn: message => warnings.push(message) }), 8789);
+  assert.deepEqual(checked, [8787, 8788, 8789]); assert.match(warnings[0], /8789/);
+  assert.equal(await choosePort({ envPort: undefined, interactive: true, autoAvailable: true, check, warn() {}, ask: async prompt => { assert.match(prompt, /8789/); return ''; } }), 8789);
+  await assert.rejects(choosePort({ port: 8787, interactive: false, autoAvailable: true, check }), /in use/);
+  assert.equal(await choosePort({ envPort: '65535', interactive: false, autoAvailable: true, check: async p => { if (p === 65535) throw new Error('in use'); }, warn() {} }), 1024);
+});
+
 test('production console, SPA routes and hashed assets work with API keys enabled; API authentication stays enforced', async () => {
   const root = fixture();
   try {
