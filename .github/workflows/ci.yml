@@ -1,5 +1,7 @@
 name: Checks
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   backend:
     strategy:
@@ -18,7 +20,13 @@ jobs:
         if: runner.os == 'Linux'
         run: bash -n install.sh && bash -n start.sh && bash -n upgrade.sh
   console:
+    needs: backend
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: prebuilt-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -28,3 +36,28 @@ jobs:
         working-directory: ui
       - run: npm exec --yes --package=pnpm@10.34.0 -- pnpm run build
         working-directory: ui
+      - name: Package verified prebuilt console and committed source
+        run: node scripts/package-release.mjs
+      - name: Smoke test installation without build tools
+        run: |
+          ADMIN_TOKEN=ci-install-smoke-only node .runtime/release/package/scripts/install.mjs --no-start --port 19876 --lang en
+          test ! -d .runtime/release/package/ui/node_modules
+          test ! -e .runtime/release/package/data/accounts.json
+      - name: Publish prebuilt release after all checks pass
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="build-$GITHUB_SHA"
+          if [[ "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" != "$GITHUB_SHA" ]]; then
+            echo 'A newer commit exists; this build will not replace the latest release.'
+            exit 0
+          fi
+          if gh release view "$tag" --json isDraft > .runtime/release/existing.json 2>/dev/null; then
+            if [[ "$(node -p "JSON.parse(require('fs').readFileSync('.runtime/release/existing.json')).isDraft")" != true ]]; then exit 0; fi
+            gh release upload "$tag" .runtime/release/kuku2api.tar.gz .runtime/release/kuku2api.zip .runtime/release/SHA256SUMS --clobber
+          else
+            gh release create "$tag" .runtime/release/kuku2api.tar.gz .runtime/release/kuku2api.zip .runtime/release/SHA256SUMS --draft --target "$GITHUB_SHA" --title "kuku2api ${GITHUB_SHA:0:7}" --notes 'Prebuilt console and backend. No frontend build or dependency installation is required on the server. SHA256SUMS included.'
+          fi
+          gh release edit "$tag" --draft=false --latest

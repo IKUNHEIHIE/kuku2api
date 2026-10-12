@@ -8,15 +8,16 @@ import { createInterface } from 'node:readline';
 import { listenPort, savedListenPort } from '../src/listen-port.mjs';
 import { installerLanguage } from './install-language.mjs';
 import { directEnvironment, start } from './start.mjs';
+import { validatePrebuilt } from './prebuilt.mjs';
 
 export const PNPM_VERSION = '10.34.0';
-export const INSTALLER_PROTOCOL = 2;
+export const INSTALLER_PROTOCOL = 3;
 export function supportedNode(version) {
   const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version);
   return !!m && (Number(m[1]) > 24 || (Number(m[1]) === 24 && Number(m[2]) >= 15));
 }
 export function installOptions(args) {
-  const allowed = new Set(['--no-start', '--backend-only', '--skip-dependencies']);
+  const allowed = new Set(['--no-start', '--backend-only', '--skip-dependencies', '--build-from-source']);
   const values = {};
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--port' || args[i] === '--lang') {
@@ -27,7 +28,7 @@ export function installOptions(args) {
   }
   if (values.port !== undefined) values.port = listenPort(values.port);
   if (values.lang !== undefined) installerLanguage(values.lang);
-  return { ...values, start: !args.includes('--no-start'), ui: !args.includes('--backend-only'),
+  return { ...values, ...(args.includes('--build-from-source') ? { sourceBuild: true } : {}), start: !args.includes('--no-start'), ui: !args.includes('--backend-only'),
     dependencies: !args.includes('--skip-dependencies') };
 }
 export async function availablePort(port, language = 'en') {
@@ -127,9 +128,14 @@ export async function install(root, args) {
   await finishInstall(root, options, port, language);
 }
 
-// Upgrade builds in staging, before stopping or changing the installed service.
+// Upgrade verifies prebuilt output (or explicitly builds source) in staging.
 export async function buildConsole(root, options, t = (_zh, en) => en) {
   if (options.ui) {
+    if (!options.sourceBuild) {
+      validatePrebuilt(root, t);
+      console.log(t('已校验预编译控制台；无需安装前端依赖或本机构建。', 'Prebuilt console verified; no frontend dependencies or local build required.'));
+      return;
+    }
     if (options.dependencies) {
       const nodeDir = path.dirname(process.execPath);
       const npmCli = [path.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),

@@ -9,10 +9,11 @@ import { buildConsole, installOptions, availablePort, choosePort } from './insta
 import { installerLanguage } from './install-language.mjs';
 import { listenPort } from '../src/listen-port.mjs';
 import { installationState, runtimeAt, stopRuntime, launchVerified, samePath } from './service.mjs';
+import { validatePrebuilt } from './prebuilt.mjs';
 
 const HERE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const roots = new Set(['src', 'scripts', 'test', 'docs', 'ui', '.github']);
-const rootFiles = new Set(['.gitattributes', '.gitignore', '.npmrc', 'README.md', 'package.json', 'install.sh', 'install.ps1', 'start.sh', 'start.ps1', 'upgrade.sh', 'upgrade.ps1']);
+const rootFiles = new Set(['.gitattributes', '.gitignore', '.npmrc', 'README.md', 'package.json', 'release.json', 'install.sh', 'install.ps1', 'start.sh', 'start.ps1', 'upgrade.sh', 'upgrade.ps1']);
 const forbidden = /^(?:data|capture|analysis)(?:\/|$)|^ui\/\.github(?:\/|$)|(?:^|\/)(?:node_modules|dist|coverage|__screenshots__|\.vitest-attachments|\.tanstack|\.vscode|\.idea|\.git|\.runtime|\.agents|\.codex|\.aws)(?:\/|$)|(?:^|\/)\.env(?:$|\.(?!example$))|\.sqlite[^/]*$|\.db(?:-[^/]*)?$|\.(?:bak|tmp|key|pem)$|(?:^|\/)(?:\.DS_Store|Thumbs\.db)$/;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const blobHash = bytes => createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
@@ -83,7 +84,7 @@ export async function manage(root, source, action, args, { build = buildConsole,
   try { lockFile = openSync(lock, 'wx', 0o600); }
   catch (error) { if (error.code === 'EEXIST') throw new Error(t('已有安装或升级任务在运行；若上次被强制中断，请确认无任务运行后删除 .runtime/maintenance.lock。', 'Another maintenance operation is running. If a prior operation was forcibly interrupted, verify it is stopped before removing .runtime/maintenance.lock.')); throw error; }
   writeFileSync(lockFile, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }));
-  let backupDirectory, originalFiles, installedFiles, previousGit, nextGit, databaseSaved = false, changed = false, distChanged = false, oldStopped = false, previousRuntime;
+  let backupDirectory, originalFiles, installedFiles, previousGit, nextGit, release, databaseSaved = false, changed = false, distChanged = false, oldStopped = false, previousRuntime;
   try {
     if (action === 'upgrade' && incomplete) {
       console.log(t('检测到尚未完成的安装，重新选择可用端口；不会停止占用默认端口的服务。', 'An incomplete installation was detected. Selecting an available port without stopping the service on the default port.'));
@@ -101,6 +102,7 @@ export async function manage(root, source, action, args, { build = buildConsole,
     if (samePath(root, source)) throw new Error('Upgrade requires a separate staging source directory');
     const manifest = JSON.parse(readFileSync(path.join(source, 'package.json'), 'utf8'));
     if (manifest.name !== 'kuku2api') throw new Error('Invalid upgrade archive');
+    release = options.ui && !options.sourceBuild && existsSync(path.join(source, 'release.json')) ? validatePrebuilt(source, t) : null;
     installedFiles = publicFiles(source);
     for (const name of ['src/server.mjs', 'scripts/install.mjs', 'scripts/manage.mjs', 'scripts/service.mjs', 'package.json']) if (!installedFiles.has(name)) throw new Error(`Incomplete upgrade archive: ${name}`);
     if (existsSync(path.join(root, '.git'))) {
@@ -108,7 +110,8 @@ export async function manage(root, source, action, args, { build = buildConsole,
       if (!samePath(git(root, ['rev-parse', '--show-toplevel']), root)) throw new Error('Installation must be the Git repository root');
       previousGit = git(root, ['rev-parse', 'HEAD']);
       console.log(t('正在获取 Git 更新…', 'Fetching Git updates…'));
-      git(root, ['fetch', 'origin', 'main']); nextGit = git(root, ['rev-parse', 'FETCH_HEAD']);
+      git(root, ['fetch', 'origin', release?.commit ?? 'main']); nextGit = git(root, ['rev-parse', 'FETCH_HEAD']);
+      if (release && nextGit !== release.commit) throw new Error('Git update and release commit differ');
       git(root, ['merge-base', '--is-ancestor', previousGit, nextGit]);
       const tree = git(root, ['ls-tree', '-rz', nextGit]);
       for (const line of tree.split('\0').filter(Boolean)) {
@@ -130,15 +133,21 @@ export async function manage(root, source, action, args, { build = buildConsole,
     // change its ordering. Compare all inputs, but not that generated content.
     const sameSource = installedFiles.size === originalFiles.size && [...installedFiles].every(([name, record]) =>
       originalFiles.has(name) && (name === 'ui/src/routeTree.gen.ts' || originalFiles.get(name).hash === record.hash));
-    if (!incomplete && (sameSource || (previousGit && previousGit === nextGit)) && port === state.port && (!options.ui || existsSync(path.join(root, 'ui/dist/index.html')))) {
+    let consoleReady = existsSync(path.join(root, 'ui/dist/index.html'));
+    if (release) {
+      try { consoleReady = validatePrebuilt(root, t).commit === release.commit; }
+      catch { consoleReady = false; }
+    }
+    if (!incomplete && (sameSource || (previousGit && previousGit === nextGit)) && port === state.port && (!options.ui || consoleReady)) {
       console.log(t('源码已是最新版本，沿用现有构建与端口。', 'Source is already current; reusing the existing build and port.'));
       if (options.start && !previousRuntime) await launch(root, port, t);
       return { port, unchanged: true };
     }
     if (port !== state.port || !previousRuntime) await availablePort(port, language);
     if (options.ui && existsSync(path.join(root, 'ui/dist')) && lstatSync(path.join(root, 'ui/dist')).isSymbolicLink()) throw new Error('Linked console build directory is not supported');
-    console.log(t('正在临时目录构建新版；现有服务暂不停止…', 'Building the update in staging; the existing service remains running…'));
-    if (!options.dependencies && options.ui) throw new Error(t('升级需要重新安装前端依赖，请去掉 --skip-dependencies。', 'Upgrade requires staging dependencies; omit --skip-dependencies.'));
+    console.log(options.sourceBuild ? t('正在临时目录构建新版；现有服务暂不停止…', 'Building the update in staging; the existing service remains running…')
+      : t('正在校验新版预编译控制台；现有服务暂不停止…', 'Verifying the prebuilt update; the existing service remains running…'));
+    if (!options.dependencies && options.ui && options.sourceBuild) throw new Error(t('源码升级需要重新安装前端依赖，请去掉 --skip-dependencies。', 'Source upgrades require staging dependencies; omit --skip-dependencies.'));
     await build(source, options, t);
     if (previousGit && (git(root, ['status', '--porcelain']) || git(root, ['rev-parse', 'HEAD']) !== previousGit)) throw new Error('Local code changed during the build; upgrade stopped');
     if (previousRuntime) {
@@ -157,7 +166,10 @@ export async function manage(root, source, action, args, { build = buildConsole,
     writeFileSync(path.join(backupDirectory, 'upgrade.json'), JSON.stringify({ version: manifest.version, database_file: state.file, previous_git: previousGit, original_files: [...originalFiles.keys()], new_files: [...installedFiles.keys()] }, null, 2), { mode: 0o600 });
     console.log(t(`备份已保存：${backupDirectory}`, `Backup saved: ${backupDirectory}`));
     changed = true;
-    if (previousGit) git(root, ['merge', '--ff-only', nextGit]);
+    if (previousGit) {
+      git(root, ['merge', '--ff-only', nextGit]);
+      if (release) copyFileSync(path.join(source, 'release.json'), path.join(root, 'release.json'));
+    }
     else {
       copyPublic(source, root, installedFiles);
       for (const relative of originalFiles.keys()) if (!installedFiles.has(relative)) unlinkSync(safeTarget(root, relative));
@@ -188,6 +200,11 @@ export async function manage(root, source, action, args, { build = buildConsole,
         if (previousGit) {
           if (![previousGit, nextGit].includes(git(root, ['rev-parse', 'HEAD'])) || git(root, ['status', '--porcelain'])) throw new Error('Git worktree changed; restore from the backup manually');
           git(root, ['reset', '--hard', previousGit]);
+          if (release) {
+            const previousManifest = path.join(backupDirectory, 'source/release.json');
+            if (existsSync(previousManifest)) copyFileSync(previousManifest, path.join(root, 'release.json'));
+            else if (existsSync(path.join(root, 'release.json'))) unlinkSync(path.join(root, 'release.json'));
+          }
         } else {
           copyPublic(path.join(backupDirectory, 'source'), root, originalFiles);
           for (const relative of installedFiles.keys()) if (!originalFiles.has(relative) && existsSync(safeTarget(root, relative))) unlinkSync(safeTarget(root, relative));

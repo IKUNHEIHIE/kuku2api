@@ -4,11 +4,14 @@ umask 077
 
 REPOSITORY='IKUNHEIHIE/kuku2api'
 SOURCE_URL="https://codeload.github.com/$REPOSITORY/tar.gz/refs/heads/main"
+RELEASE_URL="https://github.com/$REPOSITORY/releases/latest/download"
 NODE_URL='https://nodejs.org/dist/latest-v24.x'
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 install_dir=''
 language='auto'
 action='auto'
+source_build=false
+backend_only=false
 system_zone="${TZ:-}"
 if [[ -z "$system_zone" ]]; then
   system_zone="$(readlink /etc/localtime 2>/dev/null || true)"
@@ -28,8 +31,10 @@ while (($#)); do
     --port) [[ $# -ge 2 && "$2" =~ ^[0-9]{1,5}$ ]] && ((10#$2 >= 1 && 10#$2 <= 65535)) || { message '端口必须是 1 到 65535 之间的整数。' 'Port must be an integer between 1 and 65535.' >&2; exit 1; }; options+=("--port" "$2"); shift 2 ;;
     --lang) [[ $# -ge 2 && "$2" =~ ^(auto|zh|en)$ ]] || { message '--lang 必须为 auto、zh 或 en。' '--lang must be auto, zh or en.' >&2; exit 1; }; language="$2"; shift 2 ;;
     --upgrade|--start|--restart|--install) [[ "$action" == auto ]] || { message '请选择一个操作。' 'Choose one action.' >&2; exit 1; }; action="${1#--}"; shift ;;
-    --no-start|--backend-only|--skip-dependencies) options+=("$1"); shift ;;
-    --help) message '用法: bash install.sh [--upgrade|--start|--restart|--install] [--dir 目录] [--port 端口] [--lang auto|zh|en] [--no-start] [--backend-only]' 'Usage: bash install.sh [--upgrade|--start|--restart|--install] [--dir PATH] [--port PORT] [--lang auto|zh|en] [--no-start] [--backend-only]'; exit 0 ;;
+    --build-from-source) source_build=true; options+=("$1"); shift ;;
+    --backend-only) backend_only=true; options+=("$1"); shift ;;
+    --no-start|--skip-dependencies) options+=("$1"); shift ;;
+    --help) message '用法: bash install.sh [--upgrade|--start|--restart|--install] [--dir 目录] [--port 端口] [--lang auto|zh|en] [--no-start] [--backend-only] [--build-from-source（仅开发者）]' 'Usage: bash install.sh [--upgrade|--start|--restart|--install] [--dir PATH] [--port PORT] [--lang auto|zh|en] [--no-start] [--backend-only] [--build-from-source (developers only)]'; exit 0 ;;
     *) message "未知安装参数: $1" "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -42,10 +47,24 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/kuku2api.XXXXXX")"
 trap 'rm -rf -- "$work"' EXIT
 download() { curl --fail --location --retry 3 --connect-timeout 20 --max-time 600 --proto '=https' --tlsv1.2 "$1" -o "$2"; }
 download_source() {
+  if [[ "$source_build" == false && "$backend_only" == false ]]; then
+    message '正在下载预编译发布包；服务器无需构建…' 'Downloading the prebuilt release; no server-side build required…'
+    download "$RELEASE_URL/SHA256SUMS" "$work/release-checksums.txt" || { message '预编译发布包暂不可用，请稍后重试；不会转为本机构建。' 'Prebuilt release unavailable; retry later. No local build will run.' >&2; exit 1; }
+    download "$RELEASE_URL/kuku2api.tar.gz" "$work/source.tar.gz"
+    expected="$(awk '$2=="kuku2api.tar.gz" {print $1}' "$work/release-checksums.txt")"
+    if command -v sha256sum >/dev/null; then actual="$(sha256sum "$work/source.tar.gz" | awk '{print $1}')";
+    elif command -v shasum >/dev/null; then actual="$(shasum -a 256 "$work/source.tar.gz" | awk '{print $1}')";
+    else message '校验发布包需要 sha256sum 或 shasum。' 'sha256sum or shasum is required to verify the release.' >&2; exit 1; fi
+    [[ "$expected" =~ ^[a-f0-9]{64}$ && "$actual" == "$expected" ]] || { message '发布包校验失败，请重新运行；不会转为本机构建。' 'Release checksum mismatch; rerun the installer. No local build will run.' >&2; exit 1; }
+    mkdir "$work/source"
+    tar -xzf "$work/source.tar.gz" -C "$work/source"
+    [[ -f "$work/source/release.json" && -f "$work/source/ui/dist/index.html" && -f "$work/source/scripts/prebuilt.mjs" ]] || { message '预编译发布包不完整，已停止安装。' 'Incomplete prebuilt release; installation stopped.' >&2; exit 1; }
+  else
   message '正在下载最新源码…' 'Downloading the latest source…'
   download "$SOURCE_URL" "$work/source.tar.gz"
   mkdir "$work/source"
   tar -xzf "$work/source.tar.gz" -C "$work/source" --strip-components=1
+  fi
   [[ -f "$work/source/scripts/manage.mjs" && -f "$work/source/package.json" ]] || { message '项目压缩包无效或版本过旧，请稍后重试。' 'Invalid or outdated project archive; retry shortly.' >&2; exit 1; }
 }
 
@@ -95,9 +114,9 @@ else
   node_bin="$install_dir/.runtime/node/bin/node"
 fi
 export PATH="$(dirname -- "$node_bin"):$PATH"
-compatible_source() { "$node_bin" -e 'const fs=require("node:fs"),p=require("node:path"),root=process.argv[1];try{process.exit(fs.readFileSync(p.join(root,"scripts/install.mjs"),"utf8").includes("export const INSTALLER_PROTOCOL = 2;")&&["scripts/manage.mjs","scripts/service.mjs","scripts/install-language.mjs","src/listen-port.mjs"].every(file=>fs.existsSync(p.join(root,file)))?0:1)}catch{process.exit(1)}' "$install_dir"; }
+compatible_source() { "$node_bin" -e 'const fs=require("node:fs"),p=require("node:path"),root=process.argv[1];try{process.exit(fs.readFileSync(p.join(root,"scripts/install.mjs"),"utf8").includes("export const INSTALLER_PROTOCOL = 3;")&&["scripts/manage.mjs","scripts/service.mjs","scripts/install-language.mjs","scripts/prebuilt.mjs","src/listen-port.mjs"].every(file=>fs.existsSync(p.join(root,file)))?0:1)}catch{process.exit(1)}' "$install_dir"; }
 if [[ "$action" == auto ]]; then
-  if [[ "$script_dir" != "$install_dir" ]] || ! compatible_source; then action=upgrade; else action=install; fi
+  if [[ "$script_dir" != "$install_dir" ]] || ! compatible_source || [[ "$source_build" == false && "$backend_only" == false ]]; then action=upgrade; else action=install; fi
 fi
 if [[ "$action" == start || "$action" == restart ]] && ! compatible_source; then action=upgrade; fi
 if [[ "$action" == upgrade ]]; then

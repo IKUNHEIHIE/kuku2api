@@ -7,6 +7,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase } from '../src/database.mjs';
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
+import { consoleFiles } from '../scripts/prebuilt.mjs';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 function bashExecutable() {
@@ -167,3 +169,52 @@ exit 0`);
     assert.deepEqual(JSON.parse(readFileSync(output, 'utf8').replace(/^\uFEFF/, '')), { directory: path.resolve(ROOT), upgrade: true, port: 19777, lang: 'zh', noStart: true, backendOnly: true });
   } finally { cleanup(root); }
 });
+
+for (const [name, executable] of runners) {
+  test(`${name}: full remote installation and upgrade consume checksummed prebuilt assets without frontend build tools`, { skip: !executable }, () => {
+    const base = mkdtempSync(path.join(tmpdir(), 'kuku-bootstrap-test-'));
+    try {
+      const root = path.join(base, 'installed'), source = path.join(base, 'source'), mocks = path.join(base, 'bin');
+      mkdirSync(source); mkdirSync(mocks); updateSource(source);
+      mkdirSync(path.join(source, 'ui/dist/assets'), { recursive: true });
+      writeFileSync(path.join(source, 'ui/dist/index.html'), '<!doctype html><script src="/assets/app.js"></script>');
+      writeFileSync(path.join(source, 'ui/dist/assets/app.js'), 'console.log("prebuilt")');
+      writeFileSync(path.join(source, 'release.json'), JSON.stringify({ format: 1, commit: 'c'.repeat(40), version: '0.2.0', console: consoleFiles(source) }));
+      const archive = path.join(base, name === 'Bash' ? 'kuku2api.tar.gz' : 'kuku2api.zip'), checksums = path.join(base, 'SHA256SUMS');
+      if (name === 'Bash') execFileSync('tar', ['-czf', archive, '-C', source, '.'], { windowsHide: true });
+      else execFileSync(executable, ['-NoProfile', '-Command', `Compress-Archive -Path '${source.replaceAll("'", "''")}/*' -DestinationPath '${archive.replaceAll("'", "''")}'`], { windowsHide: true });
+      const hash = createHash('sha256').update(readFileSync(archive)).digest('hex');
+      writeFileSync(checksums, `${hash}  ${path.basename(archive)}\n`);
+      const environment = { ...process.env, PATH: mocks + path.delimiter + path.dirname(process.execPath) + path.delimiter + process.env.PATH,
+        ADMIN_TOKEN: '', DATABASE_FILE: path.join(root, 'data/kukuai.sqlite'), PORT: undefined, NPM_CONFIG_OFFLINE: 'true',
+        KUKU_TEST_ARCHIVE: archive.replaceAll('\\', '/'), KUKU_TEST_CHECKSUMS: checksums.replaceAll('\\', '/'), KUKU_TEST_ROOT: root,
+        KUKU_TEST_ENTRY: path.join(ROOT, name === 'Bash' ? 'install.sh' : 'install.ps1'), KUKU_TEST_MOCKS: mocks };
+      if (name === 'Bash') writeFileSync(path.join(mocks, 'curl'), `#!/usr/bin/env bash
+while (($#)); do case "$1" in -o) output="$2"; shift 2;; https://*) url="$1"; shift;; *) shift;; esac; done
+case "$url" in */SHA256SUMS) cp -- "$KUKU_TEST_CHECKSUMS" "$output";; */kuku2api.tar.gz) cp -- "$KUKU_TEST_ARCHIVE" "$output";; *) echo 'Unexpected source or dependency download' >&2; exit 77;; esac
+`, { mode: 0o755 });
+      const invoke = first => {
+        const command = name === 'Bash'
+          ? `export PATH="$(cd -- "$KUKU_TEST_MOCKS" && pwd):$PATH"; bash "$KUKU_TEST_ENTRY" --dir "$KUKU_TEST_ROOT" --no-start --lang en ${first ? '--port 19778' : ''}`
+          : `function Invoke-WebRequest { param($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec)
+if ($Uri.EndsWith('/SHA256SUMS')) { Copy-Item -LiteralPath $env:KUKU_TEST_CHECKSUMS -Destination $OutFile }
+elseif ($Uri.EndsWith('/kuku2api.zip')) { Copy-Item -LiteralPath $env:KUKU_TEST_ARCHIVE -Destination $OutFile }
+else { throw 'Unexpected source or dependency download' } }
+& $env:KUKU_TEST_ENTRY -InstallDir $env:KUKU_TEST_ROOT -NoStart -Lang en ${first ? '-Port 19778' : ''}`;
+        return spawnSync(executable, name === 'Bash' ? ['-c', command] : ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(command, 'utf16le').toString('base64')], {
+          cwd: base, encoding: 'utf8', windowsHide: true, timeout: 30000, env: environment,
+        });
+      };
+      const first = invoke(true); assert.equal(first.status, 0, first.stderr); assert.match(first.stdout, /no frontend dependencies or local build/);
+      const db = openDatabase({ root }); const token = db.store('admin').load().token;
+      db.store('accounts').save({ accounts: [{ id: 'keep-account', bduss: 'fake-cookie' }] }); db.close();
+      const repeated = invoke(false); assert.equal(repeated.status, 0, repeated.stderr); assert.match(repeated.stdout, /already current/);
+      assert(!repeated.stdout.includes(token)); assert.equal(existsSync(path.join(root, 'ui/node_modules')), false);
+      const before = readFileSync(environment.DATABASE_FILE);
+      writeFileSync(checksums, `${'0'.repeat(64)}  ${path.basename(archive)}\n`);
+      const rejected = invoke(false); assert.notEqual(rejected.status, 0); assert.match(rejected.stdout + rejected.stderr, /checksum mismatch/);
+      assert.deepEqual(readFileSync(environment.DATABASE_FILE), before);
+      assert.equal(existsSync(path.join(root, 'ui/node_modules')), false);
+    } finally { cleanup(base); }
+  });
+}

@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
   [string]$InstallDir,
   [ValidateRange(1, 65535)][int]$Port,
@@ -9,7 +9,8 @@ param(
   [switch]$Install,
   [switch]$NoStart,
   [switch]$BackendOnly,
-  [switch]$SkipDependencies
+  [switch]$SkipDependencies,
+  [switch]$BuildFromSource
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -41,6 +42,12 @@ New-Item -ItemType Directory -Path $taskTemp | Out-Null
 function Get-TaskDownload([string]$Url, [string]$Destination) {
   Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing -TimeoutSec 600
 }
+function Get-TaskSha256([string]$File) {
+  $taskStream = [IO.File]::OpenRead($File)
+  $taskHasher = [Security.Cryptography.SHA256]::Create()
+  try { return [BitConverter]::ToString($taskHasher.ComputeHash($taskStream)).Replace('-', '').ToLowerInvariant() }
+  finally { $taskHasher.Dispose(); $taskStream.Dispose() }
+}
 function Test-TaskNode([string]$Executable) {
   if (-not $Executable -or -not (Test-Path -LiteralPath $Executable)) { return $false }
   try {
@@ -49,6 +56,23 @@ function Test-TaskNode([string]$Executable) {
   } catch { return $false }
 }
 function Get-TaskSource {
+  if (-not $BuildFromSource -and -not $BackendOnly) {
+    Write-Host (Get-TaskMessage '正在下载预编译发布包；服务器无需构建…' 'Downloading the prebuilt release; no server-side build required…')
+    $taskReleaseUrl = "https://github.com/$taskRepository/releases/latest/download"
+    $taskChecksum = Join-Path $taskTemp 'release-checksums.txt'
+    $taskZip = Join-Path $taskTemp 'release.zip'
+    try { Get-TaskDownload "$taskReleaseUrl/SHA256SUMS" $taskChecksum }
+    catch { throw (Get-TaskMessage '预编译发布包暂不可用，请稍后重试；不会转为本机构建。' 'Prebuilt release unavailable; retry later. No local build will run.') }
+    Get-TaskDownload "$taskReleaseUrl/kuku2api.zip" $taskZip
+    $taskMatch = @(Get-Content -LiteralPath $taskChecksum | Select-String -Pattern '^([a-f0-9]{64})\s+kuku2api\.zip$')
+    if ($taskMatch.Count -ne 1 -or (Get-TaskSha256 $taskZip) -ne $taskMatch[0].Matches[0].Groups[1].Value) { throw (Get-TaskMessage '发布包校验失败，请重新运行；不会转为本机构建。' 'Release checksum mismatch; rerun the installer. No local build will run.') }
+    $taskSourceDirectory = Join-Path $taskTemp 'source'
+    Expand-Archive -LiteralPath $taskZip -DestinationPath $taskSourceDirectory
+    foreach ($taskRequired in @('release.json','ui/dist/index.html','scripts/prebuilt.mjs','scripts/manage.mjs','package.json')) {
+      if (-not (Test-Path -LiteralPath (Join-Path $taskSourceDirectory $taskRequired))) { throw (Get-TaskMessage '预编译发布包不完整，已停止安装。' 'Incomplete prebuilt release; installation stopped.') }
+    }
+    return $taskSourceDirectory
+  }
   Write-Host (Get-TaskMessage '正在下载最新源码…' 'Downloading the latest source…')
   $taskZip = Join-Path $taskTemp 'source.zip'
   Get-TaskDownload "https://codeload.github.com/$taskRepository/zip/refs/heads/main" $taskZip
@@ -93,7 +117,7 @@ try {
       $taskArchive = $taskMatch[0].Matches[0].Groups[2].Value
       $taskNodeZip = Join-Path $taskTemp $taskArchive
       Get-TaskDownload "$taskNodeUrl/$taskArchive" $taskNodeZip
-      if ((Get-FileHash -LiteralPath $taskNodeZip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $taskExpected) { throw (Get-TaskMessage 'Node.js 校验失败，已停止安装。' 'Node.js checksum mismatch; installation stopped') }
+      if ((Get-TaskSha256 $taskNodeZip) -ne $taskExpected) { throw (Get-TaskMessage 'Node.js 校验失败，已停止安装。' 'Node.js checksum mismatch; installation stopped') }
       $taskNodeStage = Join-Path $taskTemp 'node'
       Expand-Archive -LiteralPath $taskNodeZip -DestinationPath $taskNodeStage
       $taskExtracted = Join-Path $taskNodeStage ($taskArchive -replace '\.zip$','')
@@ -106,13 +130,14 @@ try {
     }
   }
   $taskInstallerSource = if (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install.mjs')) { Get-Content -LiteralPath (Join-Path $InstallDir 'scripts/install.mjs') -Raw } else { '' }
-  $taskCompatible = $taskInstallerSource.Contains('export const INSTALLER_PROTOCOL = 2;') -and
+  $taskCompatible = $taskInstallerSource.Contains('export const INSTALLER_PROTOCOL = 3;') -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/manage.mjs')) -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/service.mjs')) -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install-language.mjs')) -and
+      (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/prebuilt.mjs')) -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'src/listen-port.mjs'))
   if ($taskAction -eq 'auto') {
-    $taskAction = if (-not $taskCompatible -or [IO.Path]::GetFullPath($PSScriptRoot) -ne $InstallDir) { 'upgrade' } else { 'install' }
+    $taskAction = if (-not $taskCompatible -or [IO.Path]::GetFullPath($PSScriptRoot) -ne $InstallDir -or (-not $BuildFromSource -and -not $BackendOnly)) { 'upgrade' } else { 'install' }
   }
   if ($taskAction -in @('start', 'restart') -and (-not $taskCompatible)) { $taskAction = 'upgrade' }
   if ($taskAction -eq 'install' -and (-not $taskCompatible)) {
@@ -124,6 +149,7 @@ try {
   if ($NoStart) { $taskArgs += '--no-start' }
   if ($BackendOnly) { $taskArgs += '--backend-only' }
   if ($SkipDependencies) { $taskArgs += '--skip-dependencies' }
+  if ($BuildFromSource) { $taskArgs += '--build-from-source' }
   $env:PATH = (Split-Path $taskNode -Parent) + [IO.Path]::PathSeparator + $env:PATH
   if ($taskAction -eq 'upgrade') {
     $taskSource = Get-TaskSource
