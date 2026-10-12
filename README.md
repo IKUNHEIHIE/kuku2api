@@ -33,6 +33,7 @@ Invoke-WebRequest https://raw.githubusercontent.com/IKUNHEIHIE/kuku2api/main/ins
 按提示选择运行端口（默认 `8787`），安装完成后会显示：
 
 ```text
+安装完成，服务已在后台运行。
 控制台地址：http://服务器IP:端口
 管理员密钥：随机生成的强令牌
 ```
@@ -65,7 +66,7 @@ Invoke-WebRequest https://raw.githubusercontent.com/IKUNHEIHIE/kuku2api/main/ins
 | 升级 | `bash ~/kuku2api/upgrade.sh` | `& "$env:USERPROFILE\kuku2api\upgrade.ps1"` |
 | 启动 | `bash ~/kuku2api/start.sh` | `& "$env:USERPROFILE\kuku2api\start.ps1"` |
 
-服务以前台方式运行，关闭终端或按 Ctrl+C 会停止。详细备份与部署说明见 [运行维护](docs/operations.md)。
+安装器验证后台服务启动后自动退出，关闭终端不影响服务。Linux root + systemd 环境自动注册开机启动和异常重启；其他环境使用独立后台进程。详细说明见 [运行维护](docs/operations.md)。
 
 ## 文档
 

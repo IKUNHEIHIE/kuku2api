@@ -24,8 +24,11 @@ export async function consoleAddress(port, { host = '127.0.0.1', interfaces = ne
   return `http://${isIP(address) === 6 ? `[${address}]` : address}:${port}`;
 }
 
-export async function installSummary({ port, token, host, language }) {
+export async function installSummary({ port, token, host, language, started = true }) {
   const url = await consoleAddress(port, { host });
+  console.log(language === 'zh'
+    ? (started ? '安装完成，服务已在后台运行。' : '安装完成（未启动服务）。')
+    : (started ? 'Installation complete. Service is running in the background.' : 'Installation complete (service not started).'));
   console.log(language === 'zh' ? `控制台地址：${url}` : `Console address: ${url}`);
   console.log(language === 'zh' ? `管理员密钥：${token}` : `Administrator key: ${token}`);
 }

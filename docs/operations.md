@@ -28,7 +28,7 @@
 - 只允许代理访问后端时，可设置 `LISTEN_HOST=127.0.0.1`，由代理终止 HTTPS。
 - 分开部署前后端时，按实际域名配置 `CORS_ORIGIN`，在控制台填写后端根地址。
 
-安装器不配置防火墙、HTTPS 证书或系统服务。
+安装器不配置防火墙或 HTTPS 证书。
 
 ## 数据存储
 
@@ -59,8 +59,27 @@ SQLite 保存账号凭据、普通密钥、会话映射、Responses、对话正�
 
 日志不记录请求头、请求体或查询字符串，系统消息经过凭据脱敏。排障时仍不要公开整个数据库或未经检查的本地抓包。
 
-## 服务停止
+## 后台服务管理
 
-默认前台服务按 Ctrl+C 停止。升级脚本通过受保护的运行实例及停止接口，验证目录和数据库归属后等待请求结束，最长 120 秒。不要通过结束所有 Node.js 进程处理端口冲突。
+一键安装、升级、`start.sh` / `start.ps1` 验证后台实例启动成功后返回终端，并显示完成提示、控制台地址和管理员密钥。`--no-start` 明确显示未启动，不会声称服务正在运行。开发者 `npm start` 保留前台运行方式。
+
+Linux root + systemd 环境自动创建按安装目录区分的 `kuku2api-<目录哈希>.service`，启用开机启动，异常退出 3 秒后重启（受 systemd 启动频率限制）。关闭 SSH / 宝塔终端不影响系统服务。取得当前安装的服务名后可管理：
+
+```bash
+cd ~/kuku2api
+node_bin=node
+[ ! -x .runtime/node/bin/node ] || node_bin=.runtime/node/bin/node
+unit="$($node_bin --input-type=module -e 'import { serviceName } from "./scripts/background-service.mjs"; console.log(serviceName(process.cwd()))')"
+systemctl status "$unit"
+journalctl -u "$unit" -n 100 --no-pager
+systemctl stop "$unit"
+systemctl start "$unit"
+```
+
+其他环境使用独立后台进程，输出保存到 `.runtime/server.log`，关闭终端后继续运行，但不自动开机启动或异常重启。停止可调用下方受保护的停止接口。
+
+后台配置私有保存在 `.runtime/service.json`；systemd 使用 `.runtime/service.env`。仅保存应用配置，不复制整个登录会话环境；文件可能含显式管理员令牌/API 密钥，不要分享。后续启动和升级沿用保存值，当前显式环境变量优先。源码 `npm start` 不自动读取这些文件，继续使用启动环境和 SQLite 配置。
+
+升级脚本验证目录、数据库和实例归属后等待请求结束，最长 120 秒；systemd 实例先显式停止托管服务，取消自动重启，再备份切换。启动失败会停止新实例再恢复旧版。API 主动正常退出不会触发 `Restart=on-failure`；长期禁用开机启动可用 `systemctl disable --now "$unit"`。不要通过结束所有 Node.js 进程处理端口冲突。
 
 运行实例接口和停止请求格式见 [API 文档](api.md#运行实例管理)。

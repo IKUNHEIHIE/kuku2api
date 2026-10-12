@@ -127,9 +127,10 @@ try {
     }
   }
   $taskInstallerSource = if (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install.mjs')) { Get-Content -LiteralPath (Join-Path $InstallDir 'scripts/install.mjs') -Raw } else { '' }
-  $taskCompatible = $taskInstallerSource.Contains('export const INSTALLER_PROTOCOL = 4;') -and
+  $taskCompatible = $taskInstallerSource.Contains('export const INSTALLER_PROTOCOL = 5;') -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/manage.mjs')) -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/service.mjs')) -and
+      (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/background-service.mjs')) -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install-language.mjs')) -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/prebuilt.mjs')) -and
       (Test-Path -LiteralPath (Join-Path $InstallDir 'scripts/install-output.mjs')) -and

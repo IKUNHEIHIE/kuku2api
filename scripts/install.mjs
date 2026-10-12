@@ -12,7 +12,7 @@ import { validatePrebuilt } from './prebuilt.mjs';
 import { quietInstall, progress, installSummary } from './install-output.mjs';
 
 export const PNPM_VERSION = '10.34.0';
-export const INSTALLER_PROTOCOL = 4;
+export const INSTALLER_PROTOCOL = 5;
 export function supportedNode(version) {
   const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version);
   return !!m && (Number(m[1]) > 24 || (Number(m[1]) === 24 && Number(m[2]) >= 15));
@@ -118,6 +118,8 @@ function run(executable, args, cwd, t) {
 }
 
 export async function install(root, args) {
+  const { applySavedEnvironment } = await import('./background-service.mjs');
+  applySavedEnvironment(root);
   const options = installOptions(args);
   const language = installerLanguage(options.lang);
   const t = (zh, en) => language === 'zh' ? zh : en;
@@ -179,14 +181,14 @@ async function finishInstall(root, options, port, language) {
       const { launchVerified } = await import('./service.mjs');
       await launchVerified(root, port, t);
     }
-    if (process.env.KUKU_INSTALLER_SUMMARY !== '0') await installSummary({ port, host, token, language });
+    if (process.env.KUKU_INSTALLER_SUMMARY !== '0') await installSummary({ port, host, token, language, started: options.start });
     return;
   }
   const url = `http://127.0.0.1:${port}`;
   console.log(t(`kuku2api ${version} 安装完成。请保存上方首次生成的管理员令牌；再次安装会复用已有数据库与令牌。`, `kuku2api ${version} installed. Save the administrator token shown on first install; reinstalling preserves the database and token.`));
   console.log(t(`控制台 / API: ${url}${options.ui ? '' : '（仅后端；未构建控制台）'}`, `Console / API: ${url}${options.ui ? '' : ' (backend only; console not built)'}`));
   if (options.ui) console.log(t(`登录页的“服务端地址配置”应填写 ${url}（不要加 /v1），管理员令牌与普通 API 密钥分别填写。`, `Set the login page server address to ${url} (without /v1). Administrator tokens and model API keys are separate.`));
-  console.log(t('自动领取默认关闭。关闭终端会停止前台服务；再次运行 start.sh 或 start.ps1 启动。', 'Automatic claiming is off by default. Closing the terminal stops the service; run start.sh or start.ps1 to restart.'));
+  console.log(t('自动领取默认关闭。此开发入口以前台运行；start.sh 或 start.ps1 使用后台启动。', 'Automatic claiming is off by default. This development entry runs in the foreground; start.sh or start.ps1 starts a background service.'));
   if (options.start) return start(root, { port });
 }
 

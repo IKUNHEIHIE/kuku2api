@@ -111,7 +111,7 @@ else
 fi
 export PATH="$(dirname -- "$node_bin"):$PATH"
 export KUKU_INSTALLER_QUIET=1
-compatible_source() { "$node_bin" -e 'const fs=require("node:fs"),p=require("node:path"),root=process.argv[1];try{process.exit(fs.readFileSync(p.join(root,"scripts/install.mjs"),"utf8").includes("export const INSTALLER_PROTOCOL = 4;")&&["scripts/manage.mjs","scripts/service.mjs","scripts/install-language.mjs","scripts/prebuilt.mjs","scripts/install-output.mjs","src/listen-port.mjs"].every(file=>fs.existsSync(p.join(root,file)))?0:1)}catch{process.exit(1)}' "$install_dir"; }
+compatible_source() { "$node_bin" -e 'const fs=require("node:fs"),p=require("node:path"),root=process.argv[1];try{process.exit(fs.readFileSync(p.join(root,"scripts/install.mjs"),"utf8").includes("export const INSTALLER_PROTOCOL = 5;")&&["scripts/manage.mjs","scripts/service.mjs","scripts/background-service.mjs","scripts/install-language.mjs","scripts/prebuilt.mjs","scripts/install-output.mjs","src/listen-port.mjs"].every(file=>fs.existsSync(p.join(root,file)))?0:1)}catch{process.exit(1)}' "$install_dir"; }
 if [[ "$action" == auto ]]; then
   if [[ "$script_dir" != "$install_dir" ]] || ! compatible_source || [[ "$source_build" == false && "$backend_only" == false ]]; then action=upgrade; else action=install; fi
 fi

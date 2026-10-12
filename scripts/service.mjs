@@ -4,6 +4,8 @@ import path from 'node:path';
 import { availablePort } from './install.mjs';
 import { start } from './start.mjs';
 import { listenPort, listenHost } from '../src/listen-port.mjs';
+import { savedServiceEnvironment, launchBackground, stopManagedRuntime } from './background-service.mjs';
+import { quietInstall } from './install-output.mjs';
 
 export const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const runtimeUrl = state => {
@@ -23,7 +25,8 @@ function processAlive(pid) {
   catch (error) { return error.code !== 'ESRCH'; }
 }
 export function installationState(root) {
-  const file = path.resolve(root, process.env.DATABASE_FILE || 'data/kukuai.sqlite');
+  const env = { ...savedServiceEnvironment(root), ...process.env };
+  const file = path.resolve(root, env.DATABASE_FILE || 'data/kukuai.sqlite');
   let settings = {}, admin = {};
   if (existsSync(file)) {
     const db = new DatabaseSync(file, { readOnly: true });
@@ -36,8 +39,8 @@ export function installationState(root) {
   } else if (existsSync(path.join(root, 'admin-token.json'))) {
     admin = JSON.parse(readFileSync(path.join(root, 'admin-token.json'), 'utf8'));
   }
-  return { file, settings, token: process.env.ADMIN_TOKEN?.trim() ? process.env.ADMIN_TOKEN : admin.token,
-    port: listenPort(process.env.PORT ?? settings.port ?? 8787), host: listenHost(process.env.LISTEN_HOST ?? settings.host ?? '127.0.0.1') };
+  return { file, settings, token: env.ADMIN_TOKEN?.trim() ? env.ADMIN_TOKEN : admin.token,
+    port: listenPort(env.PORT ?? settings.port ?? 8787), host: listenHost(env.LISTEN_HOST ?? settings.host ?? '127.0.0.1') };
 }
 
 export async function runtimeAt(root, state, t = (_zh, en) => en) {
@@ -58,11 +61,13 @@ export async function runtimeAt(root, state, t = (_zh, en) => en) {
 }
 
 export async function stopRuntime(state, info, t = (_zh, en) => en, timeout = 120000) {
-  const response = await fetch(`${runtimeUrl(state)}/pool/admin/shutdown`, {
-    method: 'POST', headers: { 'x-admin-token': state.token, 'content-type': 'application/json' },
-    body: JSON.stringify({ instance_id: info.instance_id }), signal: AbortSignal.timeout(5000), redirect: 'error',
-  });
-  if (response.status !== 202) throw new Error(t('服务身份已变化，停止升级。', 'Service identity changed; upgrade stopped.'));
+  if (!stopManagedRuntime(info.root, info.pid)) {
+    const response = await fetch(`${runtimeUrl(state)}/pool/admin/shutdown`, {
+      method: 'POST', headers: { 'x-admin-token': state.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ instance_id: info.instance_id }), signal: AbortSignal.timeout(5000), redirect: 'error',
+    });
+    if (response.status !== 202) throw new Error(t('服务身份已变化，停止升级。', 'Service identity changed; upgrade stopped.'));
+  }
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     if (!processAlive(info.pid)) {
@@ -78,6 +83,21 @@ export async function launchVerified(root, port, t = (_zh, en) => en, timeout = 
   // initializes WAL can briefly lock its database during the startup check.
   const state = installationState(root); state.port = port;
   await availablePort(port, 'en', state.host);
+  if (quietInstall()) {
+    const service = await launchBackground(root, state);
+    try {
+      const deadline = Date.now() + timeout;
+      while (!service.ended() && Date.now() < deadline) {
+        try {
+          const info = await runtimeAt(root, state);
+          if (info?.pid === service.pid()) return { pid: info.pid, mode: service.mode };
+        } catch {}
+        await delay(300);
+      }
+    } catch (error) { await service.stop(); throw error; }
+    await service.stop();
+    throw new Error(t('新服务未通过启动检查，请查看服务日志。', 'The new service failed its startup check; inspect its service log.'));
+  }
   const child = start(root, { port, env: { ...process.env, DATABASE_FILE: state.file } });
   const closed = new Promise(resolve => { child.once('error', resolve); child.once('close', resolve); });
   let ended = false;

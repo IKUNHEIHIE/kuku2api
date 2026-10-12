@@ -76,7 +76,7 @@ for (const [name, executable] of runners) {
       updateSource(root);
       const result = invoke(name, executable, root, database);
       assert.equal(result.status, 0, result.stderr);
-      assert.equal(result.stdout.trim().split(/\r?\n/).length, 2);
+      assert.equal(result.stdout.trim().split(/\r?\n/).length, 3);
       assert.match(result.stdout, /127\.0\.0\.1:19777/);
       assert.equal(result.stdout.includes(token), true);
       const db = openDatabase({ root, file: database });
@@ -139,7 +139,7 @@ function Invoke-WebRequest { param($Uri, $OutFile, [switch]$UseBasicParsing, $Ti
           { cwd: root, encoding: 'utf8', windowsHide: true, timeout: 60000, env: environment });
       }
       assert.equal(result.status, 0, result.stderr);
-      assert.equal(result.stdout.trim().split(/\r?\n/).length, 2);
+      assert.equal(result.stdout.trim().split(/\r?\n/).length, 3);
       assert.equal(result.stdout.includes(token), true);
       assert.equal(existsSync(path.join(root, 'legacy-installer-executed')), false);
       assert(existsSync(path.join(root, 'scripts/manage.mjs')));
@@ -205,7 +205,7 @@ else { throw 'Unexpected source or dependency download' } }
           cwd: base, encoding: 'utf8', windowsHide: true, timeout: 30000, env: environment,
         });
       };
-      const first = invoke(true); assert.equal(first.status, 0, first.stderr); assert.match(first.stdout, /^Console address: http:\/\/127\.0\.0\.1:19778\r?\nAdministrator key: kuku-admin-[A-Za-z0-9_-]{43}\r?\n$/);
+      const first = invoke(true); assert.equal(first.status, 0, first.stderr); assert.match(first.stdout, /^Installation complete \(service not started\).\r?\nConsole address: http:\/\/127\.0\.0\.1:19778\r?\nAdministrator key: kuku-admin-[A-Za-z0-9_-]{43}\r?\n$/);
       const db = openDatabase({ root }); const token = db.store('admin').load().token;
       db.store('accounts').save({ accounts: [{ id: 'keep-account', bduss: 'fake-cookie' }] }); db.close();
       const repeated = invoke(false); assert.equal(repeated.status, 0, repeated.stderr); assert.equal(repeated.stdout, first.stdout);

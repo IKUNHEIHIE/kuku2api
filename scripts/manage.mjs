@@ -11,6 +11,7 @@ import { listenPort } from '../src/listen-port.mjs';
 import { installationState, runtimeAt, stopRuntime, launchVerified, samePath } from './service.mjs';
 import { validatePrebuilt } from './prebuilt.mjs';
 import { quietInstall, progress, installSummary } from './install-output.mjs';
+import { managedRuntime, systemdAvailable } from './background-service.mjs';
 
 const HERE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const roots = new Set(['src', 'scripts', 'test', 'docs', 'ui', '.github']);
@@ -77,7 +78,7 @@ export async function manage(root, source, action, args, { build = buildConsole,
   const state = installationState(root);
   const summary = async port => {
     const current = installationState(root);
-    if (quietInstall()) await installSummary({ port, token: current.token, host: current.host, language });
+    if (quietInstall()) await installSummary({ port, token: current.token, host: current.host, language, started: options.start });
   };
   let port = listenPort(options.port ?? state.port);
   const incomplete = !existsSync(state.file) && !['accounts.json', 'keys.json', 'settings.json', 'admin-token.json'].some(name => existsSync(path.join(root, name)));
@@ -96,6 +97,10 @@ export async function manage(root, source, action, args, { build = buildConsole,
       port = await choosePort({ ...options, savedPort: state.port, language, start: true, autoAvailable: true, ...portSelection });
     } else previousRuntime = await runtimeAt(root, state, t);
     if (action === 'start' && previousRuntime) {
+      if (quietInstall() && systemdAvailable() && !managedRuntime(root, previousRuntime.pid)) {
+        await stopRuntime(state, previousRuntime, t);
+        if (options.start) await launch(root, state.port, t);
+      }
       progress(t(`服务已经运行：http://127.0.0.1:${state.port}`, `Service is already running: http://127.0.0.1:${state.port}`)); await summary(state.port); return;
     }
     if (action !== 'upgrade') {
@@ -110,7 +115,7 @@ export async function manage(root, source, action, args, { build = buildConsole,
     if (manifest.name !== 'kuku2api') throw new Error('Invalid upgrade archive');
     release = options.ui && !options.sourceBuild && existsSync(path.join(source, 'release.json')) ? validatePrebuilt(source, t) : null;
     installedFiles = publicFiles(source);
-    for (const name of ['src/server.mjs', 'scripts/install.mjs', 'scripts/manage.mjs', 'scripts/service.mjs', 'package.json']) if (!installedFiles.has(name)) throw new Error(`Incomplete upgrade archive: ${name}`);
+    for (const name of ['src/server.mjs', 'scripts/install.mjs', 'scripts/manage.mjs', 'scripts/service.mjs', 'scripts/background-service.mjs', 'package.json']) if (!installedFiles.has(name)) throw new Error(`Incomplete upgrade archive: ${name}`);
     if (existsSync(path.join(root, '.git'))) {
       if (git(root, ['status', '--porcelain'])) throw new Error(t('Git 目录有本地修改，已保留。请先提交或另存修改后再升级。', 'The Git checkout has local changes. Commit or save them before upgrading; nothing was overwritten.'));
       if (!samePath(git(root, ['rev-parse', '--show-toplevel']), root)) throw new Error('Installation must be the Git repository root');
@@ -146,6 +151,9 @@ export async function manage(root, source, action, args, { build = buildConsole,
     }
     if (!incomplete && (sameSource || (previousGit && previousGit === nextGit)) && port === state.port && (!options.ui || consoleReady)) {
       progress(t('源码已是最新版本，沿用现有构建与端口。', 'Source is already current; reusing the existing build and port.'));
+      if (options.start && previousRuntime && quietInstall() && systemdAvailable() && !managedRuntime(root, previousRuntime.pid)) {
+        await stopRuntime(state, previousRuntime, t); previousRuntime = null;
+      }
       if (options.start && !previousRuntime) await launch(root, port, t);
       await summary(port);
       return { port, unchanged: true };
@@ -202,6 +210,9 @@ export async function manage(root, source, action, args, { build = buildConsole,
     await summary(port);
     return { backupDirectory, port };
   } catch (error) {
+    if (error.serviceStopFailed) throw new Error(t(
+      `新系统服务未能停止，已保留当前文件及备份，请先检查 systemd 服务再恢复。${backupDirectory ?? ''}`,
+      `The new system service could not be stopped. Files and backups were preserved; inspect systemd before restoring. ${backupDirectory ?? ''}`), { cause: error });
     if (changed) {
       try {
         await availablePort(port);

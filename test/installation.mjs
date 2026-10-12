@@ -97,7 +97,7 @@ test('a publicly bound backend requires a model key even before the first key is
   });
 });
 
-test('quiet installation persists public listening and only prints the two requested Chinese lines', async () => {
+test('quiet installation persists public listening and prints completion and the two requested Chinese lines', async () => {
   const root = fixture();
   try {
     for (const directory of ['src', 'scripts']) cpSync(path.join(ROOT, directory), path.join(root, directory), { recursive: true });
@@ -108,7 +108,7 @@ test('quiet installation persists public listening and only prints the two reque
     const env = directEnvironment({ ...process.env, KUKU_INSTALLER_QUIET: '1', KUKU_INSTALLER_SUMMARY: undefined, LISTEN_HOST: undefined, ADMIN_TOKEN: '', DATABASE_FILE: path.join(root, 'data/kukuai.sqlite') });
     const invoke = () => spawnSync(process.execPath, ['--import', pathToFileURL(preload).href, path.join(root, 'scripts/install.mjs'), '--backend-only', '--no-start', '--port', '19876', '--lang', 'zh'], { cwd: root, env, encoding: 'utf8', timeout: 15000 });
     const first = invoke(); assert.equal(first.status, 0, first.stderr);
-    assert.match(first.stdout, /^控制台地址：http:\/\/203\.0\.113\.8:19876\r?\n管理员密钥：kuku-admin-[A-Za-z0-9_-]{43}\r?\n$/);
+    assert.match(first.stdout, /^安装完成（未启动服务）。\r?\n控制台地址：http:\/\/203\.0\.113\.8:19876\r?\n管理员密钥：kuku-admin-[A-Za-z0-9_-]{43}\r?\n$/);
     const db = openDatabase({ root, file: env.DATABASE_FILE });
     try { assert.equal(db.store('installation').load().host, '0.0.0.0'); } finally { db.close(); }
     const second = invoke(); assert.equal(second.status, 0, second.stderr); assert.equal(second.stdout, first.stdout);
