@@ -60,7 +60,8 @@ jobs:
           fi
           if gh release view "$tag" --json isDraft > .runtime/release/existing.json 2>/dev/null; then
             if [[ "$(node -p "JSON.parse(require('fs').readFileSync('.runtime/release/existing.json')).isDraft")" != true ]]; then
-              echo "$tag is already published; bump package.json and add release notes to publish a new version."
+              gh release edit "$tag" --notes-file "$notes"
+              echo "$tag release notes synced; published assets and tag unchanged. Bump package.json to publish a new package."
               exit 0
             fi
             gh release upload "$tag" .runtime/release/kuku2api.tar.gz .runtime/release/kuku2api.zip .runtime/release/SHA256SUMS --clobber
