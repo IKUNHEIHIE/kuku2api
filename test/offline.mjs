@@ -3,6 +3,7 @@
 // Live acceptance against the real pool is a separate script and must stay out of this gate.
 import { createServer } from 'node:http';
 import assert from 'node:assert/strict';
+import { claimClock } from './claim-clock.mjs';
 
 const BASE = 'http://127.0.0.1';
 const profileIdentities = new Map();
@@ -457,7 +458,7 @@ const FAKE_STOKEN = 'Y'.repeat(64);
 const ACCT = { id: 'stub-0', alias: 'stub', priority: 0, bduss: FAKE_BDUSS, stoken: FAKE_STOKEN };
 
 function mkPool(n) {
-  const p = new Pool(Array.from({ length: n }, (_, i) => ({ ...ACCT, id: `a${i}`, priority: i })), { cooldownMs: 60_000 });
+  const p = new Pool(Array.from({ length: n }, (_, i) => ({ ...ACCT, id: `a${i}`, priority: i })), { cooldownMs: 60_000, ...claimClock() });
   for (const a of p.accounts) a.deviceId = 'dev-stub';
   return p;
 }

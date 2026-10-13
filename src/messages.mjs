@@ -15,8 +15,10 @@ export function textContent(content, types = ['text']) {
   }).join('');
 }
 
-export function callerInstructions(messages, instructions = '') {
-  return [...messages.filter(m => m.role === 'system' || m.role === 'developer').map(m => m.content), instructions]
+export function callerInstructions(messages, instructions = '', { labelRoles = false } = {}) {
+  return [...messages.filter(m => m.role === 'system' || m.role === 'developer')
+    .map(m => labelRoles ? `CALLER_${m.role.toUpperCase()}_INSTRUCTIONS:\n${m.content}` : m.content),
+    instructions && (labelRoles ? `CALLER_RESPONSE_INSTRUCTIONS:\n${instructions}` : instructions)]
     .filter(Boolean).join('\n\n');
 }
 

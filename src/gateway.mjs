@@ -99,7 +99,7 @@ export function makeChunk(id, created, model, delta, finish_reason = null) {
 }
 
 export class Pool {
-  constructor(accounts = [], { cooldownMs = 5 * 60_000, authCooldownMs = 60 * 60_000, balanceRetryMs = 10 * 60_000, sessionStore = null, database = null, logger = console } = {}) {
+  constructor(accounts = [], { cooldownMs = 5 * 60_000, authCooldownMs = 60 * 60_000, balanceRetryMs = 10 * 60_000, sessionStore = null, database = null, logger = console, claimNow = () => performance.now(), claimWait = (ms) => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
     this.database = database;
     this.logger = logger;
     this.cooldownMs = cooldownMs;
@@ -108,6 +108,10 @@ export class Pool {
     // Retry "out of points" after a window instead of latching until manually reset.
     this.balanceRetryMs = balanceRetryMs;
     this.queues = new Map();
+    this.claimQueueKey = Symbol('free-point claims');
+    this.nextClaimAt = 0;
+    this.claimNow = claimNow;
+    this.claimWait = claimWait;
     this.sessions = new Map();
     this.sessionStore = sessionStore;
     // Upstream history lives on the session_id, not in our process: without restoring the
@@ -335,13 +339,25 @@ export class Pool {
   // first by spending one low-thinking turn, then explicitly reporting its completion.
   // The official client reports CHAT on GenerateComplete. A proxied conversation alone does
   // not report progress: only this explicit earn-and-claim flow may do that write.
+  scheduleClaim(fn) {
+    // One process-wide pool queue covers batches, single-account requests and the scheduler.
+    // Wait after completion, so a slow paid turn cannot overlap the next account's work.
+    return this.serialize(this.claimQueueKey, async () => {
+      while (this.claimNow() < this.nextClaimAt) await this.claimWait(this.nextClaimAt - this.claimNow());
+      try { return await fn(); }
+      finally { this.nextClaimAt = this.claimNow() + 15_000; }
+    });
+  }
+
   async claimFreePoints({ only = null, runChat = false, chatModel = 'gateway-glm-5.3-flash', chatText = '请只回复 OK，不要调用工具或执行任何任务。' } = {}) {
     const targets = only ? this.accounts.filter((a) => a.id === only || a.alias === only) : this.accounts;
     const out = [];
-    for (const a of targets) {
-      // Manual and scheduled claims must re-read task state under the same account queue.
-      out.push(await this.serialize(`claim:${a.id}`, async () => {
-        const rec = { id: a.id, alias: a.alias, ok: false, points_earned: 0, claimed: [], reported: [], chat_turn: null, notes: [], code: null, message: '' };
+    for (const target of targets) {
+      out.push(await this.scheduleClaim(async () => {
+        const rec = { id: target.id, alias: target.alias, ok: false, points_earned: 0, claimed: [], reported: [], chat_turn: null, notes: [], code: null, message: '' };
+        // Accounts may be removed or credentials refreshed while this job waits in the queue.
+        const a = this.accounts.find(a => a.id === target.id && a.upstream_user_id === target.upstream_user_id);
+        if (!a) { rec.message = '账号已删除或身份已变更，已跳过领取'; return rec; }
         try {
           let tasks = flattenTasks(await a.client.freePointHome());
           if (runChat) {
@@ -467,12 +483,12 @@ export class Pool {
   async recordedChat(args, onDelta, signal) {
     const started = Date.now();
     const observation = { usage_events: [] };
-    let result, error;
+    let result, error, turnId;
     try { result = await this._chat(args, onDelta, signal, observation); }
     catch (e) { error = e; }
     if (this.database) {
       try {
-        this.database.recordTurn({ model: args.model.id, account: args.account.id, messages: args.messages,
+        turnId = this.database.recordTurn({ model: args.model.id, account: args.account.id, messages: args.messages,
           session_key: deriveSessionKey({ sessionKey: args.sessionKey, messages: args.messages, accountId: args.account.id }),
           think_mode: args.think_mode, source: args.source ?? 'chat', store: args.store,
           created_at: started, duration_ms: Date.now() - started, status: error ? 'failed' : result?.cancelled ? 'cancelled' : 'completed',
@@ -483,6 +499,11 @@ export class Pool {
         failure.persistence = true; // Never spend another account's points retrying a disk failure.
         throw failure;
       }
+    }
+    if (observation.agent_timing) {
+      try { this.logger.log?.('agent timing:', JSON.stringify({ turn_id: turnId ?? null, source: args.source ?? 'chat', model: args.model.id,
+        status: error ? 'failed' : 'completed', ...observation.agent_timing })); }
+      catch { console.error('Agent timing log could not be saved'); }
     }
     if (error) {
       error.observation = observation;
@@ -505,7 +526,7 @@ export class Pool {
     // silently pick its own default, ignoring the caller's model choice.
     if (!MODEL_INDEX.has(model.id)) await this.refreshModelIndex(account);
     const cfg = MODEL_INDEX.get(model.id) ?? { model_name: model.id, display_name: model.id };
-    if (agent) return nativeAgentTurn({ client: account.client, model: cfg, agent,
+    if (agent) return nativeAgentTurn({ client: account.client, model: cfg, agent, onDelta,
       think_mode: think_mode ?? cfg.think_mode ?? lastCatalog?.default_think_id ?? 3, observation, signal,
       ownsAccount: () => this.accounts.some(a => a.id === accountId && a.upstream_user_id === upstreamUserId) });
     const logicalKey = deriveSessionKey({ sessionKey, messages, accountId: account.id });

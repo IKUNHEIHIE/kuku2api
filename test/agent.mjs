@@ -4,10 +4,12 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createServer, request as httpRequest } from 'node:http';
+import { EventEmitter } from 'node:events';
 import { Pool, MODEL_INDEX } from '../src/gateway.mjs';
 import { createApp } from '../src/server.mjs';
 import { createLedger } from '../src/ledger.mjs';
-import { openDatabase } from '../src/database.mjs';
+import { openDatabase, createDatabaseLogger } from '../src/database.mjs';
 import { KukuAccount } from '../src/upstream.mjs';
 import { prepareAgent, validateAgentTurn } from '../src/agent.mjs';
 import { checkToolSchema, matchesToolSchema } from '../src/tool-schema.mjs';
@@ -40,7 +42,7 @@ function setup(t, plan = ({ messages }) => {
     a.client.allocateIds = async () => ({ chat_id: `native-${++seen.allocations}`, query_id: `reply-${seen.allocations}` });
     a.client.controlStream = async function* (kind, body, signal) {
       const q = queue(signal); if (kind === 'sandbox') sandbox = q; else base = q;
-      seen.channels.push({ kind, body });
+      seen.channels.push({ kind, body, signal });
       yield { data: { type: kind === 'base' ? 'connected' : 'sandbox', sub_type: 'connected' } };
       yield* q.read();
     };
@@ -65,16 +67,17 @@ function setup(t, plan = ({ messages }) => {
       } } });
       if (!turn.calls?.length) emit(turn.incomplete ? 'REPLY_END' : 'TURN_DONE');
       else if (turn.completeWithCalls) setTimeout(() => emit('TURN_DONE'), 10);
+      else if (turn.waitWithCalls) setTimeout(() => emit(turn.waitWithCalls), 10);
     };
     a.client.sse = body => stream.read();
     a.client.closeTurn = async body => { seen.close.push(body); emit('TURN_DONE'); };
   }
   return { pool, seen, ledger, app: createApp({ pool, ledger }) };
 }
-async function request(app, route, body, headers = {}) {
+async function request(app, route, body, headers = {}, onWrite = () => {}) {
   const req = { url: route, method: 'POST', headers, async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ model, ...body })); } };
-  const res = { body: '', status: null, writableFinished: false, writeHead(status) { this.status = status; },
-    write(value) { this.body += value; }, end(value = '') { this.body += value; this.writableFinished = true; } };
+  const res = { body: '', status: null, writableFinished: false, writeHead(status, responseHeaders) { this.status = status; this.headers = responseHeaders; },
+    write(value) { this.body += value; onWrite(value, this); }, end(value = '') { this.body += value; this.writableFinished = true; } };
   await app(req, res);
   return { ...res, json: res.body.startsWith('{') ? JSON.parse(res.body) : null,
     events: res.body.split('\n').filter(s => s.startsWith('data: {')).map(s => JSON.parse(s.slice(6))) };
@@ -102,7 +105,7 @@ for (const stream of [false, true]) test(`Chat native tool loop reads, writes an
   }
   assert.equal(s.seen.send.length, 4); assert.equal(s.seen.close.length, 3);
   assert.equal(new Set(s.seen.send.map(s => s.session_id)).size, 4); assert.equal(s.pool.sessions.size, 0);
-  assert(s.seen.send.every(s => s.text.includes('preserve this instruction') && !s.text.includes('[object Object]') && !s.text.includes('CLIENT_TOOLS_JSON')));
+  assert(s.seen.send.every(s => !s.text.includes('preserve this instruction') && !s.text.includes('[object Object]') && !s.text.includes('CLIENT_TOOLS_JSON')));
   assert(s.seen.send.every(s => s.custom_instructions.includes('preserve this instruction')));
   assert(s.seen.definitions.every(tools => tools[0].inputSchema.required[0] === 'value'));
   assert(s.seen.callbacks.every(c => c.result?.tools)); // Backend never executes caller commands.
@@ -157,7 +160,9 @@ for (const [label, plan, patch] of [
   ['built-in command', { calls: [{ name: 'bash', method: 'shell.exec', arguments: {} }] }, {}],
 ]) test(`${label} emits no tools and never retries another account`, async t => {
   const s = setup(t, () => plan), r = await chat(s, { messages: [user], stream: true, ...patch });
-  assert.equal(r.status, 502, r.body); assert.equal(s.seen.send.length, 1); assert(!r.body.includes('"finish_reason":"tool_calls"'));
+  assert.equal(r.status, plan.text ? 200 : 502, r.body);
+  if (plan.text) assert(r.events.some(e => e.error?.code === 'invalid_tool_response'));
+  assert.equal(s.seen.send.length, 1); assert(!r.body.includes('"finish_reason":"tool_calls"'));
   assert(s.pool.accounts.every(a => !a.cooldown_until)); assert.equal(s.seen.close.length, plan.calls?.length ? 1 : 0);
 });
 
@@ -253,4 +258,168 @@ test('Responses image attachments survive SQLite restart and are not rendered as
   const next=await responses(restarted,{previous_response_id:first.json.id,input:[{type:'function_call_output',call_id:call.call_id,output:'done'}]});
   assert.equal(next.status,200,next.body);assert.equal(uploaded,2);assert.equal(attached,2);
   assert([...s.seen.send,...restarted.seen.send].every(r=>r.attachments.length===1&&!r.text.includes(png)));
+});
+
+function gate() { let resolve; const promise = new Promise(yes => { resolve = yes; }); return { promise, resolve }; }
+async function within(promise) {
+  let timer;
+  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Expected progress before upstream completion')), 1500); })]); }
+  finally { clearTimeout(timer); }
+}
+for (const surface of ['chat', 'responses']) for (const textFirst of [false, true]) test(`${surface} streams text and reasoning before TURN_DONE without replay (textFirst=${textFirst})`, async t => {
+  const release = gate(), first = gate(); let upstreamFinished = false, deliveredBeforeCompletion = false;
+  t.after(() => release.resolve());
+  const s = setup(t, async ({ emit }) => {
+    emit(textFirst ? 'TEXT_BLOCK_DELTA' : 'THINKING_BLOCK_DELTA', { delta: textFirst ? 'FIRST ' : 'THINK ' });
+    await release.promise;
+    emit(textFirst ? 'THINKING_BLOCK_DELTA' : 'TEXT_BLOCK_DELTA', { delta: textFirst ? 'THINK ' : 'FIRST ' });
+    upstreamFinished = true;
+    return { text: 'LAST', reasoning: 'DONE' };
+  });
+  const route = surface === 'chat' ? '/v1/chat/completions' : '/v1/responses';
+  const tools = surface === 'chat' ? definitions : definitions.map(t => ({ type: 'function', ...t.function }));
+  const pending = request(s.app, route, { stream: true, tools, ...(surface === 'chat' ? { messages: [user] } : { input: 'test' }) }, {}, value => {
+    if (value.includes(textFirst ? 'FIRST ' : 'THINK ')) { deliveredBeforeCompletion = !upstreamFinished; first.resolve(); }
+  });
+  try { await within(first.promise); assert(deliveredBeforeCompletion); }
+  finally { release.resolve(); }
+  const r = await pending; assert.equal(r.status, 200); assert.equal(r.headers['x-accel-buffering'], 'no');
+  if (surface === 'chat') {
+    assert.equal(r.events.map(e => e.choices?.[0]?.delta?.content ?? '').join(''), 'FIRST LAST');
+    assert.equal(r.events.map(e => e.choices?.[0]?.delta?.reasoning_content ?? '').join(''), 'THINK DONE');
+  } else {
+    const final = r.events.find(e => e.type === 'response.completed').response;
+    assert.equal(r.events.filter(e => e.type === 'response.output_text.delta').map(e => e.delta).join(''), 'FIRST LAST');
+    assert.equal(r.events.filter(e => e.type === 'response.reasoning_summary_text.delta').map(e => e.delta).join(''), 'THINK DONE');
+    assert.deepEqual(final.output.map(o => o.type), textFirst ? ['message', 'reasoning'] : ['reasoning', 'message']);
+    for (const [index, item] of final.output.entries()) {
+      const added = r.events.filter(e => e.type === 'response.output_item.added' && e.item.id === item.id);
+      const done = r.events.filter(e => e.type === 'response.output_item.done' && e.item.id === item.id);
+      assert.equal(added.length, 1); assert.equal(done.length, 1);
+      assert.equal(added[0].output_index, index); assert.equal(done[0].output_index, index);
+      assert(r.events.filter(e => e.item_id === item.id).every(e => e.output_index === index));
+    }
+    assert.deepEqual(s.ledger.get(final.id).response.output, final.output);
+    assert.deepEqual(r.events.map(e => e.sequence_number), r.events.map((_, i) => i));
+  }
+});
+
+for (const surface of ['chat', 'responses']) test(`${surface} reports an invalid call after streamed text without exposing tools or retrying`, async t => {
+  const release = gate(), first = gate(); t.after(() => release.resolve());
+  const s = setup(t, async ({ emit }) => { emit('TEXT_BLOCK_DELTA', { delta: 'Checking ' }); await release.promise; return { calls: [{ name: 'read_file', arguments: { value: 123 } }] }; });
+  const tools = surface === 'chat' ? definitions : definitions.map(t => ({ type: 'function', ...t.function }));
+  const pending = request(s.app, surface === 'chat' ? '/v1/chat/completions' : '/v1/responses', { tools, stream: true, ...(surface === 'chat' ? { messages: [user] } : { input: 'test' }) }, {}, v => { if (v.includes('Checking ')) first.resolve(); });
+  try { await within(first.promise); } finally { release.resolve(); }
+  const r = await pending;
+  assert.equal(r.status, 200, r.body); assert.equal(s.seen.send.length, 1); assert.equal(s.seen.close.length, 1);
+  assert(!r.events.some(e => e.choices?.[0]?.delta?.tool_calls || e.type === 'response.function_call_arguments.delta' || e.type === 'response.completed'));
+  if (surface === 'chat') assert(r.events.some(e => e.error?.code === 'invalid_tool_response'));
+  else {
+    const failed = r.events.find(e => e.type === 'response.failed').response;
+    assert.equal(failed.output_text, 'Checking '); assert.equal(failed.error.code, 'invalid_tool_response');
+  }
+});
+
+test('native preparation overlaps both ID requests with control connections and cancels siblings on failure', async t => {
+  const s = setup(t, () => ({ text: 'ready' })), allocations = [], started = gate();
+  s.pool.accounts[0].client.allocateIds = () => {
+    assert.equal(s.seen.channels.length, 2);
+    const allocation = gate(); allocations.push(allocation); if (allocations.length === 2) started.resolve();
+    return allocation.promise;
+  };
+  t.after(() => allocations.forEach((g, i) => g.resolve({ chat_id: 'session-' + i, query_id: 'reply-' + i })));
+  const pending = chat(s, { messages: [user] });
+  try { await within(started.promise); assert.equal(s.seen.send.length, 0); }
+  finally { allocations.forEach((g, i) => g.resolve({ chat_id: 'session-' + i, query_id: 'reply-' + i })); }
+  assert.equal((await pending).status, 200); assert.equal(s.seen.send[0].session_id, 'session-0'); assert.equal(s.seen.send[0].reply_id, 'reply-1');
+  const failed = setup(t); failed.pool.accounts[0].client.allocateIds = async () => { throw Object.assign(new Error('allocation failed'), { retryUnsafe: true }); };
+  const r = await chat(failed, { messages: [user] }); assert.equal(r.status, 500); assert.equal(failed.seen.send.length, 0);
+  assert(failed.seen.channels.every(c => c.signal.aborted));
+});
+
+test('account rotation after a streamed fragment blocks later fragments and executable calls', async t => {
+  const release = gate(), first = gate(); t.after(() => release.resolve());
+  const s = setup(t, async ({ emit, account }) => {
+    emit('TEXT_BLOCK_DELTA', { delta: 'safe first' }); await release.promise;
+    account.upstream_user_id = 'rotated'; return { text: 'forbidden later', calls: [{ name: 'read_file', arguments: { value: 'x' } }] };
+  });
+  const pending = request(s.app, '/v1/chat/completions', { messages: [user], tools: definitions, stream: true }, {}, v => { if (v.includes('safe first')) first.resolve(); });
+  try { await within(first.promise); } finally { release.resolve(); }
+  const r = await pending; assert.equal(r.status, 200); assert(!r.body.includes('forbidden later'));
+  assert(r.events.some(e => e.error?.code === 'session_account_mismatch')); assert(!r.body.includes('"tool_calls":[')); assert.equal(s.seen.send.length, 1);
+});
+
+for (const surface of ['chat', 'responses']) test(`${surface} delivers the first text through a real HTTP stream before upstream completion`, async t => {
+  const release = gate(), first = gate(); let finished = false;
+  t.after(() => release.resolve());
+  const s = setup(t, async ({ emit }) => { emit('TEXT_BLOCK_DELTA', { delta: 'HTTP_FIRST' }); await release.promise; finished = true; return { text: '_LAST' }; });
+  const server = createServer(s.app); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+  const tools = surface === 'chat' ? definitions : definitions.map(t => ({ type: 'function', ...t.function }));
+  const body = JSON.stringify({ model, tools, stream: true, ...(surface === 'chat' ? { messages: [user] } : { input: 'test' }) });
+  const completed = new Promise((resolve, reject) => {
+    const req = httpRequest({ hostname: '127.0.0.1', port: server.address().port, method: 'POST', path: surface === 'chat' ? '/v1/chat/completions' : '/v1/responses', headers: { 'content-type': 'application/json' } }, res => {
+      assert.equal(res.headers['x-accel-buffering'], 'no'); let text = '';
+      res.on('data', chunk => { text += chunk; if (text.includes('HTTP_FIRST')) first.resolve(!finished); });
+      res.on('end', () => resolve(text)); res.on('error', reject);
+    }); req.on('error', reject); req.end(body);
+  });
+  try { assert.equal(await within(first.promise), true); } finally { release.resolve(); }
+  assert((await completed).includes('_LAST')); assert.equal(s.seen.send.length, 1);
+});
+
+for (const surface of ['chat', 'responses']) test(`${surface} disconnect after first text closes the native turn without retrying`, async t => {
+  const release = gate(); t.after(() => release.resolve());
+  const s = setup(t, async ({ emit }) => { emit('TEXT_BLOCK_DELTA', { delta: 'first' }); await release.promise; return { incomplete: true }; });
+  const res = Object.assign(new EventEmitter(), { writableFinished: false, writeHead() {}, write(value) {
+    if (value.includes('first')) { this.emit('close'); release.resolve(); }
+  }, end() { this.writableFinished = true; } });
+  const tools = surface === 'chat' ? definitions : definitions.map(t => ({ type: 'function', ...t.function }));
+  const req = { url: surface === 'chat' ? '/v1/chat/completions' : '/v1/responses', method: 'POST', headers: {},
+    async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ model, tools, stream: true, ...(surface === 'chat' ? { messages: [user] } : { input: 'test' }) })); } };
+  await within(s.app(req, res));
+  assert.equal(s.seen.send.length, 1); assert.equal(s.seen.close.length, 1); assert(s.seen.channels.every(c => c.signal.aborted));
+});
+
+for (const type of ['AWAITING_INPUT', 'REQUIRE_EXTERNAL_EXECUTION']) test(`${type} after a validated native client call permits handoff instead of a false desktop-tool error`, async t => {
+  const s = setup(t, () => ({ calls: [{ name: 'read_file', arguments: { value: 'demo.txt' } }], waitWithCalls: type }));
+  const r = await chat(s, { messages: [user], stream: true });
+  assert.equal(r.status, 200, r.body); assert.equal(s.seen.close.length, 1); assert.equal(s.seen.send.length, 1);
+  assert.equal(r.events.flatMap(e => e.choices?.[0]?.delta?.tool_calls ?? []).length, 1);
+  assert(!r.events.some(e => e.error));
+});
+
+test('caller instructions are sent once with role labels while all user and tool history remains intact', async t => {
+  const s = setup(t, () => ({ text: 'done' }));
+  const system = 'SYSTEM_ONLY_' + '规则'.repeat(2000), developer = 'DEVELOPER_ONLY_' + 'detail '.repeat(1000);
+  const messages = [{ role: 'system', content: system }, { role: 'developer', content: developer }, user];
+  const r = await chat(s, { messages }); assert.equal(r.status, 200, r.body);
+  const sent = s.seen.send[0], transcript = JSON.parse(sent.text.split('CONVERSATION_JSON: ')[1].split('\nContinue the next')[0]);
+  assert.deepEqual(transcript, [user].map(m=>({role:m.role,content:m.content.map(p=>p.text).join('')})));
+  assert.equal((sent.text + sent.custom_instructions).split(system).length - 1, 1);
+  assert.equal((sent.text + sent.custom_instructions).split(developer).length - 1, 1);
+  assert(sent.custom_instructions.includes('CALLER_SYSTEM_INSTRUCTIONS:\n'+system));
+  assert(sent.custom_instructions.includes('CALLER_DEVELOPER_INSTRUCTIONS:\n'+developer));
+  const instructions = 'RESPONSES_INSTRUCTIONS_UNIQUE';
+  const response = await responses(s, { input: 'next request', instructions }); assert.equal(response.status, 200);
+  const next = s.seen.send[1]; assert.equal((next.text + next.custom_instructions).split(instructions).length - 1, 1);
+});
+
+test('bounded agent timing metadata is saved to SQLite logs without caller text or tool arguments', async t => {
+  const root = mkdtempSync(path.join(tmpdir(), 'kuku-agent-timing-')), db = openDatabase({ root });
+  t.after(() => { db.close(); rmSync(root, { recursive: true, force: true }); });
+  const s = setup(t, () => ({ text: 'PRIVATE_ANSWER', reasoning: 'PRIVATE_REASONING' }), db.ledger);
+  s.pool.database = db;
+  s.pool.logger = createDatabaseLogger(db, { consoleOutput: { log() {}, warn() {}, error() {} } });
+  const r = await responses(s, { input: 'PRIVATE_PROMPT', instructions: 'PRIVATE_INSTRUCTIONS', store: false }); assert.equal(r.status, 200);
+  const rows = db.sql.prepare("SELECT message FROM logs WHERE message LIKE 'agent timing:%'").all();
+  assert.equal(rows.length, 1); const log = rows[0].message;
+  for (const text of ['PRIVATE_PROMPT','PRIVATE_ANSWER','PRIVATE_REASONING','PRIVATE_INSTRUCTIONS']) assert(!log.includes(text));
+  const timing = JSON.parse(log.slice('agent timing: '.length));
+  assert.equal(timing.model, model); assert.equal(timing.tool_count, definitions.length); assert.equal(timing.status, 'completed');
+  for (const key of ['controls_ready_ms','ids_ready_ms','prepared_ms','send_started_ms','send_ack_ms','tool_list_ms','tools_ready_ms','first_text_ms','first_reasoning_ms','total_ms']) assert(Number.isInteger(timing[key]) && timing[key] >= 0, key);
+  assert.equal(timing.tool_list_count, 1); assert.equal(timing.tool_call_count, 0); assert.equal(timing.model_ends_ms.length, 1);
+  assert(timing.prepared_ms <= timing.send_started_ms); assert(timing.total_ms >= timing.first_text_ms);
+  assert(timing.prompt_bytes > 0 && timing.instruction_bytes > 0);
+  assert(db.sql.prepare('SELECT 1 FROM usage_records WHERE id=?').get(timing.turn_id));
 });

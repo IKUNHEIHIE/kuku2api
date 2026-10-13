@@ -48,6 +48,36 @@ function json(res, status, obj) {
   res.end(body);
 }
 
+// Legal JSON whitespace keeps long batches alive through reverse-proxy idle timeouts.
+// A disconnected browser must not cancel/replay a claim that may already have paid points.
+export async function claimJson(res, work) {
+  let started = false;
+  const timer = setInterval(() => {
+    if (res.destroyed || res.writableEnded) return;
+    if (!started) {
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'x-accel-buffering': 'no', 'cache-control': 'no-store', ...CORS });
+      started = true;
+    }
+    res.write(' ');
+  }, 10_000);
+  timer.unref?.();
+  const stop = () => clearInterval(timer);
+  res.once?.('close', stop);
+  try {
+    const result = await work();
+    if (!res.destroyed && !res.writableEnded) {
+      if (started) res.end(JSON.stringify(result));
+      else json(res, 200, result);
+    }
+  } catch (e) {
+    if (!started) throw e;
+    if (!res.destroyed && !res.writableEnded) res.end(JSON.stringify({ ok: false, error: { message: redact(e.message ?? e), type: 'server_error' } }));
+  } finally {
+    stop();
+    res.off?.('close', stop);
+  }
+}
+
 // A console running on a dev-server origin (Vite etc.) is a different origin than this
 // loopback API, so preflight and credentialed-less CORS headers are required.
 const CORS = {
@@ -163,6 +193,7 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache',
+      'x-accel-buffering': 'no',
       connection: 'keep-alive',
       'x-kuku-account': account.id,
       ...CORS,
@@ -190,8 +221,6 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
       turn = r;
       if (stream && agent && !controller.signal.aborted) {
         openStream(acct);
-        if (r.reasoning) res.write(sseChunk(makeChunk(id, created, model, { reasoning_content: r.reasoning })));
-        if (r.content) res.write(sseChunk(makeChunk(id, created, model, { content: r.content })));
         if (r.tool_calls?.length) res.write(sseChunk(makeChunk(id, created, model, { tool_calls: r.tool_calls.map((call, index) => ({ index, ...call })) })));
         sentAny = true;
       }
@@ -313,7 +342,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
   });
 
   if (stream) {
-    res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive', ...CORS });
+    res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', 'x-accel-buffering': 'no', connection: 'keep-alive', ...CORS });
   }
 
   const tried = [];
@@ -340,7 +369,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
             }
             if (delta.content) {
               if (!sc.messageOpen) {
-                if (sc.reasoningOpen && !sc.reasoningClosed) { sc.reasoningClosed = true; sc.reasoningDone(sc.reasoningText ?? ''); }
+                if (!agent && sc.reasoningOpen && !sc.reasoningClosed) { sc.reasoningClosed = true; sc.reasoningDone(sc.reasoningText ?? ''); }
                 sc.messageOpen = true;
                 sc.messageStarted();
               }
@@ -372,6 +401,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
         previous_response_id: prevId, store: body.store, session_id: observed.session_id, reply_id: observed.reply_id,
         error: { message: redact(lastErr.message), code: f.code ?? 'upstream_error' } });
       failed.kuku.account = acct.id;
+      sc.orderOutput(failed);
       ledger?.put({ id, session_key: sessionKey, session_id: observed.session_id ?? null, model, account: acct.id,
         created_at: created, output_text: sc.text, response: failed,
         ...(agent ? { agent_bridge: true, upstream_user_id: acct.upstream_user_id } : {}) });
@@ -399,6 +429,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
     tool_calls: turn?.tool_calls,
   });
   final.kuku.account = acct.id;
+  sc?.orderOutput(final);
   if (agent) {
     final.tools = body.tools ?? [];
     final.tool_choice = body.tool_choice ?? 'auto';
@@ -637,9 +668,11 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
       if (url.pathname === '/pool/admin/claim' && req.method === 'POST') {
         const only = body.id ?? body.account ?? null;
         // `chat` earns the CHAT task by spending one minimal turn; off unless asked for.
-        const out = await pool.claimFreePoints({ only, runChat: !!body.chat, chatModel: body.model ?? undefined, chatText: body.text ?? undefined });
-        logger.log('manual claim:', JSON.stringify(out.map((a) => ({ id: a.id, ok: a.ok, points_earned: a.points_earned, reported: a.reported, notes: a.notes, code: a.code }))));
-        return json(res, 200, { ok: true, accounts: out, points_earned: out.reduce((n, a) => n + (a.points_earned ?? 0), 0) });
+        return claimJson(res, async () => {
+          const out = await pool.claimFreePoints({ only, runChat: !!body.chat, chatModel: body.model ?? undefined, chatText: body.text ?? undefined });
+          logger.log('manual claim:', JSON.stringify(out.map((a) => ({ id: a.id, ok: a.ok, points_earned: a.points_earned, reported: a.reported, notes: a.notes, code: a.code }))));
+          return { ok: true, accounts: out, points_earned: out.reduce((n, a) => n + (a.points_earned ?? 0), 0) };
+        });
       }
 
       if (url.pathname === '/pool/admin/auto-claim' && req.method === 'GET') {
@@ -654,7 +687,7 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
 
       if (url.pathname === '/pool/admin/auto-claim/run' && req.method === 'POST') {
         if (!autoClaim) return openError(res, 501, 'the scheduler is not configured in this process');
-        return json(res, 200, { ok: true, result: await autoClaim.run() });
+        return claimJson(res, async () => ({ ok: true, result: await autoClaim.run() }));
       }
 
       return openError(res, 404, 'not found');

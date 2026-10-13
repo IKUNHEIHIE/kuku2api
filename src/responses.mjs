@@ -103,6 +103,7 @@ export class ResponseStream {
     this.response = response;
     this.item_id = response.output[response.output.length - 1]?.id ?? `msg_${Date.now()}`;
     this.output_index = Math.max(0, response.output.length - 1);
+    this.next_output_index = 0;
     this.text = '';
   }
 
@@ -120,32 +121,32 @@ export class ResponseStream {
 
   reasoningStarted() {
     this.reasoning_item_id = `rs_${this.response.id.slice(5, 25)}`;
-    this.reasoning_index = 0;
-    this.output_index = 1;
+    this.reasoning_index = this.next_output_index++;
     this.item_id = `msg_${this.response.id.slice(5, 25)}`;
-    this.emit('response.output_item.added', { output_index: 0, item: { id: this.reasoning_item_id, type: 'reasoning', summary: [] } });
-    this.emit('response.reasoning_summary_part.added', { item_id: this.reasoning_item_id, output_index: 0, summary_index: 0, part: { type: 'summary_text', text: '' } });
+    this.emit('response.output_item.added', { output_index: this.reasoning_index, item: { id: this.reasoning_item_id, type: 'reasoning', summary: [] } });
+    this.emit('response.reasoning_summary_part.added', { item_id: this.reasoning_item_id, output_index: this.reasoning_index, summary_index: 0, part: { type: 'summary_text', text: '' } });
   }
 
   reasoningDelta(delta) {
-    this.emit('response.reasoning_summary_text.delta', { item_id: this.reasoning_item_id, output_index: 0, summary_index: 0, delta });
+    this.emit('response.reasoning_summary_text.delta', { item_id: this.reasoning_item_id, output_index: this.reasoning_index, summary_index: 0, delta });
   }
 
   reasoningDone(full) {
-    this.emit('response.reasoning_summary_text.done', { item_id: this.reasoning_item_id, output_index: 0, summary_index: 0, text: full });
+    this.emit('response.reasoning_summary_text.done', { item_id: this.reasoning_item_id, output_index: this.reasoning_index, summary_index: 0, text: full });
     this.emit('response.reasoning_summary_part.done', {
       item_id: this.reasoning_item_id,
-      output_index: 0,
+      output_index: this.reasoning_index,
       summary_index: 0,
       part: { type: 'summary_text', text: full },
     });
     this.emit('response.output_item.done', {
-      output_index: 0,
+      output_index: this.reasoning_index,
       item: { id: this.reasoning_item_id, type: 'reasoning', summary: [{ type: 'summary_text', text: full }] },
     });
   }
 
   messageStarted() {
+    this.output_index = this.next_output_index++;
     this.emit('response.output_item.added', {
       output_index: this.output_index,
       item: { id: this.item_id, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
@@ -180,10 +181,13 @@ export class ResponseStream {
   }
 
   completedAgent(finalResponse) {
-    // Native structured calls are buffered and validated before exposing them.
+    // Preserve indices already delivered, including text arriving before reasoning.
+    // The server also orders before persistence so GET and completed agree.
+    this.orderOutput(finalResponse);
     for (const [output_index, item] of finalResponse.output.entries()) {
       const common = { response_id: finalResponse.id, output_index, item_id: item.id };
-      this.emit('response.output_item.added', { response_id: finalResponse.id, output_index,
+      const streamed = item.type === 'message' ? this.messageOpen : item.type === 'reasoning' ? this.reasoningOpen : false;
+      if (!streamed) this.emit('response.output_item.added', { response_id: finalResponse.id, output_index,
         item: { ...item, status: 'in_progress', ...(item.type === 'message' ? { content: [] }
           : item.type === 'function_call' ? { arguments: '' } : item.type === 'custom_tool_call' ? { input: '' } : { summary: [] }) } });
       if (item.type === 'function_call' || item.type === 'custom_tool_call') {
@@ -193,14 +197,16 @@ export class ResponseStream {
         this.emit(`${prefix}.done`, { ...common, ...(custom ? { input: value } : { arguments: value, name: item.name }) });
       } else if (item.type === 'message') {
         const part = item.content[0];
-        this.emit('response.content_part.added', { ...common, content_index: 0, part: { ...part, text: '' } });
-        this.emit('response.output_text.delta', { ...common, content_index: 0, delta: part.text });
+        if (!streamed) this.emit('response.content_part.added', { ...common, content_index: 0, part: { ...part, text: '' } });
+        const remaining = streamed ? part.text.slice(this.text.length) : part.text;
+        if (remaining || !streamed) this.emit('response.output_text.delta', { ...common, content_index: 0, delta: remaining });
         this.emit('response.output_text.done', { ...common, content_index: 0, text: part.text });
         this.emit('response.content_part.done', { ...common, content_index: 0, part });
       } else if (item.type === 'reasoning') {
         const part = item.summary[0];
-        this.emit('response.reasoning_summary_part.added', { ...common, summary_index: 0, part: { ...part, text: '' } });
-        this.emit('response.reasoning_summary_text.delta', { ...common, summary_index: 0, delta: part.text });
+        if (!streamed) this.emit('response.reasoning_summary_part.added', { ...common, summary_index: 0, part: { ...part, text: '' } });
+        const remaining = streamed ? part.text.slice((this.reasoningText ?? '').length) : part.text;
+        if (remaining || !streamed) this.emit('response.reasoning_summary_text.delta', { ...common, summary_index: 0, delta: remaining });
         this.emit('response.reasoning_summary_text.done', { ...common, summary_index: 0, text: part.text });
         this.emit('response.reasoning_summary_part.done', { ...common, summary_index: 0, part });
       }
@@ -208,6 +214,14 @@ export class ResponseStream {
     }
     this.emit('response.completed', { response: finalResponse });
     this.res.end();
+  }
+
+  orderOutput(response) {
+    const started = new Map();
+    if (this.messageOpen) started.set(this.item_id, this.output_index);
+    if (this.reasoningOpen) started.set(this.reasoning_item_id, this.reasoning_index);
+    response.output.sort((a, b) => (started.get(a.id) ?? Infinity) - (started.get(b.id) ?? Infinity));
+    return response;
   }
 
   failed(message, response = null) {

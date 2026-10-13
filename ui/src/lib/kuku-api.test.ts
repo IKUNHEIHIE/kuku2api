@@ -1145,6 +1145,16 @@ describe('kuku-api client', () => {
       expect(runRes.result.accounts[0].points_earned).toBe(50)
     })
 
+    it('parses claim heartbeats and rejects errors returned after HTTP headers were sent', async () => {
+      vi.spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(new Response('   ' + JSON.stringify({ ok: true, accounts: [], points_earned: 0 })))
+        .mockResolvedValueOnce(new Response('   ' + JSON.stringify({ ok: false, error: { message: '领取执行失败', type: 'server_error' } })))
+        .mockResolvedValueOnce(new Response('   ' + JSON.stringify({ ok: false, error: { message: '自动领取失败', type: 'server_error' } })))
+      expect((await kukuApi.claimFreePoints()).ok).toBe(true)
+      await expect(kukuApi.claimFreePoints()).rejects.toThrow('领取执行失败')
+      await expect(kukuApi.runAutoClaim()).rejects.toThrow('自动领取失败')
+    })
+
     it('handles balance_dead and auto_claim in pool state', async () => {
       vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
         new Response(

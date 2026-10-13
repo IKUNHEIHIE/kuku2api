@@ -7,6 +7,7 @@ import { Pool, MODEL_INDEX } from '../src/gateway.mjs';
 import { KukuAccount } from '../src/upstream.mjs';
 import { createApp } from '../src/server.mjs';
 import { openDatabase } from '../src/database.mjs';
+import { claimClock } from './claim-clock.mjs';
 
 async function fixture(t, { terminal = 'TURN_DONE', newline = '\n', incomplete = false, stall = false, stallJson = null, wrongReply = false, requiresClient = null, streamTimeoutMs = stall ? 200 : 1500 } = {}) {
   const previous = process.env.KUKU_BASE_URL;
@@ -49,7 +50,7 @@ async function fixture(t, { terminal = 'TURN_DONE', newline = '\n', incomplete =
   await once(upstream, 'listening');
   process.env.KUKU_BASE_URL = `http://127.0.0.1:${upstream.address().port}`;
   const database = openDatabase({ file: ':memory:' });
-  const pool = new Pool([{ id: 'fake', bduss: 'synthetic', stoken: 'synthetic' }], { database, logger: { warn() {}, log() {} } });
+  const pool = new Pool([{ id: 'fake', bduss: 'synthetic', stoken: 'synthetic' }], { database, logger: { warn() {}, log() {} }, ...claimClock() });
   // Shared CI runners can pause longer than 150 ms even for loopback requests.
   // Keep short budgets only where the test deliberately waits for a deadline.
   pool.accounts[0].client = new KukuAccount({ bduss: 'synthetic', stoken: 'synthetic' }, { requestTimeoutMs: stallJson ? 150 : 1500, streamTimeoutMs });

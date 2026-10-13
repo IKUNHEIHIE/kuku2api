@@ -10,6 +10,7 @@ import { createApp } from '../src/server.mjs';
 import { createFileStore, createKeyRing, toRecords } from '../src/store.mjs';
 import { createAutoClaim } from '../src/scheduler.mjs';
 import { resolveAdminToken } from '../src/admin-token.mjs';
+import { claimClock } from './claim-clock.mjs';
 
 function temporaryFile(t, name) {
   const root = path.dirname(fileURLToPath(import.meta.url));
@@ -137,7 +138,7 @@ test('administrators can read console GET routes independently of ordinary keys 
 });
 
 function rewardPool({ chatReady = false, failedReward = null, refusedReward = null } = {}) {
-  const pool = new Pool([{ id: 'fake', bduss: 'FAKE-BDUSS', stoken: 'FAKE-STOKEN', priority: 0 }]);
+  const pool = new Pool([{ id: 'fake', bduss: 'FAKE-BDUSS', stoken: 'FAKE-STOKEN', priority: 0 }], claimClock());
   const paid = new Set();
   const ready = new Set(chatReady ? ['LOGIN', 'CHAT'] : ['LOGIN']);
   const calls = { turns: 0, rewards: [], reports: [] };

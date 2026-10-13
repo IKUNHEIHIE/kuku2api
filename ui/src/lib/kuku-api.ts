@@ -796,7 +796,7 @@ async function apiRequest<T>(
     data = { raw: text }
   }
 
-  if (!res.ok) {
+  if (!res.ok || (data?.ok === false && data.error && typeof data.error === 'object')) {
     const errData = (data && typeof data === 'object' && 'error' in data && data.error && typeof data.error === 'object')
       ? (data.error as Record<string, unknown>)
       : null

@@ -1,6 +1,6 @@
 # API 文档
 
-版本：1.1.0（原生 MCP 工具与图片输入适配） · 更新：2026-10-13
+版本：基于 1.1.0 的主分支更新（实时流式优化与领取限速；云端已更新，尚未发布新安装包） · 更新：2026-10-13
 
 本文描述当前接口。旧版差异与验收过程见 [历史归档](archive/api-history.md)，安装参数和环境变量见 [安装与升级](installation.md)、[运行维护](operations.md)。
 
@@ -221,8 +221,13 @@ Responses 的同一往返使用 `output` 中的 `function_call.call_id`，下一
 
 - 最多 128 个工具，工具定义与序列化后的完整会话分别不超过 2 MiB。名称唯一，匹配 `[A-Za-z0-9_.:-]{1,128}`；函数参数根节点描述 JSON 对象。
 - 参数在交给客户端前按 JSON Schema 校验：支持 type/properties/required/additionalProperties、数组、enum/const、anyOf/oneOf/allOf/not、本地 `$ref`、常见数值/长度约束。远程引用不支持。`strict:true` 遇到未支持的关键字（如 format）提前拒绝；这是本地验证，并非原生约束解码承诺。
-- `required` / 指定工具 / `none` / `parallel_tool_calls:false` 会校验实际结果；模型违反选择、调用未知工具或参数不合规时返回 502 `invalid_tool_response`，不把半成品调用发给客户端，也不自动再次付费生成。
-- 工具模式先等待原生结构化调用或完整最终回答并校验，然后输出 SSE。Chat 使用 `delta.tool_calls[index]`；Responses 使用 `response.output_item.added`、`response.function_call_arguments.delta/done` 或 `response.custom_tool_call_input.delta/done`，最后 `response.completed`。参数 delta 可以是一次完整字符串，不保证逐 token 到达；应提高客户端首字节超时。
+- `required` / 指定工具 / `none` / `parallel_tool_calls:false` 会校验实际结果；模型违反选择、调用未知工具或参数不合规时返回 `invalid_tool_response`，不把半成品调用发给客户端，也不自动再次付费生成。尚未输出流时返回 HTTP 502；正文或思考已经输出时，Chat 发送 SSE error 后结束，Responses 发送 error / response.failed，客户端应将其视为失败而非成功回答。
+- `stream:true` 的工具模式实时转发上游正文和思考增量，不再等待完整最终回答。正文、思考仅发送一次；Responses 的 item ID、output_index 及最终 output 按实际输出顺序保持一致。`stream:false` 仍返回完整结果。
+- 工具调用独立缓冲，参数校验和原生轮交接完成后才交付。Chat 使用 `delta.tool_calls[index]`；Responses 使用 `response.output_item.added`、`response.function_call_arguments.delta/done` 或 `response.custom_tool_call_input.delta/done`，最后 `response.completed`。参数 delta 可以是一次完整字符串，不保证逐 token 到达；工具发现、上游思考和生成仍可能有等待，应保留合理的客户端超时。
+- 两个控制连接、独立 ID 分配及图片准备可并行进行，全部就绪后才发送生成请求。SSE 带 `X-Accel-Buffering: no`，请求 Nginx 及时转发；代理配置若显式忽略该头，仍须配置 `proxy_buffering off`。参见 [OpenAI 流式事件约定](https://developers.openai.com/api/reference/resources/responses/streaming-events) 与 [Nginx 缓冲说明](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_buffering)。
+- 工具模式的 system/developer 及 Responses instructions 通过带角色标签的 `custom_instructions` 完整发送一次，不再同时复制到普通会话 JSON 中。用户消息、assistant 调用与 tool 结果仍完整保留，客户端请求格式不变。
+- 已收到本轮有效原生 MCP 调用时，随后到达的 AWAITING_INPUT / REQUIRE_EXTERNAL_EXECUTION 视为等待工具结果，继续按已校验调用交接。没有本轮有效调用的桌面等待仍明确失败，不会执行上游桌面命令。
+- 每轮工具请求在 SQLite 系统日志增加一条 `agent timing: {...}`，可用现有管理员接口 `GET /pool/admin/logs?kind=system&level=info` 查询。记录 `turn_id`、模型、状态、实际思考档、工具/工具发现次数、输入字节数及相对本轮启动的毫秒时间：`ids_ready_ms`、`controls_ready_ms`、`images_ready_ms`、`prepared_ms`、`send_started_ms`、`send_ack_ms`、`tool_list_ms`、`tools_ready_ms`、`first_event_ms`、`first_reasoning_ms`、`first_text_ms`、`tool_call_ms`、`close_started_ms`、`close_done_ms`、`total_ms`。未发生的阶段不出现；`model_ends_ms` 最多记录 16 个模型结束时间。计时不包含进入原生适配前的排队/目录刷新或客户端执行工具的时间，不等于客户端实际首字延迟。日志不包含提示词、工具参数、结果正文或凭据；保留策略沿用系统日志设置。
 - 原生工具轮可能包含多次内部推理。usage 合计当前已观察到的 MODEL_CALL_END，用量包含上游平台提示与工具发现开销，**不是客户端历史的上下文长度**。数据库标记 `usage_scope:"all_model_calls"`。交接时尚未报告的用量/积分保持未知，不编造费用。客户端不应单凭该合计值判断是否必须压缩上下文。
 - 已开始上游生成后的失败不自动换号或重复发送。客户端同样应避免对不确定是否已执行的工具无限重试；执行状态由客户端记录。
 
@@ -363,7 +368,11 @@ Responses 在用户消息 `content` 中使用：
 
 默认只领取可领取任务。显式 `chat:true` 且对话任务尚未完成、不可领取时，先执行一轮独立的纯文本短答，再上报 CHAT、刷新任务并领取；已完成或已可领取时不重复发对话。对话可能消耗积分，返回的 `chat_turn.consume_points` 是实际费用。
 
-`reported` 表示确认成功的进度上报，`notes` 表示延迟、失败或不确定说明。任务上报成功和 reward_point 非零均不能独立证明到账，以 rewardClaim 成功和余额为准。失败不自动重复付费对话；同账号领取串行。
+`reported` 表示确认成功的进度上报，`notes` 表示延迟、失败或不确定说明。任务上报成功和 reward_point 非零均不能独立证明到账，以 rewardClaim 成功和余额为准。失败不自动重复付费对话。
+
+所有账号的领取共用当前后端进程的同一个队列，覆盖上述两个 POST 领取接口、单账号领取和定时自动领取。第一个账号可立即开始；每个账号处理完毕（包括失败）后至少等待 15 秒，再开始下一个账号，不会同时执行两个账号的领取。排队期间已删除或身份已变更的账号跳过并返回 `ok:false` 与 `message`。普通对话和只读任务查询不受该队列影响。
+
+批量任务可能耗时数分钟。两个 POST 领取接口等待期间每 10 秒发送 JSON 空白字符保活，响应头包含 `X-Accel-Buffering: no`；最终仍是原有 JSON 对象，可用 `response.json()` 解析。不要按首个响应字节判断完成，也不要因等待而重复提交。鉴权及参数错误仍在开始领取前返回；若保活已发出后出现请求级异常，HTTP 状态已是 200，最终对象为 `{ok:false,error:{message,type:"server_error"}}`，客户端也须检查该错误对象。客户端断开后已提交的任务继续处理，避免取消后重新领取。
 
 每日领取默认关闭，配置与结果保存 SQLite。开启后每天到指定小时运行；当日已过点且尚未运行会补跑，当天自动触发不重复。状态包括 `enabled`、`hour`、`last_run_at`、`last_result`、`next_run_at`、`running`。普通模型请求不会自动领取积分。
 

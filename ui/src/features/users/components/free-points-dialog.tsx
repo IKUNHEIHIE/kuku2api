@@ -383,7 +383,7 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
                   variant='outline'
                   size='sm'
                   onClick={() => void handleRunAutoClaimNow()}
-                  disabled={runningAutoClaim || loading}
+                  disabled={runningAutoClaim || claiming !== null || loading}
                   className='h-8 text-xs gap-1.5'
                   title='立即执行一次每日领取任务'
                 >
@@ -574,7 +574,7 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
               <Button
                 size='sm'
                 onClick={() => void handleClaim()}
-                disabled={claiming !== null || loading || !canClaimAny}
+                disabled={claiming !== null || runningAutoClaim || loading || !canClaimAny}
                 className='gap-1.5 font-semibold text-xs shrink-0'
               >
                 {claiming === 'all' ? (
@@ -583,7 +583,7 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
                   <Sparkles size={14} />
                 )}
                 <span>
-                  {runChat
+                  {claiming === 'all' ? '正在依次领取，请等待…' : runChat
                     ? expectedTotalPoints > 0
                       ? `一键对话并领取全部账号 (+${expectedTotalPoints} pts 预期)`
                       : `一键领取所有账号积分 (${directClaimablePoints} pts 可领)`
@@ -594,7 +594,7 @@ export function FreePointsDialog({ open, onOpenChange, defaultAccountId }: FreeP
               </Button>
             </div>
             <div className='text-[11px] text-muted-foreground bg-muted/30 px-2.5 py-1.5 rounded border border-border/40'>
-              💡 <strong>提示：</strong>若只想对某个<strong>单个账号</strong>执行对话任务或领取积分，请直接使用下方各账号卡片或任务列表中对应的专属操作按钮，不会影响其他账号。
+              💡 <strong>提示：</strong>所有领取共用后端队列：一个账号处理完后等待 15 秒，再处理下一个。批量领取期间请等待完成，不要重复提交。下方按钮可指定单个账号领取。
             </div>
           </div>
 
