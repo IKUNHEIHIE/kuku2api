@@ -4,6 +4,7 @@ import { UpstreamError } from './upstream.mjs';
 import { validateAgentTurn } from './agent.mjs';
 import { callerInstructions } from './messages.mjs';
 import { prepareImages } from './images.mjs';
+import { stableToolDefinitions } from './tool-definitions.mjs';
 
 function deferred() {
   let resolve, reject;
@@ -11,14 +12,14 @@ function deferred() {
   return { promise, resolve, reject };
 }
 function failure(message, code = 'upstream_requires_client') {
-  return new UpstreamError(message, { status: code === 'upstream_timeout' ? 504 : code === 'session_account_mismatch' ? 409 : 502, code, retryUnsafe: true });
+  return new UpstreamError(message, { status: code === 'upstream_timeout' ? 504 : code === 'session_account_mismatch' ? 409 : 502, code });
 }
 
 // Each OpenAI round gets an isolated native session. At a client tool handoff we close
 // that native turn instead of holding a desktop callback open while a caller runs a
 // potentially long command. The next round carries the actual results and full history.
 // No caller tools, files or commands are executed by this process.
-export async function nativeAgentTurn({ client, model, agent, think_mode, observation, signal, onDelta = () => {}, ownsAccount = () => true }) {
+export async function nativeAgentTurn({ client, model, agent, think_mode, observation, signal, onDelta = () => {}, ownsAccount = () => true, beforeSend = () => {} }) {
   const started = performance.now();
   const timing = observation.agent_timing = { think_mode, tool_count: agent.tools.length, tool_list_count: 0, tool_call_count: 0, model_ends_ms: [] };
   const mark = key => { if (timing[key] == null) timing[key] = Math.round(performance.now() - started); };
@@ -32,18 +33,21 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
   // All promises participate in races below; suppress a late rejection during cleanup.
   for (const d of [handoff, broken, sandboxReady, baseReady]) d.promise.catch(() => {});
   const available = agent.choice === 'none' ? [] : agent.tools.filter(tool => typeof agent.choice !== 'object' || tool.name === agent.choice.name);
-  const tools = available.map(tool => ({ name: tool.name, description: tool.description,
-    inputSchema: tool.type === 'function' ? tool.parameters : { type: 'object', properties: { input: { type: 'string' } }, required: ['input'], additionalProperties: false } }));
-  // Stable only for identical definitions: preserve upstream prompt/tool caches without
-  // allowing another request's different schema to be loaded under the same connector.
-  const connector = `external_agent_${createHash('sha256').update(JSON.stringify(tools)).digest('hex').slice(0,24)}`;
+  const tools = stableToolDefinitions(available.map(tool => ({ name: tool.name, description: tool.description,
+    inputSchema: tool.type === 'function' ? tool.parameters : { type: 'object', properties: { input: { type: 'string' } }, required: ['input'], additionalProperties: false } })));
+  // Hash and tools/list use the same normalized definitions, including the original array order.
+  const toolJson = JSON.stringify(tools);
+  const fingerprint = createHash('sha256').update(toolJson).digest('hex').slice(0,24);
+  timing.tool_fingerprint = fingerprint;
+  timing.tool_definition_bytes = Buffer.byteLength(toolJson);
+  const connector = `external_agent_${fingerprint}`;
   const listen = async (kind, payload, ready) => {
     try {
       for await (const frame of client.controlStream(kind, payload, combined)) {
         const envelope = frame.data;
         if (!envelope) continue;
         if (envelope.type === 'connected' || envelope.sub_type === 'connected') { ready.resolve(); continue; }
-        if (envelope.type === 'error' || envelope.errno || (envelope.code != null && Number(envelope.code) !== 0)) throw failure('Native agent control channel refused the connection');
+        if (envelope.type === 'error' || envelope.errno || (envelope.code != null && Number(envelope.code) !== 0)) throw new UpstreamError('Native agent control channel refused the connection', { code: Number(envelope.code ?? envelope.errno), status: 502 });
         if (kind !== 'sandbox' || envelope.type !== 'sandbox' || envelope.sub_type !== 'task') continue;
         let request = envelope.data;
         if (typeof request === 'string') { try { request = JSON.parse(request); } catch { throw failure('Invalid native task payload', 'invalid_tool_response'); } }
@@ -132,6 +136,7 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
     await Promise.all([preparation, ready]);
     mark('prepared_ms');
     if (!ownsAccount()) throw failure('Account identity changed before sending the turn', 'session_account_mismatch');
+    beforeSend();
     sent = true; // A lost send acknowledgement must also close, never silently retry.
     mark('send_started_ms');
     await client.sendmsg(args);
@@ -174,9 +179,13 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
       // unsupported desktop action merely because it races the batching timer.
       if (delta?.requires_client && !calls.length) throw failure('Native model requested desktop input instead of a client tool');
       if (delta?.error) throw failure('Native conversation returned an error');
-      if (delta?.commercial) throw new UpstreamError('Native conversation balance or commercial restriction', {
-        status: 402, code: delta.commercial.errno, insufficient_balance: delta.commercial.reason === 'insufficient_balance' || Number(delta.commercial.errno) === 11002, retryUnsafe: true,
-      });
+      if (delta?.commercial) {
+        const drained = delta.commercial.reason === 'insufficient_balance' || Number(delta.commercial.errno) === 11002;
+        const refused = drained && !content && !reasoning && !calls.length && !observation.usage_events.length && !(observation.consume_points > 0);
+        throw new UpstreamError('Native conversation balance or commercial restriction', {
+          status: 402, code: delta.commercial.errno, insufficient_balance: drained, definitiveRefusal: refused,
+        });
+      }
       // Text is safe to stream independently. Structured executable calls remain
       // buffered until validation and native handoff have both completed.
       if (!combined.aborted && (delta?.content || delta?.reasoning_content)) {
@@ -188,7 +197,7 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
       next = iterator.next();
     }
   } catch (error) {
-    if (sent) error.retryUnsafe = true;
+    if (sent && !error.definitiveRefusal) error.retryUnsafe = true;
     throw error;
   } finally {
     clearTimeout(batchTimer);

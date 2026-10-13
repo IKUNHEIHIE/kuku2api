@@ -321,7 +321,7 @@ export function AddAccountSms({ onSuccess, onSwitchToQr }: AddAccountSmsProps) {
         cleanupCaptchaBlob()
         sessionDeadlineRef.current = 0
         retryDeadlineRef.current = 0
-        toast.success('百度账号已成功入池')
+        toast.success(res.refreshed_existing ? '账号登录凭据已更新，可用于自动续期' : '百度账号已成功入池')
         void refreshAccounts()
         onSuccess?.()
       } else if (res.state === 'captcha_required') {

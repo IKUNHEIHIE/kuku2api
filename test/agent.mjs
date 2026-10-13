@@ -10,7 +10,7 @@ import { Pool, MODEL_INDEX } from '../src/gateway.mjs';
 import { createApp } from '../src/server.mjs';
 import { createLedger } from '../src/ledger.mjs';
 import { openDatabase, createDatabaseLogger } from '../src/database.mjs';
-import { KukuAccount } from '../src/upstream.mjs';
+import { KukuAccount, UpstreamError } from '../src/upstream.mjs';
 import { prepareAgent, validateAgentTurn } from '../src/agent.mjs';
 import { checkToolSchema, matchesToolSchema } from '../src/tool-schema.mjs';
 
@@ -84,6 +84,169 @@ async function request(app, route, body, headers = {}, onWrite = () => {}) {
 }
 const chat = (s, body) => request(s.app, '/v1/chat/completions', { tools: definitions, ...body });
 const responses = (s, body) => request(s.app, '/v1/responses', { tools: definitions.map(t => ({ type: 'function', ...t.function })), ...body });
+
+for (const surface of ['chat', 'responses']) for (const stream of [false, true]) for (const reason of ['auth', 'network', 'send-refused']) {
+  test(`${surface} fails over before generation after ${reason} (stream=${stream})`, async t => {
+    const s = setup(t, ({ account }) => ({ text: account.id }));
+    const first = s.pool.accounts[0];
+    const error = reason === 'network' ? new UpstreamError('connection failed', { network: true, status: 502 })
+      : new UpstreamError('not login', { code: 200001, status: 502, definitiveRefusal: reason === 'send-refused' });
+    first.client[reason === 'send-refused' ? 'sendmsg' : 'allocateIds'] = async () => { throw error; };
+    const r = surface === 'chat' ? await chat(s, { messages: [user], stream }) : await responses(s, { input: 'synthetic', stream });
+    assert.equal(r.status, 200, r.body);
+    const text = surface === 'chat' ? stream ? r.events.map(e => e.choices?.[0]?.delta?.content ?? '').join('') : r.json.choices[0].message.content
+      : stream ? r.events.find(e => e.type === 'response.completed')?.response.output_text : r.json.output_text;
+    assert.equal(text, 'two');
+    if (reason === 'network') assert(first.cooldown_until > Date.now());
+    else assert.equal(first.auth_dead, true);
+    assert.equal(s.seen.send.length, 1);
+  });
+}
+
+for (const native of [false, true]) for (const surface of ['chat', 'responses']) for (const stream of [false, true]) {
+  test(`${surface} does not resend an accepted turn on stream failure, but the next request skips that account (native=${native}, stream=${stream})`, async t => {
+    const s = setup(t, ({ account }) => ({ text: account.id }));
+    const first = s.pool.accounts[0];
+    const sent = first.client.sendmsg;
+    let sends = 0;
+    first.client.sendmsg = async body => { sends++; if (native) await sent(body); };
+    first.client.sse = async function* () { throw new UpstreamError('stream unavailable', { status: 503, network: true }); };
+    if (!native) {
+      s.pool.accounts[1].client.sendmsg = async () => {};
+      s.pool.accounts[1].client.sse = async function* () {
+        yield { data: { type: 'TEXT_BLOCK_DELTA', data: { delta: 'two' } } }; yield { data: { type: 'TURN_DONE' } };
+      };
+    }
+    const body = surface === 'chat' ? { messages: [user], stream, ...(native ? {} : { tools: undefined }) }
+      : { input: 'synthetic', stream, ...(native ? {} : { tools: undefined }) };
+    const call = surface === 'chat' ? chat : responses;
+    const failed = await call(s, body);
+    if (surface === 'responses' && stream) assert(failed.events.some(e => e.type === 'response.failed'));
+    else assert.equal(failed.status, 503, failed.body);
+    assert.equal(sends, 1); assert(first.cooldown_until > Date.now());
+    const next = await call(s, body);
+    assert.equal(next.status, 200, next.body); assert.equal(sends, 1);
+    assert.match(next.body, /two/);
+  });
+}
+
+test('explicitly selected accounts never silently fail over', async t => {
+  const s = setup(t);
+  s.pool.accounts[0].client.allocateIds = async () => { throw new UpstreamError('not login', { code: 200001, status: 502 }); };
+  const r = await request(s.app, '/v1/chat/completions', { tools: definitions, messages: [user] }, { 'x-kuku-account': 'one' });
+  assert.equal(r.status, 502); assert.equal(s.seen.send.length, 0); assert.equal(s.pool.accounts[0].auth_dead, true);
+});
+
+test('an in-flight failure still updates the live account after another account is saved', async t => {
+  const s = setup(t);
+  s.pool.accounts[0].client.sse = async function* () {
+    s.pool.set(s.pool.accounts.map(a => ({ id: a.id, upstream_user_id: a.upstream_user_id, bduss: a.client.bduss, stoken: a.client.stoken })));
+    throw new UpstreamError('expired', { code: 200001, status: 502 });
+  };
+  const r = await chat(s, { messages: [user] });
+  assert.equal(r.status, 502); assert.equal(s.pool.accounts[0].auth_dead, true);
+  assert.equal(s.pool.pick().id, 'two');
+});
+
+test('failure after waiting for renewal condemns the actual new credential and fails over', async t => {
+  const s = setup(t, ({ account }) => ({ text: account.id }));
+  let release;
+  s.pool.credentialRefreshes.set('one', new Promise(resolve => { release = resolve; }));
+  const pending = chat(s, { messages: [user] });
+  await new Promise(resolve => setImmediate(resolve));
+  const current = { ...s.pool.accounts[0], client: Object.assign(new KukuAccount({ bduss: 'new-cookie', stoken: 'new-token' }), {
+    allocateIds: async () => { throw new UpstreamError('new token refused', { code: 200001, status: 502 }); },
+    controlStream: s.pool.accounts[0].client.controlStream,
+  }) };
+  s.pool.accounts[0] = current;
+  release();
+  const response = await pending;
+  assert.equal(response.status, 200, response.body); assert.equal(response.json.choices[0].message.content, 'two');
+  assert.equal(current.auth_dead, true); assert.equal(s.pool.pick().id, 'two');
+});
+
+for(const explicit of [false,true]) test(`waiting requests recheck disabled accounts after renewal (explicit=${explicit})`,async t=>{
+  const s=setup(t,({account})=>({text:account.id}));
+  let release;
+  s.pool.credentialRefreshes.set('one',new Promise(resolve=>{release=resolve;}));
+  const pending=request(s.app,'/v1/chat/completions',{tools:definitions,messages:[user]},explicit?{'x-kuku-account':'one'}:{});
+  await new Promise(resolve=>setImmediate(resolve));
+  s.pool.accounts[0].disabled=true;release();
+  const result=await pending;
+  assert.equal(result.status,explicit?409:200,result.body);
+  assert.equal(s.seen.send.length,explicit?0:1);
+  if(!explicit)assert.equal(result.json.choices[0].message.content,'two');
+});
+
+for(const native of [false,true])test(`account disabled during preparation is not sent a conversation (native=${native})`,async t=>{
+  const s=setup(t,({account})=>({text:account.id}));
+  const first=s.pool.accounts[0],allocate=first.client.allocateIds;
+  let release,started;
+  const gate=new Promise(resolve=>{release=resolve;}),ready=new Promise(resolve=>{started=resolve;});
+  first.client.allocateIds=async(...args)=>{started();await gate;return allocate(...args);};
+  if(!native){s.pool.accounts[1].client.sendmsg=async()=>{};s.pool.accounts[1].client.sse=async function*(){yield {data:{type:'TEXT_BLOCK_DELTA',data:{delta:'two'}}};yield{data:{type:'TURN_DONE'}};};}
+  const pending=chat(s,{messages:[user],...(native?{}:{tools:undefined})});
+  await ready;first.disabled=true;release();
+  const result=await pending;assert.equal(result.status,200,result.body);assert.equal(result.json.choices[0].message.content,'two');
+  assert.equal(s.seen.send.length,native?1:0);
+});
+
+test('native balance refusal before any generated work safely fails over', async t => {
+  const s = setup(t, ({ account }) => ({ text: account.id }));
+  s.pool.accounts[0].client.nativeToolResult = async () => {};
+  s.pool.accounts[0].client.sse = async function* () {
+    yield { data: { type: 'COMMERCIAL', data: { reason: 'insufficient_balance', errno: 11002 } } };
+  };
+  const result = await chat(s, { messages: [user] });
+  assert.equal(result.status, 200, result.body); assert.equal(result.json.choices[0].message.content, 'two');
+  assert(s.pool.accounts[0].balance_dead_until > Date.now());
+});
+
+for (const unavailable of [true, false]) test(`Responses agent continuation restores complete tool history on a healthy account (already unavailable=${unavailable})`, async t => {
+  const s = setup(t, ({ messages, account }) => messages.at(-1).role === 'tool'
+    ? { text: `${account.id}:${messages.at(-1).content}` } : { calls: [{ name: 'read_file', arguments: { value: 'synthetic' } }] });
+  const initial = (await responses(s, { input: 'start' })).json;
+  const call = initial.output.find(o => o.type === 'function_call');
+  if (unavailable) s.pool.markAuthDead(s.pool.accounts[0]);
+  else s.pool.accounts[0].client.allocateIds = async () => { throw new UpstreamError('expired', { code: 200001, status: 502 }); };
+  const next = await responses(s, { previous_response_id: initial.id, input: [{ type: 'function_call_output', call_id: call.call_id, output: 'REAL_RESULT' }] });
+  assert.equal(next.status, 200, next.body); assert.equal(next.json.output_text, 'two:REAL_RESULT');
+  assert.equal(next.json.kuku.account, 'two'); assert.notEqual(next.json.kuku.session_id, initial.kuku.session_id);
+  assert(s.seen.send.at(-1).text.includes(call.call_id));
+});
+
+for (const surface of ['chat', 'responses']) for (const stream of [false, true]) for (const large of ['count', 'size']) {
+  test(`${surface} passes ${large === 'count' ? 'more than 128 tools' : 'more than 2 MiB of tool definitions'} through native discovery without truncation (stream=${stream})`, async t => {
+    const tools = large === 'count'
+      ? Array.from({ length: 129 }, (_, i) => ({ type: 'function', function: { ...definitions[0].function, name: `tool_${i}` } }))
+      : [{ type: 'function', function: { ...definitions[0].function, name: 'large_tool', description: 'X'.repeat(2 * 1024 * 1024) + 'definition-tail' } }];
+    const last = tools.at(-1).function;
+    const s = setup(t, ({ tools: native }) => ({ calls: [{ name: native.at(-1).name, arguments: { value: 'synthetic' } }] }));
+    const result = surface === 'chat'
+      ? await chat(s, { tools, messages: [user], stream })
+      : await responses(s, { tools: tools.map(t => ({ type: 'function', ...t.function })), input: 'Use the final defined tool.', stream });
+    assert.equal(result.status, 200);
+    assert.equal(s.seen.send.length, 1);
+    assert.equal(s.seen.definitions[0].length, tools.length);
+    assert.equal(s.seen.definitions[0].at(-1).name, last.name);
+    assert.equal(s.seen.definitions[0].at(-1).description.length, last.description.length);
+    if (large === 'size') assert.ok(s.seen.definitions[0][0].description.endsWith('definition-tail'));
+    const name = surface === 'chat'
+      ? stream ? result.events.flatMap(e => e.choices?.[0]?.delta?.tool_calls ?? [])[0]?.function.name : result.json.choices[0].message.tool_calls[0].function.name
+      : (stream ? result.events.find(e => e.type === 'response.completed').response : result.json).output.find(o => o.type === 'function_call').name;
+    assert.equal(name, last.name);
+  });
+}
+
+test('removing tool count limits still rejects duplicate names before contacting upstream', async t => {
+  const s = setup(t);
+  const tools = Array.from({ length: 129 }, (_, i) => ({ type: 'function', function: { ...definitions[0].function, name: `tool_${i}` } }));
+  tools.at(-1).function.name = tools[0].function.name;
+  const result = await chat(s, { tools, messages: [user] });
+  assert.equal(result.status, 400);
+  assert.equal(result.json.error.code, 'invalid_tools');
+  assert.equal(s.seen.send.length, 0);
+});
 
 for (const stream of [false, true]) test(`Chat native tool loop reads, writes and executes a real sandbox verification (stream=${stream})`, async t => {
   const dir = mkdtempSync(path.join(tmpdir(), 'kuku-agent-test-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -218,6 +381,60 @@ test('foreign desktop tasks are ignored and identical schemas keep a stable conn
   assert.equal((await chat(s, { messages: [user], tools })).status, 200);
   assert.notEqual(s.seen.send[1].connector_list[0].name, s.seen.send[2].connector_list[0].name);
   assert(s.seen.callbacks.every(c => c.result?.tools));
+});
+
+for (const surface of ['chat', 'responses']) for (const stream of [false, true]) {
+  test(`${surface} stabilizes discovery bytes and connector for reordered object keys while tool calls/results still roundtrip (stream=${stream})`, async t => {
+    const tools = structuredClone(definitions);
+    tools[0].function.description = '保持描述中的  空白\r\n与 Unicode';
+    tools[0].function.parameters.properties.value = { description: 'Choose unchanged values.', type: 'string', enum: ['z', 'a'], default: 'z' };
+    const reorderedObjects = value => Array.isArray(value) ? value.map(reorderedObjects)
+      : value !== null && typeof value === 'object' ? Object.fromEntries(Object.entries(value).reverse().map(([k, v]) => [k, reorderedObjects(v)])) : value;
+    const reordered = reorderedObjects(tools), snapshot = JSON.stringify(tools);
+    const s = setup(t, ({ messages }) => messages.some(m => m.role === 'tool') ? { text: 'completed safely' }
+      : { calls: [{ name: 'read_file', arguments: { value: 'z' } }] });
+    const send = (defs, history = null) => surface === 'chat'
+      ? chat(s, { tools: defs, messages: history ?? [user], stream })
+      : responses(s, { tools: defs.map(t => ({ type: 'function', ...t.function })), input: history ?? 'start', stream });
+    const first = await send(tools), second = await send(reordered);
+    assert.equal(first.status, 200); assert.equal(second.status, 200);
+    assert.equal(s.seen.send[0].connector_list[0].name, s.seen.send[1].connector_list[0].name);
+    assert.equal(JSON.stringify(s.seen.definitions[0]), JSON.stringify(s.seen.definitions[1]));
+    assert.deepEqual(s.seen.definitions[0].map(t => t.name), tools.map(t => t.function.name));
+    assert.deepEqual(s.seen.definitions[0][0].inputSchema, tools[0].function.parameters);
+    assert.equal(s.seen.definitions[0][0].description, tools[0].function.description);
+    assert.equal(JSON.stringify(tools), snapshot);
+    let history;
+    if (surface === 'chat') {
+      const wire = stream ? first.events.flatMap(e => e.choices?.[0]?.delta?.tool_calls ?? [])[0] : first.json.choices[0].message.tool_calls[0];
+      const call = { id: wire.id, type: wire.type, function: wire.function };
+      assert.equal(call.function.name, 'read_file'); assert.deepEqual(JSON.parse(call.function.arguments), { value: 'z' });
+      history = [user, { role: 'assistant', content: null, tool_calls: [call] }, { role: 'tool', tool_call_id: call.id, content: 'synthetic completion' }];
+    } else {
+      const call = (stream ? first.events.find(e => e.type === 'response.completed').response : first.json).output.find(o => o.type === 'function_call');
+      assert.equal(call.name, 'read_file'); assert.deepEqual(JSON.parse(call.arguments), { value: 'z' });
+      history = [{ role: 'user', content: 'start' }, { type: 'function_call', call_id: call.call_id, name: call.name, arguments: call.arguments },
+        { type: 'function_call_output', call_id: call.call_id, output: 'synthetic completion' }];
+    }
+    const final = await send(reordered, history);
+    assert.equal(final.status, 200); assert.ok(final.body.includes('completed safely'));
+    assert.equal(JSON.stringify(s.seen.definitions[0]), JSON.stringify(s.seen.definitions[2]));
+    assert.equal(s.seen.send[0].connector_list[0].name, s.seen.send[2].connector_list[0].name);
+  });
+}
+
+test('actual description/schema changes and every array order change still get distinct connectors', async t => {
+  const s = setup(t, () => ({ text: 'done' }));
+  const baseline = structuredClone(definitions);
+  baseline[0].function.parameters.properties.value.enum = ['z', 'a'];
+  const description = structuredClone(baseline); description[0].function.description += ' ';
+  const schema = structuredClone(baseline); schema[0].function.parameters.properties.value.enum = ['z', 'different'];
+  const enumeration = structuredClone(baseline); enumeration[0].function.parameters.properties.value.enum.reverse();
+  const order = structuredClone(baseline).reverse();
+  for (const tools of [baseline, description, schema, enumeration, order]) assert.equal((await chat(s, { messages: [user], tools })).status, 200);
+  assert.equal(new Set(s.seen.send.map(args => args.connector_list[0].name)).size, 5);
+  assert.deepEqual(s.seen.definitions.at(-1).map(t => t.name), order.map(t => t.function.name));
+  assert.deepEqual(s.seen.definitions[3][0].inputSchema.properties.value.enum, ['a', 'z']);
 });
 
 test('TURN_DONE racing the handoff timer returns calls once and does not hang', async t => {
@@ -421,5 +638,9 @@ test('bounded agent timing metadata is saved to SQLite logs without caller text 
   assert.equal(timing.tool_list_count, 1); assert.equal(timing.tool_call_count, 0); assert.equal(timing.model_ends_ms.length, 1);
   assert(timing.prepared_ms <= timing.send_started_ms); assert(timing.total_ms >= timing.first_text_ms);
   assert(timing.prompt_bytes > 0 && timing.instruction_bytes > 0);
+  assert.match(timing.tool_fingerprint, /^[a-f0-9]{24}$/);
+  assert.equal(s.seen.send[0].connector_list[0].name, `external_agent_${timing.tool_fingerprint}`);
+  assert.equal(timing.tool_definition_bytes, Buffer.byteLength(JSON.stringify(s.seen.definitions[0])));
+  assert(!log.includes(definitions[0].function.name));
   assert(db.sql.prepare('SELECT 1 FROM usage_records WHERE id=?').get(timing.turn_id));
 });

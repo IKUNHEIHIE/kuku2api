@@ -35,6 +35,18 @@ describe('kuku-api client', () => {
     vi.restoreAllMocks()
   })
 
+  it('uses independent administrator authentication for credential refresh configuration and single-account jobs', async () => {
+    saveApiSettings({ baseUrl: 'https://fixture.test', adminToken: 'fixture-admin', apiKey: 'fixture-api' })
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }))
+    await kukuApi.getTokenRefresh()
+    await kukuApi.configureTokenRefresh({ interval_hours: 12 })
+    await kukuApi.refreshAccountTokens('one')
+    expect(fetch.mock.calls.map(call => call[0])).toEqual(['https://fixture.test/pool/admin/token-refresh', 'https://fixture.test/pool/admin/token-refresh', 'https://fixture.test/pool/admin/token-refresh/run'])
+    for (const [, init] of fetch.mock.calls) expect(new Headers(init?.headers).get('x-admin-token')).toBe('fixture-admin')
+    expect(JSON.parse(fetch.mock.calls[1][1]?.body as string)).toEqual({ interval_hours: 12 })
+    expect(JSON.parse(fetch.mock.calls[2][1]?.body as string)).toEqual({ id: 'one' })
+  })
+
   describe('settings management & header safety', () => {
     it('returns default settings when localStorage is empty', () => {
       const settings = getApiSettings()

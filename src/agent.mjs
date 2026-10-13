@@ -13,7 +13,6 @@ export function agentTools(body, surface) {
   if (body.functions?.length || body.function_call != null) throw invalid('Use tools and tool_choice instead of legacy functions/function_call', 'unsupported_tools');
   const list = body.tools ?? [];
   if (!Array.isArray(list)) throw invalid('tools must be an array', 'invalid_tools');
-  if (list.length > 128 || Buffer.byteLength(JSON.stringify(list)) > 2 * 1024 * 1024) throw invalid('Too many or oversized tool definitions', 'invalid_tools');
   const names = new Set();
   return list.map(tool => {
     if (!object(tool) || !['function', 'custom'].includes(tool.type) || (surface === 'chat' && tool.type !== 'function')) {

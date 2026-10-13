@@ -63,7 +63,7 @@ export function createLoginManager({ addAccount, listAccounts = () => [], device
       return fail(`the pair was accepted by passport but 库库AI refused it: ${e.message}`);
     }
     const id = s.account_id ?? nextAccountId();
-    const added = await addAccount({ id, allocateId: nextAccountId, alias: s.alias || (s.kind === 'qr' ? `扫码新增 ${id}` : `短信新增 ${id}`), priority: s.priority, bduss, stoken, device_id: deviceId });
+    const added = await addAccount({ id, allocateId: nextAccountId, alias: s.alias || (s.kind === 'qr' ? `扫码新增 ${id}` : `短信新增 ${id}`), priority: s.priority, bduss, stoken, ptoken, refreshExisting: true, device_id: deviceId });
     if (added.error) {
       const result = fail(added.error.message, added.error.code ?? added.error.status ?? null);
       if (added.error.account_id) result.account_id = added.error.account_id;
@@ -80,8 +80,9 @@ export function createLoginManager({ addAccount, listAccounts = () => [], device
     s.sign = '';
     s.failure = null;
     s.desktop_login = added.desktop_login ?? null;
+    s.refreshed_existing = added.refreshed_existing === true;
     onAdded(s.account_id);
-    return { state: 'added', account_id: s.account_id, login_type: s.kind, ...(s.desktop_login ? { desktop_login: s.desktop_login } : {}) };
+    return { state: 'added', account_id: s.account_id, login_type: s.kind, refreshed_existing: added.refreshed_existing === true, ...(s.desktop_login ? { desktop_login: s.desktop_login } : {}) };
   }
 
   async function startQr(spec = {}) {
@@ -112,7 +113,7 @@ export function createLoginManager({ addAccount, listAccounts = () => [], device
   async function pollQrSession(id) {
     const s = sessions.get(id);
     if (!s) return { error: 'unknown or expired login session', status: 404 };
-    if (s.state === 'added') return { state: 'added', account_id: s.account_id, ...(s.desktop_login ? { desktop_login: s.desktop_login } : {}) };
+    if (s.state === 'added') return { state: 'added', account_id: s.account_id, login_type: s.kind, refreshed_existing: s.refreshed_existing, ...(s.desktop_login ? { desktop_login: s.desktop_login } : {}) };
     if (s.state === 'failed') return s.failure;
     if (Date.now() > s.expires_at) return { state: 'expired' };
     // A UI polling every second must not stack up upstream calls or race itself into two adds.
@@ -203,7 +204,7 @@ export function createLoginManager({ addAccount, listAccounts = () => [], device
   async function verifySmsSession({ login_id: id, code, captcha }) {
     const s = smsSession(id);
     if (!s) return expiredSms();
-    if (s.state === 'added') return { state: 'added', account_id: s.account_id, login_type: s.kind, ...(s.desktop_login ? { desktop_login: s.desktop_login } : {}) };
+    if (s.state === 'added') return { state: 'added', account_id: s.account_id, login_type: s.kind, refreshed_existing: s.refreshed_existing, ...(s.desktop_login ? { desktop_login: s.desktop_login } : {}) };
     if (s.state === 'failed') return s.failure;
     if (!/^\d{6}$/.test(String(code ?? ''))) return { error: '请输入6位数字短信验证码', status: 400, code: 'invalid_sms_code' };
     if (!s.sends) return { error: '请先完成图形验证并发送短信', status: 409, code: 'sms_not_sent' };

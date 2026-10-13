@@ -104,7 +104,7 @@ export function AddAccountQr({ onSuccess }: AddAccountQrProps) {
             stopPolling()
 
             // If user customized alias or priority while QR was showing, apply it
-            if (newAccId && (aliasRef.current.trim() || priorityRef.current !== defaultPriority)) {
+            if (!pollRes.refreshed_existing && newAccId && (aliasRef.current.trim() || priorityRef.current !== defaultPriority)) {
               try {
                 await kukuApi.updateAccount(newAccId, {
                   alias: aliasRef.current.trim() || undefined,
@@ -115,7 +115,7 @@ export function AddAccountQr({ onSuccess }: AddAccountQrProps) {
               }
             }
 
-            toast.success(`百度账号已成功入池！(账号 ID: ${newAccId || '新账号'})`)
+            toast.success(pollRes.refreshed_existing ? `账号 ${newAccId} 登录凭据已更新，可用于自动续期` : `百度账号已成功入池！(账号 ID: ${newAccId || '新账号'})`)
             void refreshAccounts()
             onSuccess?.()
             break

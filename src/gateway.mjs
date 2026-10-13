@@ -108,6 +108,8 @@ export class Pool {
     // Retry "out of points" after a window instead of latching until manually reset.
     this.balanceRetryMs = balanceRetryMs;
     this.queues = new Map();
+    this.activeAccounts = new Map();
+    this.credentialRefreshes = new Map();
     this.claimQueueKey = Symbol('free-point claims');
     this.nextClaimAt = 0;
     this.claimNow = claimNow;
@@ -159,8 +161,10 @@ export class Pool {
         priority: Number.isFinite(a.priority) ? a.priority : 9999,
         disabled: !!a.disabled,
         upstream_user_id: a.upstream_user_id ?? null,
+        ptoken: typeof a.ptoken === 'string' ? a.ptoken : '',
+        credential: a.credential ? { ...a.credential } : {},
         cooldown_until: old?.cooldown_until ?? 0,
-        auth_dead: old?.auth_dead ?? false,
+        auth_dead: old?.auth_dead ?? (a.credential?.status === 'invalid'),
         balance_dead_until: old?.balance_dead_until ?? 0,
         client: new KukuAccount(a),
       };
@@ -192,7 +196,7 @@ export class Pool {
   // Codes measured per family: /wenchain/* -> 1000004, /bizapi/* -> 200001,
   // /api/genflowpro/* -> errno -6 "未登录" (the client also treats -7/-8 as auth-class).
   isAuthFailure(err) {
-    return err instanceof UpstreamError && [1000004, 200001, -6, -7, -8].includes(err.code);
+    return err instanceof UpstreamError && ([1000004, 200001, -6, -7, -8].includes(Number(err.code)) || [401,403].includes(err.status));
   }
 
   markAuthDead(account) {
@@ -238,6 +242,16 @@ export class Pool {
       if (this.queues.get(key) === tail) this.queues.delete(key);
       return result;
     });
+  }
+
+  async withAccountWork(id, fn) {
+    await this.credentialRefreshes.get(id)?.catch(() => {});
+    this.activeAccounts.set(id, (this.activeAccounts.get(id) ?? 0) + 1);
+    try { return await fn(); }
+    finally {
+      const count = this.activeAccounts.get(id) - 1;
+      if (count) this.activeAccounts.set(id, count); else this.activeAccounts.delete(id);
+    }
   }
 
   // Zero-cost routine check-up: one read-only auth-checked call per account.
@@ -353,7 +367,7 @@ export class Pool {
     const targets = only ? this.accounts.filter((a) => a.id === only || a.alias === only) : this.accounts;
     const out = [];
     for (const target of targets) {
-      out.push(await this.scheduleClaim(async () => {
+      out.push(await this.scheduleClaim(() => this.withAccountWork(target.id, async () => {
         const rec = { id: target.id, alias: target.alias, ok: false, points_earned: 0, claimed: [], reported: [], chat_turn: null, notes: [], code: null, message: '' };
         // Accounts may be removed or credentials refreshed while this job waits in the queue.
         const a = this.accounts.find(a => a.id === target.id && a.upstream_user_id === target.upstream_user_id);
@@ -415,7 +429,7 @@ export class Pool {
           else if (e.network) rec.unreachable = true;
         }
         return rec;
-      }));
+      })));
     }
     return out;
   }
@@ -477,14 +491,19 @@ export class Pool {
     const logicalKey = deriveSessionKey({ sessionKey: args.sessionKey, messages: args.messages, accountId: args.account.id });
     args = { ...args, sessionKey: logicalKey };
     // Every entry point (Chat, Responses, reward earning) shares this account-scoped queue.
-    return this.serialize(`chat:${accountSessionKey(args.account.id, logicalKey)}`, () => this.recordedChat(args, onDelta, signal));
+    return this.serialize(`chat:${accountSessionKey(args.account.id, logicalKey)}`, () => this.withAccountWork(args.account.id, () => {
+      const current = this.accounts.find(a => a.id === args.account.id && a.upstream_user_id === args.account.upstream_user_id);
+      if (!current) throw sessionError('账号已删除或身份已变化', 'session_account_mismatch');
+      if (!args.allowUnavailable && this.isUnavailable(current)) throw Object.assign(new Error('排队期间账号已不可用'), { status: 409, code: 'account_unavailable' });
+      return this.recordedChat({ ...args, account: current }, onDelta, signal);
+    }));
   }
 
   async recordedChat(args, onDelta, signal) {
     const started = Date.now();
     const observation = { usage_events: [] };
-    let result, error, turnId;
-    try { result = await this._chat(args, onDelta, signal, observation); }
+    let result, error, turnId, usedAccount = args.account;
+    try { result = await this._chat(args, onDelta, signal, observation, account => { usedAccount = account; }); }
     catch (e) { error = e; }
     if (this.database) {
       try {
@@ -506,6 +525,8 @@ export class Pool {
       catch { console.error('Agent timing log could not be saved'); }
     }
     if (error) {
+      // Private request context: never serialize credentials into observations or API errors.
+      Object.defineProperty(error, 'failureAccount', { value: usedAccount, configurable: true });
       error.observation = observation;
       try { this.logger.warn('inference failed:', args.source ?? 'chat', args.account.id, args.model.id, error.message); }
       catch { console.error('Database inference error log could not be saved'); }
@@ -514,19 +535,24 @@ export class Pool {
     return result;
   }
 
-  async _chat({ account, model, messages, sessionKey, think_mode, requiredSessionId, agent, instructions }, onDelta = () => {}, signal, observation = { usage_events: [] }) {
+  async _chat({ account, model, messages, sessionKey, think_mode, requiredSessionId, agent, instructions, allowUnavailable = false }, onDelta = () => {}, signal, observation = { usage_events: [] }, observeAccount = () => {}) {
     if (signal?.aborted) return { content: '', reasoning: '', usage: null, consume_points: null, usage_events: [], cancelled: true };
     const current = this.accounts.find(a => a.id === account.id);
     if (!current || current.upstream_user_id !== account.upstream_user_id) {
       throw sessionError('排队期间账号已删除或更换身份，请新建对话', 'session_account_mismatch');
     }
     account = current;
+    observeAccount(account);
     const accountId = account.id, upstreamUserId = account.upstream_user_id;
+    const checkAvailable = () => {
+      const live = this.accounts.find(a => a.id === accountId && a.upstream_user_id === upstreamUserId);
+      if (live && !allowUnavailable && this.isUnavailable(live)) throw Object.assign(new Error('发送前账号已不可用'), { status: 409, code: 'account_unavailable' });
+    };
     // A cold index (startup fetch failed) would send model_name=undefined and let upstream
     // silently pick its own default, ignoring the caller's model choice.
     if (!MODEL_INDEX.has(model.id)) await this.refreshModelIndex(account);
     const cfg = MODEL_INDEX.get(model.id) ?? { model_name: model.id, display_name: model.id };
-    if (agent) return nativeAgentTurn({ client: account.client, model: cfg, agent, onDelta,
+    if (agent) return nativeAgentTurn({ client: account.client, model: cfg, agent, onDelta, beforeSend: checkAvailable,
       think_mode: think_mode ?? cfg.think_mode ?? lastCatalog?.default_think_id ?? 3, observation, signal,
       ownsAccount: () => this.accounts.some(a => a.id === accountId && a.upstream_user_id === upstreamUserId) });
     const logicalKey = deriveSessionKey({ sessionKey, messages, accountId: account.id });
@@ -591,6 +617,8 @@ export class Pool {
       throw sessionError('请求处理期间账号已删除或更换身份，请新建对话', 'session_account_mismatch');
     }
     account = beforeSend;
+    observeAccount(account);
+    checkAvailable();
     await account.client.sendmsg({
       session_id: s.session_id,
       reply_id,
@@ -613,6 +641,7 @@ export class Pool {
     let reasoning = '';
     let lastEventId = null;
     let completed = false;
+    try {
     for await (const frame of account.client.sse({
       text,
       session_id: s.session_id,
@@ -652,6 +681,7 @@ export class Pool {
           code: c.errno ?? null,
           body: { reason: c.reason },
           insufficient_balance: drained,
+          definitiveRefusal: drained && !content && !reasoning && !observation.usage_events.length && !(consume > 0),
         });
       }
       if (delta.content || delta.reasoning_content) {
@@ -665,6 +695,11 @@ export class Pool {
     if (!completed) throw new UpstreamError('上游对话流中断，未确认对话完成；请先刷新任务和余额，不要自动重试对话', {
       code: 'upstream_incomplete', status: 502, network: true, retryUnsafe: true,
     });
+    } catch (error) {
+      // Once sendmsg was accepted, a failed stream is not proof that no work ran.
+      if (!error.definitiveRefusal) error.retryUnsafe = true;
+      throw error;
+    }
     return { content: content ?? '', reasoning, usage, consume_points: consume, session_id: s.session_id, reply_id, usage_events: observation.usage_events };
   }
 }

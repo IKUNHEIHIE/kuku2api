@@ -30,7 +30,7 @@ function qs(extra = {}) {
 }
 
 export class UpstreamError extends Error {
-  constructor(message, { code, status, body, network = false, insufficient_balance = false, retryUnsafe = false } = {}) {
+  constructor(message, { code, status, body, network = false, insufficient_balance = false, retryUnsafe = false, definitiveRefusal = false } = {}) {
     super(message);
     this.name = 'UpstreamError';
     this.code = code;
@@ -38,6 +38,7 @@ export class UpstreamError extends Error {
     this.body = body;
     this.network = network;
     this.retryUnsafe = retryUnsafe;
+    this.definitiveRefusal = definitiveRefusal;
     // Set when upstream answered with COMMERCIAL/insufficient_balance: the account is out of
     // points, which is a pool-scheduling fact, not a request error.
     this.insufficient_balance = insufficient_balance;
@@ -100,12 +101,14 @@ export class KukuAccount {
     } catch (e) {
       throw networkError(e, deadline, path === '/wenchain/genflowpro/sendmsg');
     }
-    if (!res.ok) throw new UpstreamError(`http ${res.status}`, { status: res.status, body: text });
+    if (!res.ok) throw new UpstreamError(`http ${res.status}`, { status: res.status, body: text,
+      retryUnsafe: path === '/wenchain/genflowpro/sendmsg' && ![400,401,403,429].includes(res.status),
+      definitiveRefusal: path === '/wenchain/genflowpro/sendmsg' && [400,401,403,429].includes(res.status) });
     let parsed;
     try {
       parsed = JSON.parse(text);
     } catch {
-      throw new UpstreamError('non-json body', { status: 502, body: text });
+      throw new UpstreamError('non-json body', { status: 502, body: text, retryUnsafe: path === '/wenchain/genflowpro/sendmsg' });
     }
     // Two different success envelopes live upstream: `/wenchain/*` and `/bizapi/*` answer
     // `{status:{code}}`, while `/api/genflowpro/*` answers `{errno,show_msg}` with no status
@@ -115,7 +118,10 @@ export class KukuAccount {
     const code = st ? st.code : parsed.errno;
     if (code !== 0) {
       const msg = (st ? st.msg : parsed.show_msg ?? parsed.errmsg) ?? '';
-      throw new UpstreamError(`code=${code} ${msg}`, { code, status: 502, body: parsed });
+      const refused = code != null && Number.isFinite(Number(code)) && Number(code) !== 0;
+      throw new UpstreamError(`code=${code} ${msg}`, { code, status: 502, body: parsed,
+        definitiveRefusal: path === '/wenchain/genflowpro/sendmsg' && refused,
+        retryUnsafe: path === '/wenchain/genflowpro/sendmsg' && !refused });
     }
     return parsed.data ?? {};
   }

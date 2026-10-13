@@ -8,6 +8,7 @@ import { UsersDialogs } from './components/users-dialogs'
 import { UsersPrimaryButtons } from './components/users-primary-buttons'
 import { UsersProvider, useUsers } from './components/users-provider'
 import { UsersTable } from './components/users-table'
+import { TokenRefreshPanel } from './components/token-refresh-panel'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { AlertCircle, AlertTriangle, Activity, Users as UsersIcon, CheckCircle2, Clock, Coins, Gift } from 'lucide-react'
@@ -214,6 +215,7 @@ function UsersContent({
           </div>
         </div>
 
+        <TokenRefreshPanel />
         <UsersTable data={accounts} search={search} navigate={navigate} />
       </Main>
 

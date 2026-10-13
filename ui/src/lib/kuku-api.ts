@@ -8,6 +8,38 @@ export interface Account {
   balance_retry_in_ms?: number
   cooldown_remaining_ms: number
   has_credential: boolean
+  credential?: {
+    status: 'unknown' | 'valid' | 'invalid' | 'refresh_failed' | 'error'
+    can_refresh: boolean
+    checked_at: number | null
+    refreshed_at: number | null
+    next_refresh_at: number | null
+    expires_at: number | null
+    refreshing: boolean
+    message: string
+  }
+}
+
+export interface TokenRefreshState {
+  enabled: boolean
+  interval_hours: number
+  running: boolean
+  last_run_at: number | null
+  next_run_at: number | null
+  last_result: { accounts: TokenRefreshResult[]; took_ms: number } | null
+}
+
+export interface TokenRefreshResult {
+  id: string
+  ok: boolean
+  refreshed?: boolean
+  status: string
+  message?: string
+  can_refresh?: boolean
+  checked_at?: number | null
+  refreshed_at?: number | null
+  skipped?: boolean
+  code?: number | string | null
 }
 
 export interface PoolState {
@@ -235,6 +267,7 @@ export interface LoginQrStartResponse {
 }
 
 export interface LoginQrPollResponse {
+  refreshed_existing?: boolean
   state: 'pending' | 'scanned' | 'confirmed' | 'added' | 'expired' | 'failed'
   login_id?: string
   account_id?: string
@@ -259,6 +292,7 @@ export interface LoginSmsStartResponse extends LoginSmsTiming {
 }
 
 export interface LoginSmsVerifyResponse extends LoginSmsTiming {
+  refreshed_existing?: boolean
   state: 'added' | 'captcha_required' | 'refused' | 'failed'
   account_id?: string
   login_id?: string
@@ -890,6 +924,7 @@ export const kukuApi = {
       disabled?: boolean
       bduss?: string
       stoken?: string
+      ptoken?: string
     }
   ): Promise<{ ok: boolean; account: Account }> {
     return apiRequest<{ ok: boolean; account: Account }>(
@@ -910,6 +945,16 @@ export const kukuApi = {
       },
       true
     )
+  },
+
+  async getTokenRefresh(): Promise<{ ok: boolean; token_refresh: TokenRefreshState }> {
+    return apiRequest('/pool/admin/token-refresh', {}, true)
+  },
+  async configureTokenRefresh(config: { enabled?: boolean; interval_hours?: number }): Promise<{ ok: boolean; token_refresh: TokenRefreshState }> {
+    return apiRequest('/pool/admin/token-refresh', { method: 'POST', body: JSON.stringify(config) }, true)
+  },
+  async refreshAccountTokens(id?: string): Promise<{ ok: boolean; result: { accounts: TokenRefreshResult[]; took_ms: number } }> {
+    return apiRequest('/pool/admin/token-refresh/run', { method: 'POST', body: JSON.stringify(id === undefined ? {} : { id }) }, true)
   },
 
   async resequenceAccounts(): Promise<{ ok: boolean; accounts: Account[] }> {

@@ -145,6 +145,22 @@ export const usersColumns: ColumnDef<Account>[] = [
     },
   },
   {
+    id: 'token-lifetime',
+    header: 'Token 有效期 / 续期',
+    cell: ({ row }) => {
+      const credential = row.original.credential
+      const time = (value?: number | null) => value ? new Date(value).toLocaleString() : '暂无'
+      const status = credential?.refreshing ? '正在刷新' : row.original.auth_dead ? '登录已失效' : credential?.status === 'valid' ? '最近检测有效' : credential?.status === 'refresh_failed' ? '续期失败，原登录可用' : credential?.status === 'error' ? '检测暂不可用' : '尚未检测'
+      return <div className='space-y-1 text-xs' title={credential?.message}>
+        <div>{status} · {credential?.can_refresh ? '支持自动续期' : '缺少 PTOKEN'}</div>
+        <div className='text-muted-foreground'>到期：{credential?.expires_at ? time(credential.expires_at) : '上游未提供'}</div>
+        <div className='text-muted-foreground'>检测：{time(credential?.checked_at)}</div>
+        <div className='text-muted-foreground'>刷新：{time(credential?.refreshed_at)}</div>
+        <div className='text-muted-foreground'>下次：{time(credential?.next_refresh_at)}</div>
+      </div>
+    },
+  },
+  {
     id: 'actions',
     cell: DataTableRowActions,
   },

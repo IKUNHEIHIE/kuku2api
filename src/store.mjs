@@ -41,6 +41,8 @@ export function toRecords(accounts) {
     ...(a.upstream_user_id ? { upstream_user_id: a.upstream_user_id } : {}),
     bduss: a.client.bduss,
     stoken: a.client.stoken,
+    ...(a.ptoken ? { ptoken: a.ptoken } : {}),
+    ...(a.credential && Object.keys(a.credential).length ? { credential: { ...a.credential } } : {}),
   }));
 }
 

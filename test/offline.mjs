@@ -1350,7 +1350,7 @@ await t('a scanned QR becomes a pooled account without any cookie crossing the a
   assert.equal(again.json.state, 'added');
   assert.equal(p.accounts.length, 2);
 });
-await t('scanning the same user in a new QR session refuses duplication and replays the failure', async () => {
+await t('scanning the same user refreshes the existing credential without duplication and replays completion', async () => {
   const p = mkPool(0);
   const { app, st } = adminApp(p);
   reset();
@@ -1363,15 +1363,16 @@ await t('scanning the same user in a new QR session refuses duplication and repl
   const first = await scan();
   assert.equal(first.result.json.state, 'added');
   const second = await scan();
-  assert.equal(second.result.json.state, 'failed');
-  assert.equal(second.result.json.code, 'account_already_exists');
+  assert.equal(second.result.json.state, 'added');
+  assert.equal(second.result.json.refreshed_existing, true);
   assert.equal(second.result.json.account_id, first.result.json.account_id);
   const callsBefore = { ...hits };
   const replay = await call(app, 'GET', second.path, null, headers);
   assert.deepEqual(replay.json, second.result.json);
-  assert.deepEqual(hits, callsBefore, 'terminal duplicate failure must not repeat upstream calls');
+  assert.deepEqual(hits, callsBefore, 'completed credential refresh must not repeat upstream calls');
   assert.equal(p.accounts.length, 1);
   assert.equal(st.load().accounts.length, 1);
+  assert.equal(st.load().accounts[0].ptoken, STUB_COOKIE_PTOKEN);
 });
 await t('loginAuthBody reproduces the engine-signed STOKEN exchange form', async () => {
   // Vectors measured by calling the real genflowengine.dll's
@@ -1490,7 +1491,7 @@ await t('sms login stops for a captcha, then lands the account on the typed code
   mode.smsNeedCaptcha = false;
 });
 
-await t('two concurrent SMS confirmations for a duplicate user return one sticky refusal', async () => {
+await t('two concurrent SMS confirmations refresh an existing user once without duplication', async () => {
   const p = mkPool(0);
   const { app, st } = adminApp(p);
   reset();
@@ -1503,8 +1504,8 @@ await t('two concurrent SMS confirmations for a duplicate user return one sticky
   const before = hits.login;
   const verify = () => call(app, 'POST', '/pool/admin/login/sms/verify', { login_id: second.json.login_id, code: '123456' }, headers);
   const [a, b] = await Promise.all([verify(), verify()]);
-  assert.equal(a.json.state, 'failed');
-  assert.equal(a.json.code, 'account_already_exists');
+  assert.equal(a.json.state, 'added');
+  assert.equal(a.json.refreshed_existing, true);
   assert.equal(a.json.account_id, done.json.account_id);
   assert.deepEqual(a.json, b.json);
   assert.equal(hits.login - before, 1);

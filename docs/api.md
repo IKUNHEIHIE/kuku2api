@@ -1,6 +1,6 @@
 # API 文档
 
-版本：1.1.1（实时流式优化与领取限速） · 更新：2026-10-13
+版本：1.2.0 · 更新：2026-10-14
 
 本文描述当前接口。旧版差异与验收过程见 [历史归档](archive/api-history.md)，安装参数和环境变量见 [安装与升级](installation.md)、[运行维护](operations.md)。
 
@@ -15,6 +15,7 @@
 - [图片附件](#图片附件)
 - [会话隔离](#会话隔离)
 - [号池查询与管理](#号池查询与管理)
+- [账号登录凭据续期](#账号登录凭据续期)
 - [扫码与短信登录](#扫码与短信登录)
 - [普通 API 密钥](#普通-api-密钥)
 - [积分领取](#积分领取)
@@ -58,6 +59,8 @@ JSON 请求使用 `Content-Type: application/json`。`OPTIONS` 预检返回 204�
 | PATCH / DELETE | `/pool/admin/accounts/:id` | 管理员 | 更新/删除账号 |
 | POST | `/pool/admin/resequence` | 管理员 | 重排优先级 |
 | POST | `/pool/admin/reset-cooldown` | 管理员 | 清除运行时不可用标记 |
+| GET / POST | `/pool/admin/token-refresh` | 管理员 | 读取/设置登录凭据自动续期 |
+| POST | `/pool/admin/token-refresh/run` | 管理员 | 单号/全池检测与续期 |
 | GET / POST | `/pool/admin/accounts/:id/desktop-login` | 管理员 | 电脑端初始化状态/补跑 |
 | POST | `/pool/admin/login/qr` | 管理员 | 创建扫码会话 |
 | GET | `/pool/admin/login/qr/:id.png` | 管理员 | 二维码图片 |
@@ -219,7 +222,8 @@ Responses 的同一往返使用 `output` 中的 `function_call.call_id`，下一
 
 ### 校验、流式与用量
 
-- 最多 128 个工具，工具定义与序列化后的完整会话分别不超过 2 MiB。名称唯一，匹配 `[A-Za-z0-9_.:-]{1,128}`；函数参数根节点描述 JSON 对象。
+- 不再对工具定义单独限制数量或合计大小。整个 JSON 请求体仍最多 32 MiB，序列化后的完整会话仍最多 2 MiB；这两者与工具定义数量无关。工具名称须唯一，匹配 `[A-Za-z0-9_.:-]{1,128}`；函数参数根节点描述 JSON 对象。上游实际可接受的工具规模仍由上游决定。
+- 上游工具发现响应及 connector 指纹使用同一份稳定序列化的定义：仅固定 JSON 对象的键顺序，保持工具列表和所有数组的顺序、名称、描述、参数与字符串内容。仅对象字段顺序变化时指纹不变；定义内容或数组顺序改变时指纹仍改变。客户端请求、工具调用及结果格式不变，本地 strict/Schema 校验规则不变。
 - 参数在交给客户端前按 JSON Schema 校验：支持 type/properties/required/additionalProperties、数组、enum/const、anyOf/oneOf/allOf/not、本地 `$ref`、常见数值/长度约束。远程引用不支持。`strict:true` 遇到未支持的关键字（如 format）提前拒绝；这是本地验证，并非原生约束解码承诺。
 - `required` / 指定工具 / `none` / `parallel_tool_calls:false` 会校验实际结果；模型违反选择、调用未知工具或参数不合规时返回 `invalid_tool_response`，不把半成品调用发给客户端，也不自动再次付费生成。尚未输出流时返回 HTTP 502；正文或思考已经输出时，Chat 发送 SSE error 后结束，Responses 发送 error / response.failed，客户端应将其视为失败而非成功回答。
 - `stream:true` 的工具模式实时转发上游正文和思考增量，不再等待完整最终回答。正文、思考仅发送一次；Responses 的 item ID、output_index 及最终 output 按实际输出顺序保持一致。`stream:false` 仍返回完整结果。
@@ -229,6 +233,7 @@ Responses 的同一往返使用 `output` 中的 `function_call.call_id`，下一
 - 已收到本轮有效原生 MCP 调用时，随后到达的 AWAITING_INPUT / REQUIRE_EXTERNAL_EXECUTION 视为等待工具结果，继续按已校验调用交接。没有本轮有效调用的桌面等待仍明确失败，不会执行上游桌面命令。
 - 每轮工具请求在 SQLite 系统日志增加一条 `agent timing: {...}`，可用现有管理员接口 `GET /pool/admin/logs?kind=system&level=info` 查询。记录 `turn_id`、模型、状态、实际思考档、工具/工具发现次数、输入字节数及相对本轮启动的毫秒时间：`ids_ready_ms`、`controls_ready_ms`、`images_ready_ms`、`prepared_ms`、`send_started_ms`、`send_ack_ms`、`tool_list_ms`、`tools_ready_ms`、`first_event_ms`、`first_reasoning_ms`、`first_text_ms`、`tool_call_ms`、`close_started_ms`、`close_done_ms`、`total_ms`。未发生的阶段不出现；`model_ends_ms` 最多记录 16 个模型结束时间。计时不包含进入原生适配前的排队/目录刷新或客户端执行工具的时间，不等于客户端实际首字延迟。日志不包含提示词、工具参数、结果正文或凭据；保留策略沿用系统日志设置。
 - 原生工具轮可能包含多次内部推理。usage 合计当前已观察到的 MODEL_CALL_END，用量包含上游平台提示与工具发现开销，**不是客户端历史的上下文长度**。数据库标记 `usage_scope:"all_model_calls"`。交接时尚未报告的用量/积分保持未知，不编造费用。客户端不应单凭该合计值判断是否必须压缩上下文。
+- `agent timing` 另记录 `tool_fingerprint`（稳定工具定义的 SHA-256 前 24 位）及 `tool_definition_bytes`（对应 UTF-8 JSON 字节数），便于关联相同工具集与缓存命中率；不记录工具定义正文。上游缓存收益须以实际用量记录衡量。
 - 已开始上游生成后的失败不自动换号或重复发送。客户端同样应避免对不确定是否已执行的工具无限重试；执行状态由客户端记录。
 
 ## 图片附件
@@ -264,8 +269,11 @@ Responses 在用户消息 `content` 中使用：
 - 普通上游续聊发送最新用户输入；新建普通会话发送完整历史，系统/开发指令同时进入自定义指令字段。
 - 工具模式每轮新建原生会话并重放客户端历史，不能用 Chat 会话标识代替历史；Responses 工具历史可保存在 SQLite 并通过 previous ID 恢复。
 - 会话按本地账号、已验证的上游身份和逻辑标识隔离；不同账号使用相同逻辑标识也不会共用上游会话。
-- Responses 续聊固定原账号。冲突指定账号、删除/替换身份、无法确认旧归属等情况会明确拒绝，不悄悄切到其他号。
+- 普通 Responses 上游会话续聊固定原账号。Agent 工具模式每轮使用新会话：有完整已保存工具历史时，原账号不可用或发送前失败可选择其他可用账号，并重放完整客户端历史及工具结果。原账号被删除、身份被替换或无法确认旧归属时仍明确拒绝。
+- 显式 `x-kuku-account` 始终固定账号；与 previous response 所属账号冲突时拒绝，不自动覆盖指定账号。
 - 同一账号会话请求串行，不同账号可并行。新对话仍可按号池状态选择可用账号。
+
+账号失效、余额不足及临时上游故障会更新调度状态。发送前失败或确认未生成的余额拒绝，可在同一请求内依次尝试其他账号；每个账号最多尝试一次。发送结果不确定、已经开始生成、产生用量或输出工具调用后，不自动重发当前请求；异常账号仍退出本轮调度，后续请求会选择可用账号。网络和上游临时错误通常冷却 30 秒，登录失效须续期或重新登录；请求参数和工具格式错误不会连带淘汰账号。
 
 相关稳定错误码包括 `response_account_mismatch`、`response_account_unavailable`、`session_account_mismatch`、`session_history_unavailable`。不要把上游 `session_id` 直接当作本地逻辑会话或 response ID。
 
@@ -280,7 +288,7 @@ Responses 在用户消息 `content` 中使用：
 | `GET /pool/points?account=<id>` | `{checked_at,total_balance_points,accounts}`，上游余额 |
 | `GET /pool/sessions?account=<id>&offset=0&size=20` | `{checked_at,accounts}`，上游会话；size 范围 1–50 |
 
-`account` 可省略以查询全池。状态账号含 `id`、`alias`、`priority`、`disabled`、`auth_dead`、`balance_dead`、`balance_retry_in_ms`、`cooldown_remaining_ms`、`has_credential`；不回显 Cookie。
+`account` 可省略以查询全池。状态账号含 `id`、`alias`、`priority`、`disabled`、`auth_dead`、`balance_dead`、`balance_retry_in_ms`、`cooldown_remaining_ms`、`has_credential` 及下方说明的 `credential`；不回显 BDUSS、STOKEN 或 PTOKEN。
 
 `priority` 越小越优先。登录态检查失败可能更新失效标记，网络不可达用 `unreachable:true` 表示，不等同登录失效。余额账号结果含 `ok`、`code`、`message`、`assets`、`balance_points` 等；只有 token 资产是推理积分，时长、任务数等其他桶不能相加。
 
@@ -291,12 +299,14 @@ Responses 在用户消息 `content` 中使用：
 | 请求 | 输入与结果 |
 |---|---|
 | `POST /pool/admin/accounts` | `{id,bduss,stoken,alias?,priority?,disabled?}`；或用 `ptoken` 替代 `stoken`；成功 201 |
-| `PATCH /pool/admin/accounts/:id` | 修改 `alias`、`priority`、`disabled`、`bduss`、`stoken`；200 `{ok:true,account}` |
+| `PATCH /pool/admin/accounts/:id` | 修改 `alias`、`priority`、`disabled`、`bduss`、`stoken`，或提交 `ptoken` 换取 STOKEN；200 `{ok:true,account}` |
 | `DELETE /pool/admin/accounts/:id` | 200 `{ok:true,accounts,gap:true}` |
 | `POST /pool/admin/resequence` | 按当前顺序重排为连续优先级，返回账号列表 |
 | `POST /pool/admin/reset-cooldown` | `{id?}`，省略则处理全池，清冷却、失效与余额暂不可用标记 |
 
 添加返回 `{ok:true,accounts,minted_stoken,desktop_login}`。`stoken` 与 `ptoken` 不能同时传。凭据更新可只传一个字段，空值拒绝；更新先核实身份、保存数据库再生效，成功清除相关运行时失效标记。
+
+提交的 PTOKEN 私密保存到 SQLite 用于后续续期，不随接口返回。仅更换 STOKEN 时保留原 PTOKEN；更换 BDUSS 且未提交新 PTOKEN 时清除旧 PTOKEN，避免凭据混配。
 
 本地 ID、相同标准化 Cookie 或相同上游用户冲突返回 409 `account_already_exists`，不覆盖已有账号。无法核实身份返回 502 `account_identity_unavailable`。同名别名不等于相同用户；历史重复记录不自动合并。
 
@@ -308,6 +318,44 @@ Responses 在用户消息 `content` 中使用：
 - `POST /pool/admin/accounts/:id/desktop-login`：`{}` 或 `{retry:true}`，显式补跑单号。
 
 状态为 `credited`、`no_credit`、`balance_unknown`、`unavailable`、`failed` 或 `verification_pending`；附 `message`、`reported`、`claimed_points`、`claimed`、余额观测及必要诊断字段。`credited` 表示观察到余额增加，不承诺固定活动奖励。无真实上下文时返回 unavailable；结果不确定时仅验证余额，不重复可能已完成的发奖请求。
+
+## 账号登录凭据续期
+
+这里的 Token 是号池百度账号的 BDUSS/STOKEN，与管理员令牌和普通 API 密钥独立。后端使用保存的 BDUSS + PTOKEN 向 Passport 换取 STOKEN，通过只读登录探测及账号身份核验后，先写入 SQLite 再启用新凭据。失败不会覆盖原凭据，也不发送模型对话。原登录仍有效时继续保留；只有明确登录拒绝才标记账号失效，网络波动不会当作登录过期。
+
+**无法无限延长 BDUSS 或 PTOKEN 的有效期。** 上游撤销或拒绝登录时仍需重新扫码/短信登录。上游未返回可依赖的精确到期时间，因此 `expires_at` 为 `null`，不根据本地时间伪造剩余有效期。
+
+2026-10-13 真实响应检查：`/v3/login/api/auth` 成功返回产品 STOKEN，但没有 `expires_in` / `expires_at` 或 STOKEN 的 Set-Cookie 过期属性；库库登录探测及资料接口也没有返回有效期。Passport 可为与现有凭据值相同的 `BDUSS_BFESS` / `PTOKEN_BFESS` 设置 `Max-Age=315360000`（10 年）。该值描述 Cookie 保存期限，且会随重新设置 Cookie 更新，不能当作 STOKEN 的服务端到期时间或保证登录持续有效 10 年；因此不写入 `credential.expires_at`。重新登录成功及 PTOKEN 保存成功不代表能获得精确过期时间。
+
+旧版本账号可能未保存 PTOKEN，只能检测当前登录，不能完成续期。重新扫码或短信登录同一个百度账号会补齐 PTOKEN 并更新原记录，保留账号 ID、别名、优先级和停用设置，不添加重复账号、不重复电脑端新人初始化。手动添加重复账号仍返回 409。
+
+### 配置与手动执行
+
+| 请求 | 请求体/响应 |
+|---|---|
+| `GET /pool/admin/token-refresh` | `{ok:true,token_refresh:{enabled,interval_hours,running,last_run_at,last_result,next_run_at}}` |
+| `POST /pool/admin/token-refresh` | `{enabled?:boolean,interval_hours?:integer}`；仅允许这两个字段，周期为 1–168 小时；返回更新后的配置 |
+| `POST /pool/admin/token-refresh/run` | `{id?:string}`；支持 ID/别名，省略则全池；返回 `{ok:true,result:{accounts,took_ms}}` |
+
+默认开启，每 6 小时检测并尝试续期；每分钟扫描到期账号，无历史检测记录的账号在首次扫描处理。配置、上次任务结果和账号检测记录均保存 SQLite，重启后按保存时间继续。暂时失败（`error` / `refresh_failed`）在 5 分钟后重试，成功或明确失效的账号按配置周期处理。
+
+手动与定时刷新共用串行队列，每个账号处理完后至少等待 15 秒才开始下一个账号。同一范围、同一执行方式的任务重复提交合并；不同范围的任务排队，手动全量任务不会与自动“仅到期账号”任务混为同一个任务。停用账号跳过；正在处理对话或领取积分的账号本轮跳过，定时扫描稍后再试。刷新中的账号新请求会等待刷新完成，再读取当前凭据，并在排队恢复与发送前重新检查账号可用状态；明确的管理员不可用账号探测例外保持独立鉴权。普通推理及积分领取不使用此刷新队列。
+
+批量接口每 10 秒以 JSON 空白字符保活，最终可直接 `response.json()`。顶层 `ok` 仅表示任务执行完成，应检查 `result.accounts[].ok`。单号结果含 `id`、`ok`、`status`、`refreshed`、`can_refresh`、`checked_at`、`refreshed_at`、`message`、`code`；跳过时可带 `skipped:true`，状态为 `busy`、`disabled`、`missing` 或 `changed`。保活后请求级错误遵循积分领取接口的 `{ok:false,error}` 约定。
+
+### 号池状态字段
+
+`GET /pool/state` 的 `accounts[].credential`：
+
+| 字段 | 含义 |
+|---|---|
+| `status` | `unknown` 尚未检测、`valid` 最近检测有效、`refresh_failed` 续期失败但原登录可用、`error` 暂时无法检测、`invalid` 登录失效 |
+| `can_refresh` | 是否保存了 PTOKEN；仅表示具备续期材料，不保证上游接受 |
+| `checked_at` / `refreshed_at` | 最近检测 / 成功换取并核验 STOKEN 的 Unix 毫秒时间；未发生为 `null` |
+| `expires_at` | 精确过期时间；当前上游未提供，返回 `null` |
+| `next_refresh_at` | 下次应检测时间，Unix 毫秒；自动刷新关闭或账号停用时为 `null`，忙碌/排队可能延后 |
+| `refreshing` | 该账号是否正在等待或执行凭据刷新 |
+| `message` | 安全的检测说明，不包含凭据 |
 
 ## 扫码与短信登录
 
@@ -336,13 +384,13 @@ Responses 在用户消息 `content` 中使用：
 
 验证结果为 `added`、`captcha_required`、`refused`、`failed` 等。成功带账号 ID；上游业务拒绝可在 HTTP 200 中返回状态与真实数字 `code`，不能只按 HTTP 判断成功。无法识别的登录响应返回 `login_response_unrecognized`，不会猜测成功。
 
-重复账号的登录终态示例：
+重新登录已有账号的成功终态示例：
 
 ```json
-{"state":"failed","code":"account_already_exists","account_id":"example-account","reason":"该百度账号已存在于号池，请使用已有账号；如需更新登录凭据，请编辑该账号"}
+{"state":"added","account_id":"example-account","login_type":"qr","refreshed_existing":true}
 ```
 
-本地参数与状态错误使用 HTTP：400 `invalid_phone` / `invalid_sms_code` / `captcha_required`，404 `login_session_expired`，409 `login_in_progress` / `login_session_finished` / `sms_not_sent`，429 `sms_cooldown` / `sms_send_limit`。同会话并发验证合并；完成后不能重发。
+`refreshed_existing:true` 表示更新原账号登录凭据；前端应提示“已更新登录凭据”，不要再次覆盖该账号别名/优先级。首次添加为 `false`。本地参数与状态错误使用 HTTP：400 `invalid_phone` / `invalid_sms_code` / `captcha_required`，404 `login_session_expired`，409 `login_in_progress` / `login_session_finished` / `sms_not_sent`，429 `sms_cooldown` / `sms_send_limit`。同会话并发验证合并；完成后不能重发。
 
 ## 普通 API 密钥
 

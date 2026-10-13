@@ -2,17 +2,18 @@
 
 将百度「库库AI」接入 OpenAI 兼容客户端，提供多账号池、流式对话和网页管理控制台。
 
-[快速安装](#快速安装) · [使用说明](docs/usage.md) · [API 文档](docs/api.md) · [全部文档](docs/README.md) · [v1.1.1 发布说明](docs/releases/v1.1.1.md) · [发布包](https://github.com/IKUNHEIHIE/kuku2api/releases/latest)
+[快速安装](#快速安装) · [使用说明](docs/usage.md) · [API 文档](docs/api.md) · [全部文档](docs/README.md) · [v1.2.0 发布说明](docs/releases/v1.2.0.md) · [发布包](https://github.com/IKUNHEIHIE/kuku2api/releases/latest)
 
 ## 功能
 
 - 支持 Chat Completions 与 Responses，支持流式输出和思考档位。
-- v1.1.1 实时输出工具模式的正文与思考，积分领取按账号串行处理，账号之间等待 15 秒。
-- v1.1.0 支持原生 MCP 客户端工具及图片附件适配，支持工具定义、调用与结果往返；GLM/DeepSeek Flash、OpenCode 与 Pi 验收范围见 [说明](docs/agent-upstream-verification.md)。
+- 工具模式实时输出正文与思考，支持原生 MCP 客户端工具及图片附件适配；GLM/DeepSeek Flash、OpenCode 与 Pi 验收范围见 [说明](docs/agent-upstream-verification.md)。
+- v1.2.0 改进异常账号切换，支持登录凭据定时续期及控制台管理；工具定义稳定序列化，并移除工具数量与定义总大小的额外限制。
 - 扫码、短信登录，多账号去重、调度及会话隔离。
 - 管理员令牌与模型 API 密钥独立，控制台管理账号、积分和密钥。
 - SQLite 保存设置、日志、对话与用量，支持 token 和积分统计。
 - 手动领取积分；每日自动领取默认关闭。
+- 积分领取按账号串行处理，每个账号完成后间隔 15 秒。
 - 安装与升级下载预编译包，用户服务器无需构建前端。
 
 ## 快速安装

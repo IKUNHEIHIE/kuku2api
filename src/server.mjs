@@ -9,6 +9,7 @@ import { deriveSessionKey } from './gateway.mjs';
 import { createAccountManager } from './accounts.mjs';
 import { createLoginManager } from './logins.mjs';
 import { createAutoClaim } from './scheduler.mjs';
+import { createCredentialRefresh } from './credential-refresh.mjs';
 import { resolveAdminToken } from './admin-token.mjs';
 import { openDatabase, createDatabaseLogger } from './database.mjs';
 import { databaseAdminRoute } from './database-api.mjs';
@@ -39,7 +40,7 @@ function openAiUsage(usage, content) {
 }
 
 function redact(msg) {
-  return String(msg).replace(/(BDUSS|STOKEN)=[^;"\s]+/g, '$1=<redacted>');
+  return String(msg).replace(/(BDUSS|PTOKEN|STOKEN)=[^;"\s]+/g, '$1=<redacted>');
 }
 
 function json(res, status, obj) {
@@ -128,12 +129,21 @@ function isDeterministicUpstreamFailure(err) {
 // pick skips it, then let the caller fail over. A drained account is deliberately NOT cooled —
 // its flag is cleared by the next /pool/points read once upstream refills the daily free points.
 function noteAccountFailure(pool, acct, err) {
-  if (err?.persistence || err?.retryUnsafe) return true;
+  if (err?.persistence) return true;
   const paramError = pool.isClientParamError(err);
+  acct = err?.failureAccount ?? acct;
+  // Saving another account rebuilds pool rows while this request can still be in flight.
+  // Apply the scheduling result to the live row, but never condemn a newer credential.
+  const current = pool.accounts.find(a => a.id === acct.id && a.upstream_user_id === acct.upstream_user_id &&
+    a.client.bduss === acct.client.bduss && a.client.stoken === acct.client.stoken);
+  if (!current) return paramError || err?.retryUnsafe === true;
+  acct = current;
+  const neutral = ['invalid_tool_response','session_account_mismatch','upstream_requires_client','invalid_image','unsafe_image_url','image_too_large','image_download_failed','image_upload_failed','image_rejected'].includes(err?.code);
   if (pool.isInsufficientBalance(err)) pool.markBalanceDead(acct);
   else if (pool.isAuthFailure(err)) pool.markAuthDead(acct);
-  else if (!paramError && isDeterministicUpstreamFailure(err)) pool.cool(acct);
-  return paramError;
+  else if (!paramError && !neutral && (err?.network || [429,500,502,503,504].includes(err?.status))) pool.cool(acct, Math.min(pool.cooldownMs, 30_000));
+  else if (!paramError && !neutral && isDeterministicUpstreamFailure(err)) pool.cool(acct);
+  return paramError || err?.retryUnsafe === true;
 }
 
 // An exhausted pool must not look like "the model answered nothing".
@@ -206,7 +216,7 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
     tried.push(acct.id);
     try {
       const r = await pool.chat(
-        { account: acct, model: { id: model }, messages, agent, sessionKey: agent ? `agent:${crypto.randomUUID()}` : req.headers['x-kuku-session'], think_mode: think, source: 'chat', store: reqBody.store },
+        { account: acct, model: { id: model }, messages, agent, allowUnavailable, sessionKey: agent ? `agent:${crypto.randomUUID()}` : req.headers['x-kuku-session'], think_mode: think, source: 'chat', store: reqBody.store },
         (delta) => {
           if (!stream || controller.signal.aborted) return;
           openStream(acct);
@@ -231,7 +241,7 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
     } catch (err) {
       lastErr = err;
       const paramError = noteAccountFailure(pool, acct, err);
-      if (paramError || sentAny || controller.signal.aborted) break;
+      if (wanted || paramError || sentAny || controller.signal.aborted) break;
       const next = pool.pick({ allowUnavailable, exclude: tried });
       if (!next) break;
       acct = next;
@@ -307,15 +317,16 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
   try {
     if (prev) {
       if (!prev.account || !prev.session_key || !prev.session_id) return openError(res, 409, '历史回复缺少账号或会话归属，请新建对话', 'pool_error', 'response_account_unverified');
-      if (!pool.accounts.some(a => a.id === prev.account)) return openError(res, 404, '历史回复所属账号已不存在，请新建对话', 'pool_error', 'response_account_not_found');
+      const owner = pool.accounts.find(a => a.id === prev.account);
+      if (!owner) return openError(res, 404, '历史回复所属账号已不存在，请新建对话', 'pool_error', 'response_account_not_found');
       const requested = wanted ? (pool.accounts.find(a => a.id === wanted) ?? pool.accounts.find(a => a.alias === wanted)) : null;
       if (wanted && requested?.id !== prev.account) {
         return openError(res, 409, '续聊不能切换到其他账号，请新建对话', 'pool_error', 'response_account_mismatch');
       }
-      acct = pool.resolve(prev.account, { allowUnavailable });
-      if (prev.agent_bridge && acct.upstream_user_id !== prev.upstream_user_id) {
+      if (prev.agent_bridge && owner.upstream_user_id !== prev.upstream_user_id) {
         return openError(res, 409, 'Agent 历史所属账号身份已变化，请新建对话', 'pool_error', 'session_account_mismatch');
       }
+      acct = pool.resolve(prev.agent_bridge && !wanted && !allowUnavailable && pool.isUnavailable(owner) ? null : prev.account, { allowUnavailable });
     } else acct = pool.resolve(wanted, { allowUnavailable });
   } catch (e) {
     return openError(res, e.status ?? 409, redact(e.message), 'pool_error', prev ? 'response_account_unavailable' : failureResponse(e).code);
@@ -358,7 +369,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
     tried.push(acct.id);
     try {
       turn = await pool.chat(
-          { account: acct, model: { id: model }, messages, agent, instructions: body.instructions, sessionKey, requiredSessionId: agent ? undefined : prev?.session_id, think_mode: think, source: 'responses', store: body.store },
+          { account: acct, model: { id: model }, messages, agent, allowUnavailable, instructions: body.instructions, sessionKey, requiredSessionId: agent ? undefined : prev?.session_id, think_mode: think, source: 'responses', store: body.store },
           sc ? (delta) => {
             if (controller.signal.aborted) return;
             if (delta.reasoning_content) {
@@ -384,7 +395,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
     } catch (err) {
       lastErr = err;
       const paramError = noteAccountFailure(pool, acct, err);
-      if (prev || paramError || sentAny || controller.signal.aborted) break;
+      if ((prev && !agent) || wanted || paramError || sentAny || controller.signal.aborted) break;
       const next = pool.pick({ allowUnavailable, exclude: tried });
       if (!next) break;
       acct = next;
@@ -456,6 +467,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
 }
 
 export function createApp({ pool, apiKeys = [], adminToken = '', store = null, deviceId = '', ledger = null, keyRing = null, autoClaim = null, database = null, logger = console, runtime = null, allowUnkeyedModels = true, uiDirectory = path.join(ROOT, 'ui', 'dist') }) {
+  let credentialRefresh;
   const keys = keyRing ?? createKeyRing({ envKeys: apiKeys });
   const serveUi = createStaticUi(uiDirectory);
   const adminReadPaths = new Set(['/pool/state', '/pool/health', '/pool/points', '/pool/sessions', '/v1/models']);
@@ -488,6 +500,10 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
     cooldown_remaining_ms: Math.max(0, a.cooldown_until - Date.now()),
     // Credential material is never echoed back; the UI only ever needs to tell accounts apart.
     has_credential: Boolean(a.client?.bduss && a.client?.stoken),
+    credential: { status: a.auth_dead ? 'invalid' : a.credential?.status ?? 'unknown', can_refresh: !!a.ptoken,
+      checked_at: a.credential?.checked_at ?? null, refreshed_at: a.credential?.refreshed_at ?? null,
+      expires_at: null, next_refresh_at: credentialRefresh?.nextFor(a) ?? null,
+      refreshing: pool.credentialRefreshes?.has(a.id) ?? false, message: a.credential?.message ?? '' },
   });
 
   // One place that turns credentials into a pooled account. The QR/SMS login flows call it with
@@ -496,6 +512,7 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
   // only BDUSS + PTOKEN — in that case we ask passport for the STOKEN instead of failing.
   const desktopLogin = createDesktopLogin({ database, pool });
   const accountManager = createAccountManager({ pool, store, deviceId, initializeDesktop: desktopLogin.run });
+  credentialRefresh = createCredentialRefresh({ pool, manager: accountManager, store: database?.store('credential_refresh'), logger });
   const addAccount = accountManager.add;
 
   // Login sessions (QR / SMS). Inert until the admin routes are called.
@@ -535,7 +552,8 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
         for (const k of ['id', 'bduss']) if (!body[k]) return openError(res, 400, `${k} is required`);
         if (!body.stoken && !body.ptoken) return openError(res, 400, 'stoken is required (or send ptoken and we fetch it)');
         if (body.stoken && body.ptoken) return openError(res, 400, 'send either stoken or ptoken, not both');
-        const added = await addAccount(body);
+        const { refreshExisting: _ignored, ...manualSpec } = body;
+        const added = await addAccount(manualSpec);
         if (added.error) {
           const e = added.error;
           return openError(res, e.status, e.message, e.type ?? 'invalid_request_error', e.code);
@@ -690,6 +708,18 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
         return claimJson(res, async () => ({ ok: true, result: await autoClaim.run() }));
       }
 
+      if (url.pathname === '/pool/admin/token-refresh') {
+        if (req.method === 'GET') return json(res, 200, { ok: true, token_refresh: credentialRefresh.state });
+        if (req.method !== 'POST') return openError(res, 405, 'Use GET or POST');
+        try { return json(res, 200, { ok: true, token_refresh: credentialRefresh.configure(body) }); }
+        catch (e) { return openError(res, e.status ?? 500, e.message); }
+      }
+      if (url.pathname === '/pool/admin/token-refresh/run' && req.method === 'POST') {
+        if (Object.keys(body).some(k => k !== 'id') || (body.id !== undefined && typeof body.id !== 'string')) return openError(res, 400, 'Only optional id:string is accepted');
+        if (body.id !== undefined && !pool.accounts.some(a => a.id === body.id || a.alias === body.id)) return openError(res, 404, 'unknown account');
+        return claimJson(res, async () => ({ ok: true, result: await credentialRefresh.run({ only: body.id ?? null }) }));
+      }
+
       return openError(res, 404, 'not found');
     }
 
@@ -841,7 +871,7 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
   // A rejecting handler is an unhandled promise rejection, which by default ends the process —
   // and a proxy that dies takes the whole pool down with it. Several login routes await passport
   // calls that throw on any network blip, so this is the safety net, not decoration.
-  return (req, res) => {
+  const handler = (req, res) => {
     const started = Date.now();
     let disconnected = false;
     res.once?.('close', () => { if (!res.writableFinished) disconnected = true; });
@@ -860,6 +890,8 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
       } catch { console.error('Database request log could not be saved'); }
     });
   };
+  handler.credentialRefresh = credentialRefresh;
+  return handler;
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
@@ -873,7 +905,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
   const envKeys = (process.env.API_KEYS ?? '').split(',').filter(Boolean);
   const keyRing = createKeyRing({ store: database.store('keys'), envKeys });
   const logger = createDatabaseLogger(database, { ...(process.env.KUKU_INSTALLER_QUIET === '1' ? { consoleOutput: { log() {}, warn: console.warn, error: console.error } } : {}), secrets: () => [adminToken, ...envKeys,
-    ...database.store('keys').load().keys.map((k) => k.key), ...(pool?.accounts ?? []).flatMap((a) => [a.client.bduss, a.client.stoken])] });
+    ...database.store('keys').load().keys.map((k) => k.key), ...(pool?.accounts ?? []).flatMap((a) => [a.client.bduss, a.client.stoken, a.ptoken])] });
   const pool = new Pool(loaded.accounts, { sessionStore: database.store('sessions'), database, logger });
   for (const a of pool.accounts) a.deviceId = deviceId;
   const ledger = database.ledger;
@@ -887,9 +919,9 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
   const shutdown = () => {
     if (stopping) return;
     stopping = true;
-    const pendingClaim = autoClaim.stop(); clearInterval(pruneTimer);
+    const pendingClaim = autoClaim.stop(), pendingRefresh = app.credentialRefresh.stop(); clearInterval(pruneTimer);
     server.close(async () => {
-      await Promise.allSettled([...pendingRequests, pendingClaim]);
+      await Promise.allSettled([...pendingRequests, pendingClaim, pendingRefresh]);
       database.close(); process.exit(0);
     });
   };
@@ -909,6 +941,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
     runtime,
   });
   autoClaim.start();
+  app.credentialRefresh.start();
   database.prune();
   const pruneTimer = setInterval(() => {
     try { database.prune(); } catch { console.error('Database retention cleanup failed'); }

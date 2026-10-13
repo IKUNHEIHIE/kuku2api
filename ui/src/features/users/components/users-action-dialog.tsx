@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { z } from 'zod'
 import { useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -87,8 +87,12 @@ export function UsersActionDialog({
     },
   })
 
+  const initialized = useRef<string | null>(null)
   useEffect(() => {
-    if (open) {
+    if (!open) { initialized.current = null; return }
+    const key = JSON.stringify([Boolean(currentRow), currentRow?.id])
+    if (initialized.current !== key) {
+      initialized.current = key
       form.reset({
         id: currentRow?.id ?? '',
         alias: currentRow?.alias ?? '',
@@ -317,7 +321,7 @@ export function UsersActionDialog({
                         />
                       </FormControl>
                       <FormDescription className='text-[11px]'>
-                        PATCH 改号仅支持直接轮转 STOKEN，更新有效凭据后会自动清除失效标记与冷却时间（若需以 PTOKEN 换票，请使用扫码/短信重新加号）。
+                        更新有效凭据后会清除失效标记。要为旧账号启用自动续期，可重新扫码或短信登录同一账号，系统会更新原账号，不会重复添加。
                       </FormDescription>
                       <FormMessage />
                     </FormItem>

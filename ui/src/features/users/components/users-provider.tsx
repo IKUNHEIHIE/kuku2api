@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import useDialogState from '@/hooks/use-dialog-state'
 import {
   kukuApi,
@@ -39,6 +39,7 @@ export type UsersContextType = {
   gap: boolean
   setGap: (gap: boolean) => void
   refreshAccounts: () => Promise<void>
+  refreshAccountStatus: () => Promise<void>
   runHealthCheck: (accountId?: string) => Promise<void>
   runPointsCheck: (accountId?: string, options?: { silent?: boolean }) => Promise<void>
   resetCooldown: (accountId?: string) => Promise<void>
@@ -84,8 +85,10 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
   const [apiKeyCount, setApiKeyCount] = useState(0)
   const [autoClaimState, setAutoClaimState] = useState<AutoClaimState | null>(null)
   const [gap, setGap] = useState(false)
+  const accountRequest = useRef(0)
 
   const refreshAccounts = useCallback(async () => {
+    const version = ++accountRequest.current
     try {
       setLoading(true)
       const [state, points] = await Promise.all([
@@ -93,13 +96,15 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
         kukuApi.getPoolPoints().catch(() => null),
       ])
       const accs = state.accounts || []
-      setAccounts(accs)
+      if (version === accountRequest.current) {
+        setAccounts(accs)
+        setGap(detectPriorityGap(accs))
+      }
       setAdminEnabled(state.admin_enabled)
       setActiveSessions(state.sessions || 0)
       setApiOpen(state.api_open ?? false)
       setApiKeyCount(state.api_key_count ?? 0)
       setAutoClaimState(state.auto_claim ?? null)
-      setGap(detectPriorityGap(accs))
       if (points) {
         setTotalBalancePoints(points.total_balance_points)
         const pMap: Record<string, AccountPointsResult> = {}
@@ -117,6 +122,7 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let ignore = false
+    const version = ++accountRequest.current
     void (async () => {
       try {
         const [state, points] = await Promise.all([
@@ -125,13 +131,15 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
         ])
         if (!ignore) {
           const accs = state.accounts || []
-          setAccounts(accs)
+          if (version === accountRequest.current) {
+            setAccounts(accs)
+            setGap(detectPriorityGap(accs))
+          }
           setAdminEnabled(state.admin_enabled)
           setActiveSessions(state.sessions || 0)
           setApiOpen(state.api_open ?? false)
           setApiKeyCount(state.api_key_count ?? 0)
           setAutoClaimState(state.auto_claim ?? null)
-          setGap(detectPriorityGap(accs))
           if (points) {
             setTotalBalancePoints(points.total_balance_points)
             const pMap: Record<string, AccountPointsResult> = {}
@@ -154,6 +162,12 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
     return () => {
       ignore = true
     }
+  }, [])
+
+  const refreshAccountStatus = useCallback(async () => {
+    const version = ++accountRequest.current
+    const state = await kukuApi.getPoolState()
+    if (version === accountRequest.current) setAccounts(state.accounts || [])
   }, [])
 
   const runHealthCheck = useCallback(
@@ -246,6 +260,7 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
     async (accountId?: string) => {
       try {
         const res = await kukuApi.resetCooldown(accountId)
+        accountRequest.current++
         setAccounts(res.accounts || [])
         toast.success(accountId ? `已重置账号 ${accountId} 的冷却状态` : '已清空全池冷却状态')
         await refreshAccounts()
@@ -259,6 +274,7 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
   const resequence = useCallback(async () => {
     try {
       const res = await kukuApi.resequenceAccounts()
+      accountRequest.current++
       setAccounts(res.accounts || [])
       setGap(false)
       toast.success('序号重排完成，已连续紧凑压缩')
@@ -271,6 +287,7 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
     async (id: string) => {
       try {
         const res = await kukuApi.deleteAccount(id)
+        accountRequest.current++
         setAccounts(res.accounts || [])
         if (res.gap) {
           setGap(true)
@@ -352,6 +369,7 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
       gap,
       setGap,
       refreshAccounts,
+      refreshAccountStatus,
       runHealthCheck,
       runPointsCheck,
       resetCooldown,
@@ -386,6 +404,7 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
       gap,
       setGap,
       refreshAccounts,
+      refreshAccountStatus,
       runHealthCheck,
       runPointsCheck,
       resetCooldown,
