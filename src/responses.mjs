@@ -46,7 +46,7 @@ export function toResponsesUsage(u, consume) {
   };
 }
 
-export function buildResponse({ id, model, created, text, thinking, usage, consume, instructions, previous_response_id, store, session_id, reply_id, status = 'completed', error = null }) {
+export function buildResponse({ id, model, created, text, thinking, usage, consume, instructions, previous_response_id, store, session_id, reply_id, tool_calls = [], status = 'completed', error = null }) {
   const output = [];
   if (thinking) {
     output.push({
@@ -55,13 +55,16 @@ export function buildResponse({ id, model, created, text, thinking, usage, consu
       summary: [{ type: 'summary_text', text: thinking }],
     });
   }
-  output.push({
+  if (text || !tool_calls.length) output.push({
     id: `msg_${id.slice(5, 25)}`,
     type: 'message',
     role: 'assistant',
     status: error ? 'incomplete' : 'completed',
     content: [{ type: 'output_text', text, annotations: [] }],
   });
+  for (const call of tool_calls) output.push(call.type === 'custom'
+    ? { id: `ctc_${call.id.slice(5)}`, type: 'custom_tool_call', call_id: call.id, name: call.name, input: call.input, status: 'completed' }
+    : { id: `fc_${call.id.slice(5)}`, type: 'function_call', call_id: call.id, name: call.function.name, arguments: call.function.arguments, status: 'completed' });
   return {
     id,
     object: 'response',
@@ -172,6 +175,37 @@ export class ResponseStream {
       output_index: this.output_index,
       item: { id: this.item_id, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: this.text, annotations: [] }] },
     });
+    this.emit('response.completed', { response: finalResponse });
+    this.res.end();
+  }
+
+  completedAgent(finalResponse) {
+    // Native structured calls are buffered and validated before exposing them.
+    for (const [output_index, item] of finalResponse.output.entries()) {
+      const common = { response_id: finalResponse.id, output_index, item_id: item.id };
+      this.emit('response.output_item.added', { response_id: finalResponse.id, output_index,
+        item: { ...item, status: 'in_progress', ...(item.type === 'message' ? { content: [] }
+          : item.type === 'function_call' ? { arguments: '' } : item.type === 'custom_tool_call' ? { input: '' } : { summary: [] }) } });
+      if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+        const custom = item.type === 'custom_tool_call', prefix = custom ? 'response.custom_tool_call_input' : 'response.function_call_arguments';
+        const value = custom ? item.input : item.arguments;
+        this.emit(`${prefix}.delta`, { ...common, delta: value });
+        this.emit(`${prefix}.done`, { ...common, ...(custom ? { input: value } : { arguments: value, name: item.name }) });
+      } else if (item.type === 'message') {
+        const part = item.content[0];
+        this.emit('response.content_part.added', { ...common, content_index: 0, part: { ...part, text: '' } });
+        this.emit('response.output_text.delta', { ...common, content_index: 0, delta: part.text });
+        this.emit('response.output_text.done', { ...common, content_index: 0, text: part.text });
+        this.emit('response.content_part.done', { ...common, content_index: 0, part });
+      } else if (item.type === 'reasoning') {
+        const part = item.summary[0];
+        this.emit('response.reasoning_summary_part.added', { ...common, summary_index: 0, part: { ...part, text: '' } });
+        this.emit('response.reasoning_summary_text.delta', { ...common, summary_index: 0, delta: part.text });
+        this.emit('response.reasoning_summary_text.done', { ...common, summary_index: 0, text: part.text });
+        this.emit('response.reasoning_summary_part.done', { ...common, summary_index: 0, part });
+      }
+      this.emit('response.output_item.done', { response_id: finalResponse.id, output_index, item });
+    }
     this.emit('response.completed', { response: finalResponse });
     this.res.end();
   }

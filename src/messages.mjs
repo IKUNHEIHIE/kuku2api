@@ -1,4 +1,5 @@
-// These APIs bridge text chat, not the desktop client's tool execution protocol.
+import { normalizeImagePart, imageName, validateImages } from './images.mjs';
+// Content normalization shared by plain chat and the native client-tool adapter.
 function invalid(message, code = 'invalid_message_content') {
   return Object.assign(new Error(message), { status: 400, code });
 }
@@ -14,17 +15,22 @@ export function textContent(content, types = ['text']) {
   }).join('');
 }
 
-export function validateTextOnlyTools(body) {
-  for (const field of ['tools', 'functions']) {
-    if (body[field] != null && !Array.isArray(body[field])) throw invalid(`${field} must be an array`, 'invalid_tools');
-    const choice = field === 'tools' ? body.tool_choice : body.function_call;
-    if (body[field]?.length && choice !== 'none') throw invalid(
-      'Client tool calling is not supported. Disable tools for this provider and start a text-only conversation; coding agents require a provider with tool calling support',
-      'unsupported_tools');
-  }
-  for (const choice of [body.tool_choice, body.function_call]) {
-    if (choice != null && choice !== 'auto' && choice !== 'none') throw invalid('Required or named tool calls are not supported', 'unsupported_tools');
-  }
+export function callerInstructions(messages, instructions = '') {
+  return [...messages.filter(m => m.role === 'system' || m.role === 'developer').map(m => m.content), instructions]
+    .filter(Boolean).join('\n\n');
+}
+
+export function normalizeContent(content, types = ['text'], images = false) {
+  if (!Array.isArray(content) || !content.some(p => ['image_url','input_image'].includes(p?.type))) return textContent(content, types);
+  if (!images) throw invalid('Images are supported in user input and tool results only', 'unsupported_content_type');
+  return content.map(part => ['image_url','input_image'].includes(part?.type) ? normalizeImagePart(part)
+    : { type: 'text', text: textContent([part], types) });
+}
+export function visibleContent(content) {
+  return typeof content === 'string' ? content : content.map(part => part.type === 'text' ? part.text : `[Image attachment: ${imageName(part)}]`).join('');
+}
+export function visibleMessages(messages) {
+  return messages.map(m => ({ ...m, content: visibleContent(m.content) }));
 }
 
 export function normalizeChatMessages(messages) {
@@ -37,9 +43,10 @@ export function normalizeChatMessages(messages) {
       throw invalid('Tool calls and tool results are not supported', 'unsupported_tools');
     }
     if (!['user', 'assistant', 'system', 'developer'].includes(message.role)) throw invalid('Unsupported message role');
-    return { role: message.role === 'developer' ? 'system' : message.role, content: textContent(message.content) };
+    return { role: message.role === 'developer' ? 'system' : message.role, content: normalizeContent(message.content, ['text'], message.role === 'user') };
   });
-  if (!normalized.findLast(message => message.role === 'user')?.content.trim()) throw invalid('A non-empty user text message is required');
+  if (!visibleContent(normalized.findLast(message => message.role === 'user')?.content ?? '').trim()) throw invalid('A non-empty user message is required');
+  validateImages(normalized);
   return normalized;
 }
 
@@ -48,7 +55,7 @@ export function normalizeResponseInput(input) {
   if (!Array.isArray(input)) return [];
   const messages = input.map(item => {
     if (!item || (item.type != null && item.type !== 'message')) throw invalid('Only text message input items are supported; tool items cannot be forwarded', 'unsupported_input_type');
-    return { ...item, content: textContent(item.content, ['input_text', 'output_text', 'text']) };
+    return { ...item, content: normalizeContent(item.content, ['input_text', 'output_text', 'text'], item.role === 'user') };
   });
   return messages.length ? normalizeChatMessages(messages) : [];
 }

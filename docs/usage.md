@@ -4,12 +4,12 @@
 
 ## 登录控制台
 
-安装完成后，打开终端显示的控制台地址，填写管理员密钥。首次登录从当前页面自动识别协议、域名/IP 和端口，例如：
+安装完成后，打开终端显示的控制台地址，填写管理员密钥。首次登录从当前页面自动识别协议、域名/IP 和端口。本文所有 `kuku.example.invalid` 地址均为不可用于实际连接的示例占位符，不是部署地址；使用时替换为自己的服务地址。
 
 | 页面地址 | 自动使用的后端地址 |
 |---|---|
-| `http://服务器IP:8400/users` | `http://服务器IP:8400` |
-| `https://你的域名/users` | `https://你的域名` |
+| `http://kuku.example.invalid:8787/users` | `http://kuku.example.invalid:8787` |
+| `https://kuku.example.invalid/users` | `https://kuku.example.invalid` |
 
 已有合法的自定义后端地址会保留。前后端分开部署时可展开服务端地址配置，填写后端根地址，**不加 `/v1`**。HTTP 和 HTTPS 均支持；FTP、file 等协议不支持。
 
@@ -29,27 +29,77 @@
 
 ## 接入模型客户端
 
-在控制台创建普通 API 密钥，保存只显示一次的完整密钥。客户端 Base URL 为 `http://服务器IP:端口/v1`，HTTPS 反向代理使用 `https://你的域名/v1`。
+在控制台创建普通 API 密钥，保存只显示一次的完整密钥。客户端 Base URL 为 `http://kuku.example.invalid:8787/v1`，HTTPS 反向代理示例为 `https://kuku.example.invalid/v1`。
 
 模型 ID 以 `/v1/models` 为准；显示名称不一定等于请求使用的 ID。公开监听时必须配置普通 API 密钥，管理员密钥不能代替它调用模型。
 
 ### OpenCode 等编程客户端
 
-当前项目是文本对话桥接，尚不支持 OpenAI 工具调用往返协议，不能直接作为 OpenCode 的完整编程 Agent 后端。客户端本地文件不会因为连接 API 就自动上传；库库AI的电脑端工具也无法代替 OpenCode 在本机读文件、运行命令或修改代码。
+v1.1.0 新增原生 MCP 工具适配；使用 v1.0.1 的用户需先运行一键升级。后端向上游提供客户端的真实工具定义，转换结构化调用，客户端在自己的工作目录中检查权限并执行。2026-10-13 已通过 GLM Flash、DeepSeek Flash 的读文件→写文件→运行检查→最终回答测试，以及 OpenCode 1.19.0 + GLM Flash 的实际 read→edit→bash 测试。详见 [验收说明](agent-upstream-verification.md)。
 
-- 纯文本问答：将该模型配置为不支持工具，并禁用本地工具、MCP 工具和附件。模型能力字段随 OpenCode 版本不同，应按对应版本的 [模型文档](https://opencode.ai/docs/models/) 与 [权限文档](https://opencode.ai/docs/permissions/) 配置。`plan` 模式仍可能需要读取文件，不能视为纯文本模式。
-- 文本块：v1.0.1 起支持文本数组，解决 `[object Object]`；旧版本应升级到 v1.0.1 或更高版本。
-- 多轮上下文：Chat 需固定账号并为每个独立聊天提供唯一且稳定的 `x-kuku-session`，Responses 使用 `previous_response_id`。只发送标准完整 messages 历史，不会让当前桥接自动重放历史或系统指令；客户端不支持这些会话扩展时，不能依赖完整多轮兼容性。
-- 自动读写代码或执行命令：使用已实现工具调用的服务；仅调高思考档位、换另一个库库AI模型或延长超时无法补齐此协议。
-- `upstream_requires_client`：表示上游已进入需要电脑端处理或补充输入的状态，部分请求可能已经扣分。先查看对话及余额；结束/处理旧任务后开启新对话，不自动换号或循环重试。禁用 OpenCode 工具能避免客户端工具请求，但不能保证上游自身永不进入等待状态。
+OpenCode 使用自定义 OpenAI-compatible provider。以下是本次验收配置的精简示例；替换地址、普通 API 密钥和目录中可用的模型 ID：
 
-后端会在发送上游前拒绝不支持的工具和附件，避免静默丢内容后继续扣分；这项保护本身不会提供工具执行能力。具体错误码见 [API 文档](api.md#chat-completions)。
+```json
+{
+  "$schema":"https://opencode.ai/config.json",
+  "provider":{
+    "kuku":{
+      "npm":"@ai-sdk/openai-compatible",
+      "name":"kuku2api",
+      "options":{"baseURL":"https://kuku.example.invalid/v1","apiKey":"REPLACE_WITH_YOUR_API_KEY"},
+      "models":{
+        "gateway-glm-5.3-flash":{
+          "name":"GLM Flash",
+          "tool_call":true,
+          "limit":{"context":128000,"output":8192},
+          "options":{"think_mode":1}
+        }
+      }
+    }
+  },
+  "model":"kuku/gateway-glm-5.3-flash",
+  "compaction":{"auto":false,"prune":false},
+  "agent":{"title":{"disable":true},"summary":{"disable":true},"compaction":{"disable":true}},
+  "permission":{"read":"allow","edit":"ask","bash":"ask"}
+}
+```
+
+配置格式见 OpenCode [自定义提供商](https://opencode.ai/docs/providers/#custom-provider)、[模型](https://opencode.ai/docs/models/) 和 [权限](https://opencode.ai/docs/permissions/) 文档。`limit` 是客户端配置，并非本项目验证的上游模型最大窗口或输出保证。首次使用请从少量文件和短任务开始，客户端首字节超时建议至少覆盖后端默认 180 秒生成期限。
+
+- 工具模式缓冲并校验后才输出调用，客户端收到的参数增量可能只有一块；不能按“是否逐字出现参数”判断工具有没有生效。
+- Chat 每轮重传完整 messages、tool_calls、tool 结果和 tools，无需 `x-kuku-session`；Responses 可在 store:true 时使用 previous ID，store:false 必须自行重传完整历史。
+- 上游 usage 包括平台提示和内部工具发现的多次推理合计，不能作为客户端当前上下文长度。示例关闭自动压缩和自动标题等额外调用以避免过早压缩和额外消耗；大任务需主动精简历史或开启新会话，并保留任务交接摘要。长期任务压缩、子 Agent 和所有 MCP 插件尚未逐项验收。
+- 工作目录必须是客户端实际项目目录。外部启动器应同时设置 cwd/PWD 或显式使用 OpenCode 的 `--dir`；模型 API 不会自动上传本地文件，只有客户端实际执行 read 后的文本结果才会进入历史。
+- 支持标准图片附件及工具返回的图片；其他二进制文件、提供商托管工具、grammar 自定义工具仍不支持。图片大小、URL、存储与限制见 [图片附件](api.md#图片附件)。权限由客户端控制，后端不会在云服务器执行客户端命令。
+- `invalid_tool_response` 表示模型调用或参数未通过校验，没有向客户端交出可执行调用。`upstream_requires_client` 表示上游仍请求了未支持的桌面能力；先查看状态和余额，避免自动循环重发付费请求。
+
+### Pi 编程 Agent
+
+已实际验证 Pi 1.2.0 + GLM Flash，Chat 和 Responses 均成功完成识图、写入文件、运行固定检查及最终回答。配置参考 Pi 官方 [自定义模型文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/models.md)，在 agent 目录的 models.json 中添加：
+
+```json
+{
+  "providers":{
+    "kuku":{
+      "baseUrl":"https://kuku.example.invalid/v1",
+      "api":"openai-completions",
+      "apiKey":"REPLACE_WITH_YOUR_API_KEY",
+      "authHeader":true,
+      "models":[{"id":"gateway-glm-5.3-flash","input":["text","image"],"reasoning":false,"contextWindow":128000,"maxTokens":8192}]
+    }
+  }
+}
+```
+
+需要 Responses 时将 api 改为 `openai-responses`。`input` 的 image 标记用于让客户端发送图片，reasoning:false 是本次验收的客户端能力设置，不代表上游关闭思考；服务端思考档位按 API 请求与上游默认值确定。Pi 可用 `@图片路径` 附加图片，或调用 read 读取图片。上述窗口和输出上限仍只是客户端设置。
+
+Pi 同样需要避免根据累计上游 usage 过早压缩；本次验收 settings.json 使用 `{"compaction":{"enabled":false},"retry":{"enabled":false,"maxRetries":0}}`，并限制工具权限到合成测试文件及固定命令。关闭自动压缩后，大任务需自行整理上下文；日常使用的工具权限应由使用者配置。
 
 ## 思考档位与会话
 
 思考档位来自模型目录的 `think_list`。支持 `think_mode`，也支持兼容的 `reasoning_effort`，具体字段见 [API 文档](api.md#模型与思考档位)。档位会传给上游，实际思考内容和预算由模型决定，不保证随档位严格递增。
 
-多轮对话需要显式标识：Chat Completions 复用 `x-kuku-session`，Responses 使用 `previous_response_id`。没有标识时每次新建对话，不会根据相同正文自动续接。会话按账号与上游身份隔离；旧账号不可用时，已有 Responses 链不会悄悄换号继续。
+普通文本 Chat 可用 `x-kuku-session` 续接上游会话，也可每次重传完整历史。工具模式 Chat 每次新建原生会话，须重传完整历史；Responses 可通过 `previous_response_id` 取回已保存的工具历史。会话按账号与上游身份隔离；旧账号不可用时，已有 Responses 链不会悄悄换号继续。
 
 ## 积分与用量
 

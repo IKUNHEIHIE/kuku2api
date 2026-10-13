@@ -1,6 +1,6 @@
 # API 文档
 
-版本：1.0.1 · 更新：2026-10-13
+版本：1.1.0（原生 MCP 工具与图片输入适配） · 更新：2026-10-13
 
 本文描述当前接口。旧版差异与验收过程见 [历史归档](archive/api-history.md)，安装参数和环境变量见 [安装与升级](installation.md)、[运行维护](operations.md)。
 
@@ -11,6 +11,8 @@
 - [模型与思考档位](#模型与思考档位)
 - [Chat Completions](#chat-completions)
 - [Responses](#responses)
+- [客户端工具调用](#客户端工具调用)
+- [图片附件](#图片附件)
 - [会话隔离](#会话隔离)
 - [号池查询与管理](#号池查询与管理)
 - [扫码与短信登录](#扫码与短信登录)
@@ -118,20 +120,23 @@ JSON 请求使用 `Content-Type: application/json`。`OPTIONS` 预检返回 204�
 | 字段 | 说明 |
 |---|---|
 | `model` | 可选，默认 `gateway-glm-5.3-flash`；取模型目录的 ID |
-| `messages` | 必须为非空数组；`content` 支持字符串或 `[{"type":"text","text":"..."}]`，多个文本块按顺序拼接，保留原换行 |
+| `messages` | 必须为非空数组；`content` 支持字符串、text 块和用户 image_url 块；文本保留原换行，图片见下节 |
 | `stream` | 只有 `true` 开启 SSE，默认非流式 |
 | `think_mode` / `reasoning.effort` / `reasoning_effort` | 思考设置，见上节 |
 | `store` | 本项目扩展；`false` 不存正文/思考，但保留用量与最小续接数据 |
 | `stream_options.include_usage` | 流式末尾附加 usage 帧 |
 | `kuku_meta` | 流式末尾附加非标准 kuku 元信息帧，默认关闭 |
+| `tools` | 客户端函数定义：`[{"type":"function","function":{"name":"...","description":"...","parameters":{...},"strict":false}}]` |
+| `tool_choice` | `auto`（默认）、`none`、`required`，或 `{"type":"function","function":{"name":"..."}}` |
+| `parallel_tool_calls` | 默认 true；false 时只允许一条工具调用 |
 
 可选请求头：`x-kuku-account` 指定账号 ID 或别名；`x-kuku-session` 指定逻辑会话标识。指定账号不能绕过停用、冷却或失效状态。`x-kuku-allow-unavailable: 1` 是需管理员权限的诊断选项，不是普通模型调用的授权替代。
 
-必须包含非空的最新 `user` 文本；支持 `system/developer/user/assistant` 角色，`developer` 归一为 `system`。当前上游桥接只发送最新用户输入，额外的 system/developer 消息不等同于可替换上游系统指令；完整历史的处理限制见 [会话隔离](#会话隔离)。
+纯文本请求必须包含非空用户文本，支持 `system/developer/user/assistant`。新建会话发送完整历史；system/developer 内容同时传入上游自定义指令字段，仍受上游平台指令约束。显式续接普通上游会话时发送最新用户消息。
 
-**客户端工具调用尚未实现。** 非空 `tools/functions` 默认返回 HTTP 400 `unsupported_tools`，不会分配上游会话、发送对话或消耗上游积分；仅显式 `tool_choice:"none"` / `function_call:"none"` 时允许携带对应定义。空工具数组与 `auto/none` 可用于纯文本请求。强制/指定工具选择、工具调用历史及 `role:"tool"/"function"` 均拒绝。不会把库库AI电脑客户端的工具当作 OpenCode 的本地工具执行。
+有工具定义或工具历史时启用原生 MCP 适配，支持 `assistant.tool_calls` 与 `role:"tool"` 往返。最后一条消息须为非空 user 或工具结果；所有历史调用必须有对应结果，未知、重复或缺失 `tool_call_id` 返回 400 `invalid_tool_history`。旧式 `functions/function_call`、`role:"function"` 不支持。详见 [客户端工具调用](#客户端工具调用)。
 
-图片、文件、音频等内容块返回 400 `unsupported_content_type`，混合文本与不支持内容也整体拒绝；内容结构或 `text` 类型不正确返回 `invalid_message_content`，工具定义不是数组返回 `invalid_tools`。不再静默丢弃内容或发送 `[object Object]`。校验发生在开启 SSE 和访问上游前，流式请求同样返回普通 JSON 错误。
+支持图片附件；其他文件、音频等内容块仍返回 400 `unsupported_content_type`，混合文本与不支持内容也整体拒绝。内容结构或 `text` 类型不正确返回 `invalid_message_content`，工具定义不是数组返回 `invalid_tools`。不会静默丢弃附件或发送 `[object Object]`。本地内容校验发生在开启 SSE 和访问上游前；远程图片还需通过下载与上游上传检查。
 
 非流式响应包含 `id`、`object:"chat.completion"`、秒级 `created`、`model`、`choices`、`usage`，另有扩展块：
 
@@ -139,7 +144,7 @@ JSON 请求使用 `Content-Type: application/json`。`OPTIONS` 预检返回 204�
 {"kuku":{"account":"example-account","consume_points":0.01,"session_id":"upstream-session","reply_id":"upstream-reply"}}
 ```
 
-数值仅为结构示例，不能视为固定费用。usage 可含 `prompt_tokens`、`completion_tokens`、`total_tokens`、`reasoning_tokens`、`cache_read_tokens`；兼容响应在上游缺失用量时可能包含粗略输出估算，管理统计不把未知上游量估算入账。
+数值仅为结构示例，不能视为固定费用。usage 可含 `prompt_tokens`、`completion_tokens`、`total_tokens`、`reasoning_tokens`、`cache_read_tokens`；兼容响应在上游缺失用量时可能包含粗略输出估算，管理统计不把未知上游量估算入账。工具模式增加 `kuku.tool_adapter:"native-mcp"`。
 
 流式响应类型为 `text/event-stream`，逐个解析 `data:`：正文在 `choices[].delta.content`，思考在扩展 `delta.reasoning_content`；usage 或 kuku 帧不是正文。成功流以 `data: [DONE]` 收尾，错误帧需单独处理，不能仅看到 `finish_reason` 就认定整条流结束。
 
@@ -157,9 +162,11 @@ JSON 请求使用 `Content-Type: application/json`。`OPTIONS` 预检返回 204�
 }
 ```
 
-`input` 接受非空文本或文本消息项数组；`developer` 归一为 `system`。支持 `instructions`、`previous_response_id`、`stream`、`store` 及思考字段；这不是完整的 OpenAI 多模态或工具执行实现，不应依赖图片、工具调用项或客户端工具任务。
+`input` 接受非空文本或输入项数组。支持 `instructions`、`previous_response_id`、`stream`、`store` 及思考字段。`instructions` 只作用于本次请求，不随 previous ID 继承；需要时每次重传。
 
-文本消息的 `content` 支持字符串及 `input_text/output_text/text` 块；数组需含非空用户文本。工具定义的限制与 Chat 相同；函数调用/工具结果等非消息项返回 400 `unsupported_input_type`，不支持的内容块返回 `unsupported_content_type`，不会过滤后重发较早的用户消息。
+文本消息 `content` 支持字符串及 `input_text/output_text/text` 块；用户图片使用 `input_image`。工具模式还接受 `function_call`、`function_call_output`、`custom_tool_call`、`custom_tool_call_output`，工具结果可携带文本及图片内容块。返回的可见 reasoning summary 可原样放回，不能续传其他提供商的加密 reasoning。未知项返回 400 `unsupported_input_type`，其他不支持的内容块返回 `unsupported_content_type`。
+
+函数工具采用扁平格式：`{"type":"function","name":"read_file","parameters":{...},"strict":false}`，指定选择为 `{"type":"function","name":"read_file"}`。同时支持 `{"type":"custom","name":"apply_patch","format":{"type":"text"}}`；其调用项使用 `input` 文本，结果使用 `output` 文本与 `call_id`。grammar 格式返回 400 `unsupported_tool_format`。
 
 返回 Response 对象，含 `id`、`object:"response"`、`created_at`（秒）、`status`、`output`、`output_text`、`usage`、`kuku` 等字段。SSE 使用 Responses 事件名，包含创建、文本增量和完成事件；失败可能返回失败事件，应按事件状态处理。
 
@@ -171,13 +178,86 @@ JSON 请求使用 `Content-Type: application/json`。`OPTIONS` 预检返回 204�
 
 列表形状为 `{object:"list",data,first_id,last_id,has_more}`。无效或不在过滤结果中的游标返回 400 `cursor_not_found`，不能当作空末页。
 
-`store:false` 不出现在列表，详情返回 404，但最小映射仍可支持 `previous_response_id` 续接。对话保留策略可能清理旧映射；独立备份不随在线删除自动清理。
+`store:false` 不出现在列表，详情返回 404。普通文本的最小映射仍可续接；工具模式不保存历史和工具定义，因此不能用 previous ID 续接，须重新发送完整 input 历史，否则返回 400 `agent_history_unavailable`。对话保留策略可能清理旧映射；独立备份不随在线删除自动清理。
+
+## 客户端工具调用
+
+### 工作方式与边界
+
+真实上游验收已确认：直接加入 OpenAI `tools/tool_choice` 字段没有注册为模型工具；库库AI提供的是原生自定义 MCP connector 通道。后端用该通道提供 `tools/list`，接收结构化 `tools/call`，再转换成 OpenAI 调用项；不会从普通正文提取或猜测工具调用。
+
+后端只返回调用建议，**读写客户端工作目录、命令和 MCP 工具的权限检查与执行全部由客户端负责**。上传的图片由上游图片读取能力解析；不会在本后端执行上游电脑端工具，也不接管其他桌面客户端的任务。其他二进制附件、托管 web/file-search/code-interpreter 工具、grammar 自定义工具及提供商加密推理状态尚不支持；不能据此宣称所有 Agent 客户端完全兼容。
+
+每次工具轮使用独立上游会话；交出工具调用前结束该轮，不长期挂起桌面回调。下一次请求把完整历史和真实工具结果送入新会话。这样客户端执行长命令时不会占用等待中的上游生成任务。Chat 工具模式忽略 `x-kuku-session`，必须每轮重传历史及工具定义；Responses 可在 `store:true` 时通过 previous ID 从 SQLite 恢复历史，固定原账号与上游身份。
+
+### 一次往返示例
+
+首次请求：
+
+```json
+{
+  "model":"gateway-glm-5.3-flash",
+  "messages":[{"role":"user","content":"读取 demo.txt"}],
+  "tools":[{"type":"function","function":{
+    "name":"read_file","description":"读取客户端工作目录中的文本文件",
+    "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}
+  }}],
+  "tool_choice":"auto",
+  "parallel_tool_calls":false
+}
+```
+
+响应 `choices[0].message` 可能为（ID 仅作示例）：
+
+```json
+{"role":"assistant","content":null,"tool_calls":[{"id":"call_example","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"demo.txt\"}"}}]}
+```
+
+此时 `finish_reason:"tool_calls"`。客户端按自己的权限读取文件，下一轮保留原 messages 和完整 assistant 消息，再追加 `{"role":"tool","tool_call_id":"call_example","content":"实际文件内容或实际错误"}`，同时重传 tools。收到普通最终回答时 `finish_reason:"stop"`。多个调用的结果可逆序回传，但必须全部回传且 ID 不重复。
+
+Responses 的同一往返使用 `output` 中的 `function_call.call_id`，下一轮提交 `{"type":"function_call_output","call_id":"...","output":"真实结果"}`；可附 `previous_response_id`，或自行携带完整历史。response output item 的 `id` 与 `call_id` 不可混用。
+
+### 校验、流式与用量
+
+- 最多 128 个工具，工具定义与序列化后的完整会话分别不超过 2 MiB。名称唯一，匹配 `[A-Za-z0-9_.:-]{1,128}`；函数参数根节点描述 JSON 对象。
+- 参数在交给客户端前按 JSON Schema 校验：支持 type/properties/required/additionalProperties、数组、enum/const、anyOf/oneOf/allOf/not、本地 `$ref`、常见数值/长度约束。远程引用不支持。`strict:true` 遇到未支持的关键字（如 format）提前拒绝；这是本地验证，并非原生约束解码承诺。
+- `required` / 指定工具 / `none` / `parallel_tool_calls:false` 会校验实际结果；模型违反选择、调用未知工具或参数不合规时返回 502 `invalid_tool_response`，不把半成品调用发给客户端，也不自动再次付费生成。
+- 工具模式先等待原生结构化调用或完整最终回答并校验，然后输出 SSE。Chat 使用 `delta.tool_calls[index]`；Responses 使用 `response.output_item.added`、`response.function_call_arguments.delta/done` 或 `response.custom_tool_call_input.delta/done`，最后 `response.completed`。参数 delta 可以是一次完整字符串，不保证逐 token 到达；应提高客户端首字节超时。
+- 原生工具轮可能包含多次内部推理。usage 合计当前已观察到的 MODEL_CALL_END，用量包含上游平台提示与工具发现开销，**不是客户端历史的上下文长度**。数据库标记 `usage_scope:"all_model_calls"`。交接时尚未报告的用量/积分保持未知，不编造费用。客户端不应单凭该合计值判断是否必须压缩上下文。
+- 已开始上游生成后的失败不自动换号或重复发送。客户端同样应避免对不确定是否已执行的工具无限重试；执行状态由客户端记录。
+
+## 图片附件
+
+图片支持普通对话和工具调用混用。Chat 在用户 `content` 中使用：
+
+```json
+{"type":"image_url","image_url":{"url":"data:image/png;base64,<图片base64>","detail":"auto"}}
+```
+
+Responses 在用户消息 `content` 中使用：
+
+```json
+{"type":"input_image","image_url":"https://example.com/image.png","detail":"auto"}
+```
+
+两种形式均可使用完整 HTTP(S) URL 或 base64 data URL；同一消息可以混合多个文本块与图片，也可以只含图片。工具返回截图等图片时，Chat 的 tool content 数组和 Responses function_call_output / custom_tool_call_output 的 output 数组也支持相应图片块。system/developer/assistant 的图片内容不支持。
+
+- 支持 PNG、JPEG、GIF、WebP；单张最多 10 MiB，一次完整请求历史最多 10 张、解码后总大小最多 20 MiB；JSON 请求体最多 32 MiB，超出返回 413 `request_too_large`。
+- 图片按内容签名验证，base64 必须有效并匹配声明格式；不支持 SVG、PDF、音频、普通文件或其他服务的 file_id。未知文件引用返回 `unsupported_image_reference`；不是仅凭 URL 后缀判断图片。
+- detail 接受 auto/low/high/original 以兼容客户端字段，原生接口没有等价预算设置；当前不保证这些值改变图片解析精度或费用。
+- 远程下载不携带调用方密钥或百度 Cookie。DNS 结果全部检查，连接固定到已检查地址；拒绝本机、内网、链路本地及保留地址，最多跟随三次重新检查的重定向。下载超时为 30 秒，下载流同样受单张大小限制。
+- 后端上传实际图片字节，完成上游安全检查与会话关联后才发送对话；不会把 URL 或 base64 拼成普通提示词代替图片。相同客户端凭据下缓存云文件 ID 一小时、最多 64 项，每个原生会话仍独立关联。账号或凭据之间不共享文件缓存。
+- 请求中的图片随对话正文保存到 SQLite；store:false 不保存新正文和图片内容，仅保留用量。工具模式若依赖 previous_response_id，应使用 store:true；大量图片会增加数据库体积，可按隐私和容量需求自行重传完整历史并使用 store:false。**store:false 不等于删除上游已接收的图片或会话**，上游保留规则由其服务决定。
+- `invalid_image`、`image_too_large`、`unsafe_image_url` 表示输入、大小或地址不合规；`image_download_failed`、`image_upload_failed` 表示获取/上传/关联失败；`image_rejected` 表示上游安全检查拒绝。不会删除图片后静默降级成纯文本生成。
+
+已用 GLM Flash 真实验证图形颜色和图片中文字，DeepSeek v4.1 Flash 也通过图片识别并结构化回报正确标签与圆形数量；Pi 1.2.0 在 Chat 图片附件及 Responses 工具图片结果两种流程中均完成识图、写文件、执行固定检查。各模型的图片理解效果仍取决于上游，不将一次成功当作全部模型能力保证。
 
 ## 会话隔离
 
 - 无明确标识时每次创建独立会话，不按相同消息正文匹配旧会话。
 - Chat 通过 `x-kuku-session` 续聊；Responses 推荐只用上轮返回的 `previous_response_id`。
-- 上游会话自己持有历史，网关主要发送最新用户输入，不自动重放完整历史。
+- 普通上游续聊发送最新用户输入；新建普通会话发送完整历史，系统/开发指令同时进入自定义指令字段。
+- 工具模式每轮新建原生会话并重放客户端历史，不能用 Chat 会话标识代替历史；Responses 工具历史可保存在 SQLite 并通过 previous ID 恢复。
 - 会话按本地账号、已验证的上游身份和逻辑标识隔离；不同账号使用相同逻辑标识也不会共用上游会话。
 - Responses 续聊固定原账号。冲突指定账号、删除/替换身份、无法确认旧归属等情况会明确拒绝，不悄悄切到其他号。
 - 同一账号会话请求串行，不同账号可并行。新对话仍可按号池状态选择可用账号。
@@ -323,7 +403,7 @@ JSON 请求使用 `Content-Type: application/json`。`OPTIONS` 预检返回 204�
 
 列表行含 `id,created_at,source,model,account,session_key,session_id,status,content_stored,prompt_tokens,completion_tokens,total_tokens,consume_points,usage_scope,duration_ms`，不含正文。
 
-`GET /pool/admin/conversations/:id` 返回 `{ok:true,data}`，详情另含 `reply_id,think_mode,messages,output_text,reasoning_text,reasoning_tokens,cache_read_tokens,model_call_count,usage_events,error_code`。未知积分或内容可能为 null，`content_stored` 为 0/1。`usage_scope` 为 `single_model_call,last_model_call,reported,unknown`。
+`GET /pool/admin/conversations/:id` 返回 `{ok:true,data}`，详情另含 `reply_id,think_mode,messages,output_text,reasoning_text,reasoning_tokens,cache_read_tokens,model_call_count,usage_events,error_code`。未知积分或内容可能为 null，`content_stored` 为 0/1。`usage_scope` 为 `single_model_call,last_model_call,all_model_calls,reported,unknown`；all_model_calls 表示原生工具轮中已观察到的调用合计，last_model_call 仍表示旧文本链路只统计末次调用。含工具调用的 `output_text` 保存 `{content,tool_calls}` 的 JSON 文本。
 
 这里的 `turn-*` ID 是归档记录 ID，不能作为 `previous_response_id`。客户端断开可能记录 cancelled，不保证上游不计费。`store:false` 不保存正文/思考；删除或清理正文不删除累计统计。
 
@@ -374,15 +454,16 @@ v1.0.0 起，新安装的日志默认保留 7 天，对话默认长期保留。�
 
 | HTTP | 典型情况 |
 |---|---|
-| 400 | 参数、模型、档位或游标错误；`unsupported_tools`、`unsupported_content_type`、`unsupported_input_type`、`invalid_message_content`、`invalid_tools` 表示文本桥接能力或消息结构不符合要求 |
+| 400 | 参数、模型、档位或游标错误；工具相关包括 `unsupported_tools`、`unsupported_tool_format`、`invalid_tools`、`invalid_tool_schema`、`invalid_agent_request`、`invalid_tool_history`、`agent_context_too_large`、`agent_history_unavailable`；图片相关包括 `invalid_image`、`image_too_large`、`unsafe_image_url`、`unsupported_image_reference`、`image_rejected` |
 | 401 | 管理员令牌或普通 API 密钥不正确 |
 | 402 | 全池积分不足，`insufficient_balance` |
 | 404 | 账号、记录、会话或路由不存在 |
 | 409 | 账号不可用、重复账号、续聊归属冲突或操作冲突 |
+| 413 | `request_too_large`，JSON 请求体超过 32 MiB |
 | 422 | `upstream_requires_client`，上游等待电脑客户端工具或输入 |
 | 429 | 短信发送冷却或次数上限 |
 | 500 | 服务或持久化异常 |
-| 502 | 上游失败、响应不完整或身份无法核实 |
+| 502 | 上游失败、响应不完整或身份无法核实；工具模式 `invalid_tool_response` 表示输出校验失败，`upstream_requires_client` 表示请求了不可用的原生桌面工具或输入；图片相关为 `image_download_failed`、`image_upload_failed` |
 | 504 | `upstream_timeout`，上游未在等待上限内完成 |
 
 流已经开始时不能再修改 HTTP 状态，应读取错误事件。短信业务拒绝、逐账号体检及积分领取可在 HTTP 200 中返回业务失败，必须检查其状态/账号结果。上游请求已经发送但结果不确定时，不自动换号重发，避免重复扣分。

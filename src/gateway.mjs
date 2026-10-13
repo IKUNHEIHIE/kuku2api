@@ -1,5 +1,8 @@
 import { KukuAccount, UpstreamError } from './upstream.mjs';
-import { normalizeChatMessages } from './messages.mjs';
+import { normalizeChatMessages, callerInstructions, visibleContent, visibleMessages } from './messages.mjs';
+import { prepareImages } from './images.mjs';
+import { agentMessages } from './agent.mjs';
+import { nativeAgentTurn } from './native-agent.mjs';
 
 export function frameToDelta(frame) {
   const d = frame?.data;
@@ -101,9 +104,8 @@ export class Pool {
     this.logger = logger;
     this.cooldownMs = cooldownMs;
     this.authCooldownMs = authCooldownMs;
-    // Measured: a freshly minted STOKEN can answer 11002 for a few minutes and then serve fine
-    // (07:47 read 0 points, 07:49 turn refused, 07:57 the same credential had 648.86 and cost
-    // 0.17). So "out of points" retries on a window instead of latching until someone resets it.
+    // Newly issued credentials may temporarily report 11002 before their balance is ready.
+    // Retry "out of points" after a window instead of latching until manually reset.
     this.balanceRetryMs = balanceRetryMs;
     this.queues = new Map();
     this.sessions = new Map();
@@ -455,7 +457,7 @@ export class Pool {
   }
 
   async chat(args, onDelta = () => {}, signal) {
-    args = { ...args, messages: normalizeChatMessages(args.messages) };
+    args = { ...args, messages: args.agent ? agentMessages(args.messages) : normalizeChatMessages(args.messages) };
     const logicalKey = deriveSessionKey({ sessionKey: args.sessionKey, messages: args.messages, accountId: args.account.id });
     args = { ...args, sessionKey: logicalKey };
     // Every entry point (Chat, Responses, reward earning) shares this account-scoped queue.
@@ -474,7 +476,8 @@ export class Pool {
           session_key: deriveSessionKey({ sessionKey: args.sessionKey, messages: args.messages, accountId: args.account.id }),
           think_mode: args.think_mode, source: args.source ?? 'chat', store: args.store,
           created_at: started, duration_ms: Date.now() - started, status: error ? 'failed' : result?.cancelled ? 'cancelled' : 'completed',
-          error_code: error?.code, result: result ?? observation });
+          error_code: error?.code, result: result?.tool_calls?.length
+            ? { ...result, content: JSON.stringify({ content: result.content, tool_calls: result.tool_calls }) } : result ?? observation });
       } catch {
         const failure = new Error('Database could not persist the inference record');
         failure.persistence = true; // Never spend another account's points retrying a disk failure.
@@ -490,17 +493,21 @@ export class Pool {
     return result;
   }
 
-  async _chat({ account, model, messages, sessionKey, think_mode, requiredSessionId }, onDelta = () => {}, signal, observation = { usage_events: [] }) {
+  async _chat({ account, model, messages, sessionKey, think_mode, requiredSessionId, agent, instructions }, onDelta = () => {}, signal, observation = { usage_events: [] }) {
     if (signal?.aborted) return { content: '', reasoning: '', usage: null, consume_points: null, usage_events: [], cancelled: true };
     const current = this.accounts.find(a => a.id === account.id);
     if (!current || current.upstream_user_id !== account.upstream_user_id) {
       throw sessionError('排队期间账号已删除或更换身份，请新建对话', 'session_account_mismatch');
     }
     account = current;
+    const accountId = account.id, upstreamUserId = account.upstream_user_id;
     // A cold index (startup fetch failed) would send model_name=undefined and let upstream
     // silently pick its own default, ignoring the caller's model choice.
     if (!MODEL_INDEX.has(model.id)) await this.refreshModelIndex(account);
     const cfg = MODEL_INDEX.get(model.id) ?? { model_name: model.id, display_name: model.id };
+    if (agent) return nativeAgentTurn({ client: account.client, model: cfg, agent,
+      think_mode: think_mode ?? cfg.think_mode ?? lastCatalog?.default_think_id ?? 3, observation, signal,
+      ownsAccount: () => this.accounts.some(a => a.id === accountId && a.upstream_user_id === upstreamUserId) });
     const logicalKey = deriveSessionKey({ sessionKey, messages, accountId: account.id });
     const key = accountSessionKey(account.id, logicalKey);
     let s = this.sessions.get(key);
@@ -548,9 +555,16 @@ export class Pool {
     // Each turn gets its own reply_id; reusing one across turns rewrites the previous answer.
     const reply_id = (await account.client.allocateIds('genfp', 3, { signal })).query_id;
     Object.assign(observation, { session_id: s.session_id, reply_id });
-    // The upstream session already holds history; only the newest user turn goes on the wire.
-    // Re-sending the whole transcript re-bloats a ~30k system prompt and doubles point burn.
-    const text = messages.findLast((m) => m.role === 'user').content;
+    // Explicit native sessions already hold history. Fresh/stateless calls need the complete
+    // caller transcript. Agent rounds always use fresh sessions to avoid replaying tool effects.
+    const attachments = await prepareImages(s.turn === 0 ? messages : [messages.findLast(m => m.role === 'user')], account.client, s.session_id, signal,
+      () => this.accounts.some(a => a.id === accountId && a.upstream_user_id === upstreamUserId));
+    const text = ((s.turn === 0 && messages.length > 1)
+      ? `Answer the latest user message using this complete conversation and its system/developer instructions. Do not assume files exist on this computer.\nCONVERSATION_JSON: ${JSON.stringify(visibleMessages(messages))}`
+      : visibleContent(messages.findLast((m) => m.role === 'user').content))
+      + (attachments.length ? `\nATTACHED_IMAGES: ${JSON.stringify(attachments.map(({reference,name}) => ({reference,name})))}` : '');
+    const customInstructions = callerInstructions(messages, instructions);
+    const context = customInstructions ? { custom_instructions: customInstructions } : {};
     const beforeSend = this.accounts.find(a => a.id === account.id);
     if (!beforeSend || beforeSend.upstream_user_id !== account.upstream_user_id) {
       throw sessionError('请求处理期间账号已删除或更换身份，请新建对话', 'session_account_mismatch');
@@ -565,6 +579,7 @@ export class Pool {
       model_name: cfg.model_name,
       model_display_name: cfg.display_name,
       think_mode: think_mode ?? cfg.think_mode ?? lastCatalog?.default_think_id ?? 3,
+      ...context, attachments,
       signal,
     });
     s.turn += 1;
@@ -586,6 +601,7 @@ export class Pool {
       model_name: cfg.model_name,
       model_display_name: cfg.display_name,
       think_mode: think_mode ?? cfg.think_mode ?? lastCatalog?.default_think_id ?? 3,
+      ...context, attachments,
       ...(lastEventId ? { msg_id: lastEventId } : {}),
       signal,
     })) {

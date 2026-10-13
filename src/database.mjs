@@ -161,7 +161,7 @@ export function openDatabase({ root, file = process.env.DATABASE_FILE || path.jo
         id, timestamp, rec.source ?? 'chat', rec.model ?? '', rec.account ?? '', status,
         count(usage?.prompt_tokens), count(usage?.completion_tokens), count(usage?.total_tokens),
         count(usage?.reasoning_tokens), count(usage?.cache_read_tokens), Number(known),
-        events.length > 1 ? 'last_model_call' : events.length === 1 ? 'single_model_call' : known ? 'reported' : 'unknown',
+        known && result.usage_scope === 'all_model_calls' ? 'all_model_calls' : events.length > 1 ? 'last_model_call' : events.length === 1 ? 'single_model_call' : known ? 'reported' : 'unknown',
         events.length, Number.isFinite(result.consume_points) ? result.consume_points : null,
         count(rec.duration_ms), rec.error_code == null ? null : String(rec.error_code), encode(events),
       );
@@ -255,7 +255,7 @@ export function openDatabase({ root, file = process.env.DATABASE_FILE || path.jo
       if (!group) throw new Error('Invalid statistics group');
       const groups = sql.prepare(`SELECT ${group} AS bucket, ${fields} FROM usage_records${where} GROUP BY ${group} ORDER BY bucket LIMIT 1001`).all(...args);
       return { summary, group_by: groupBy, groups: groups.slice(0, 1000), groups_truncated: groups.length > 1000,
-        token_scope: 'reported_per_attempt; multi-call turns use last MODEL_CALL_END', timezone: 'UTC', historical_coverage: 'legacy Responses only; earlier Chat Completions were not saved' };
+        token_scope: 'reported_per_attempt; native agent turns sum observed MODEL_CALL_END events; other multi-call turns use last MODEL_CALL_END', timezone: 'UTC', historical_coverage: 'legacy Responses only; earlier Chat Completions were not saved' };
     },
     conversations(filters = {}) {
       return page('conversation_turns c LEFT JOIN usage_records u ON c.id=u.id', filters,

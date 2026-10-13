@@ -53,7 +53,7 @@ test('Responses preserves text parts', async t => {
 });
 for (const [name, invoke] of [['Chat', chat], ['Responses', responses]]) {
   for (const patch of [
-    { tools: [{ type: 'function', function: { name: 'read', parameters: {} } }] },
+    { tools: [{ type: 'web_search' }] },
     { tools: [], tool_choice: 'required' },
     { tool_choice: { type: 'function', function: { name: 'read' } } },
     { functions: [{ name: 'read' }], function_call: 'auto' },
@@ -61,22 +61,22 @@ for (const [name, invoke] of [['Chat', chat], ['Responses', responses]]) {
     test(`${name} rejects unsupported tools before any upstream request: ${JSON.stringify(patch)}`, async t => {
       const s = setup(t), result = await invoke(s.app, { ...patch, stream: true });
       assert.equal(result.status, 400);
-      assert.equal(result.json.error.code, 'unsupported_tools');
+      assert(['unsupported_tools', 'invalid_agent_request'].includes(result.json.error.code));
       assert.equal(s.calls.alloc, 0);
       assert.equal(s.calls.send.length, 0);
       assert.equal(s.pool.sessions.size, 0);
       assert(s.pool.accounts.every(a => !a.cooldown_until));
     });
   }
-  test(`${name} accepts empty tools or explicitly disabled definitions`, async t => {
+  test(`${name} accepts empty tools`, async t => {
     const s = setup(t);
-    for (const patch of [{ tools: [], tool_choice: 'auto' }, { tools: [{ type: 'function', function: { name: 'read' } }], tool_choice: 'none' }]) {
+    for (const patch of [{ tools: [], tool_choice: 'auto' }, { tools: [], tool_choice: 'none' }]) {
       assert.equal((await invoke(s.app, patch)).status, 200);
     }
     assert.equal(s.calls.send.length, 2);
   });
 }
-for (const content of [null, {}, [{ type: 'text', text: {} }], [{ type: 'text', text: 'valid' }, { type: 'image_url', image_url: { url: 'https://example.invalid/a.png' } }], [{ type: 'file', file: {} }], []]) {
+for (const content of [null, {}, [{ type: 'text', text: {} }], [{ type: 'text', text: 'valid' }, { type: 'image_url', image_url: { url: 'file:///private.png' } }], [{ type: 'file', file: {} }], []]) {
   test(`Chat rejects malformed or non-text content without dropping parts: ${JSON.stringify(content)}`, async t => {
     const s = setup(t), result = await chat(s.app, { messages: [{ role: 'user', content }] });
     assert.equal(result.status, 400);
@@ -84,17 +84,17 @@ for (const content of [null, {}, [{ type: 'text', text: {} }], [{ type: 'text', 
     assert.equal(s.calls.send.length, 0);
   });
 }
-test('Chat rejects tool history instead of resending an earlier user turn', async t => {
+test('Chat rejects unmatched tool history instead of resending an earlier user turn', async t => {
   const s = setup(t), result = await chat(s.app, { messages: [
     { role: 'user', content: 'earlier' }, { role: 'assistant', content: null, tool_calls: [{ id: 'call1', type: 'function', function: { name: 'read', arguments: '{}' } }] },
-    { role: 'tool', tool_call_id: 'call1', content: 'file content' },
+    { role: 'tool', tool_call_id: 'unknown', content: 'file content' },
   ] });
-  assert.equal(result.json.error.code, 'unsupported_tools');
+  assert.equal(result.json.error.code, 'invalid_tool_history');
   assert.equal(s.calls.alloc, 0);
 });
 for (const input of [
   [{ role: 'user', content: 'read a file' }, { type: 'function_call_output', call_id: 'call1', output: 'file content' }],
-  [{ role: 'user', content: [{ type: 'input_text', text: 'valid' }, { type: 'input_image', image_url: 'https://example.invalid/a.png' }] }],
+  [{ role: 'user', content: [{ type: 'input_text', text: 'valid' }, { type: 'input_image', image_url: 'file:///private.png' }] }],
 ]) {
   test('Responses rejects unsupported input instead of silently deleting parts', async t => {
     const s = setup(t), result = await responses(s.app, { input, stream: true });

@@ -228,6 +228,18 @@ test('multi-call usage keeps raw events and explicitly counts only the final rep
   assert.equal(record.usage_scope, 'last_model_call');
 });
 
+test('native agent aggregated usage remains distinct from partial legacy usage', t => {
+  const database = memory(t);
+  database.recordTurn({ model: 'native-agent', account: 'one', store: false, result: {
+    usage: { prompt_tokens: 50, completion_tokens: 7, total_tokens: 57 }, usage_scope: 'all_model_calls',
+    usage_events: [{ prompt_tokens: 20, completion_tokens: 3, total_tokens: 23 }, { prompt_tokens: 30, completion_tokens: 4, total_tokens: 34 }],
+  } });
+  const stats = database.tokenStats(), row = database.conversation(database.conversations().data[0].id);
+  assert.equal(stats.summary.total_tokens, 57); assert.equal(stats.summary.partial_usage_attempts, 0);
+  assert.equal(row.usage_scope, 'all_model_calls'); assert.equal(row.model_call_count, 2);
+  assert.equal(row.messages, null);
+});
+
 test('SQL Responses paging filters private turns and resolves stable cursors', (t) => {
   const database = memory(t);
   database.ledger.put({ id: 'one', session_key: 'a' });

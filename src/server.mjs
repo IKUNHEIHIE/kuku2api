@@ -17,7 +17,8 @@ import { createStaticUi } from './static-ui.mjs';
 import { listenPort, listenHost } from './listen-port.mjs';
 import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
-import { normalizeChatMessages, validateTextOnlyTools } from './messages.mjs';
+import { normalizeChatMessages } from './messages.mjs';
+import { prepareAgent, assistantHistory } from './agent.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -81,8 +82,8 @@ function rejectThinkMode(res) {
 }
 
 async function readBody(req) {
-  const chunks = [];
-  for await (const c of req) chunks.push(c);
+  const chunks = []; let size = 0;
+  for await (const c of req) { size += c.length; if (size > 32 * 1024 * 1024) throw Object.assign(new Error('JSON body exceeds 32 MiB'), { status: 413, code: 'request_too_large' }); chunks.push(c); }
   const raw = Buffer.concat(chunks).toString('utf8');
   return raw ? JSON.parse(raw) : {};
 }
@@ -112,7 +113,7 @@ function failureResponse(err) {
   }
   const status = Number(err?.status);
   return { status: Number.isInteger(status) && status >= 400 && status <= 599 ? status : (err instanceof UpstreamError || err?.network ? 502 : 500),
-    code: ['upstream_timeout', 'upstream_incomplete', 'upstream_requires_client', 'session_account_mismatch', 'session_history_unavailable'].includes(err?.code) ? err.code : undefined };
+    code: ['upstream_timeout', 'upstream_incomplete', 'upstream_requires_client', 'invalid_tool_response', 'session_account_mismatch', 'session_history_unavailable', 'invalid_image', 'unsafe_image_url', 'image_too_large', 'image_download_failed', 'image_upload_failed', 'image_rejected'].includes(err?.code) ? err.code : undefined };
 }
 
 // reqBody.kuku_meta adds a final non-standard `data: {"kuku":{...}}` frame so a console UI
@@ -123,8 +124,8 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
   if (unknownModelId(model)) return rejectUnknownModel(res, model);
   const think = resolveThink(reqBody);
   if (Number.isNaN(think) || unknownThinkMode(think)) return rejectThinkMode(res);
-  let messages;
-  try { validateTextOnlyTools(reqBody); messages = normalizeChatMessages(reqBody.messages); }
+  let messages, agent;
+  try { agent = prepareAgent(reqBody, 'chat'); messages = agent?.messages ?? normalizeChatMessages(reqBody.messages); }
   catch (error) { return openError(res, 400, error.message, 'invalid_request_error', error.code); }
   const stream = reqBody.stream === true;
 
@@ -174,7 +175,7 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
     tried.push(acct.id);
     try {
       const r = await pool.chat(
-        { account: acct, model: { id: model }, messages, sessionKey: req.headers['x-kuku-session'], think_mode: think, source: 'chat', store: reqBody.store },
+        { account: acct, model: { id: model }, messages, agent, sessionKey: agent ? `agent:${crypto.randomUUID()}` : req.headers['x-kuku-session'], think_mode: think, source: 'chat', store: reqBody.store },
         (delta) => {
           if (!stream || controller.signal.aborted) return;
           openStream(acct);
@@ -187,6 +188,13 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
       usage = r.usage;
       consume = r.consume_points;
       turn = r;
+      if (stream && agent && !controller.signal.aborted) {
+        openStream(acct);
+        if (r.reasoning) res.write(sseChunk(makeChunk(id, created, model, { reasoning_content: r.reasoning })));
+        if (r.content) res.write(sseChunk(makeChunk(id, created, model, { content: r.content })));
+        if (r.tool_calls?.length) res.write(sseChunk(makeChunk(id, created, model, { tool_calls: r.tool_calls.map((call, index) => ({ index, ...call })) })));
+        sentAny = true;
+      }
       served = acct;
       lastErr = null;
       if (stream && !controller.signal.aborted) openStream(acct); // an empty completed turn still needs SSE
@@ -215,12 +223,13 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
       res.write(sseChunk({ error: { message: redact(lastErr.message), type: 'upstream_error', code: failureResponse(lastErr).code ?? null } }));
       return res.end('data: [DONE]\n\n');
     }
-    res.write(sseChunk(makeChunk(id, created, model, {}, 'stop')));
+    res.write(sseChunk(makeChunk(id, created, model, {}, turn?.finish_reason ?? 'stop')));
     if (reqBody.stream_options?.include_usage) {
       res.write(sseChunk({ ...makeChunk(id, created, model, {}), usage: openAiUsage(usage, content) }));
     }
     if (reqBody.kuku_meta) {
-      res.write(sseChunk({ kuku: { account: served.id, consume_points: consume, session_id: turn?.session_id ?? null, reply_id: turn?.reply_id ?? null } }));
+      res.write(sseChunk({ kuku: { account: served.id, consume_points: consume, session_id: turn?.session_id ?? null, reply_id: turn?.reply_id ?? null,
+        ...(agent ? { tool_adapter: 'native-mcp' } : {}) } }));
     }
     return res.end('data: [DONE]\n\n');
   }
@@ -230,13 +239,15 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
     object: 'chat.completion',
     created,
     model,
-    choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+    choices: [{ index: 0, message: { role: 'assistant', content: turn?.tool_calls?.length && !content ? null : content,
+      ...(turn?.tool_calls?.length ? { tool_calls: turn.tool_calls } : {}) }, finish_reason: turn?.finish_reason ?? 'stop' }],
     usage: openAiUsage(usage, content),
     kuku: {
       account: served.id,
       consume_points: consume,
       session_id: turn?.session_id ?? null,
       reply_id: turn?.reply_id ?? null,
+      ...(agent ? { tool_adapter: 'native-mcp' } : {}),
     },
   });
 }
@@ -248,17 +259,16 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
   if (unknownModelId(model)) return rejectUnknownModel(res, model);
   const think = resolveThink(body);
   if (Number.isNaN(think) || unknownThinkMode(think)) return rejectThinkMode(res);
-  let messages;
-  try { validateTextOnlyTools(body); messages = normalizeInput(body.input); }
-  catch (error) { return openError(res, 400, error.message, 'invalid_request_error', error.code); }
-  if (!messages.length) return openError(res, 400, 'input must be a non-empty string or item array');
-
   const prevId = body.previous_response_id ?? null;
   let prev = null;
   if (prevId) {
     prev = ledger?.get(prevId) ?? null;
     if (!prev) return openError(res, 404, `previous_response_id not found: ${prevId}`, 'invalid_request_error');
   }
+  let messages, agent;
+  try { agent = prepareAgent(body, 'responses', prev); messages = agent?.messages ?? normalizeInput(body.input); }
+  catch (error) { return openError(res, error.status ?? 400, error.message, 'invalid_request_error', error.code); }
+  if (!messages.length) return openError(res, 400, 'input must be a non-empty string or item array');
 
   const wanted = req.headers['x-kuku-account'];
   // Documented as an admin-only probe switch: without the admin token it must not let a caller
@@ -274,6 +284,9 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
         return openError(res, 409, '续聊不能切换到其他账号，请新建对话', 'pool_error', 'response_account_mismatch');
       }
       acct = pool.resolve(prev.account, { allowUnavailable });
+      if (prev.agent_bridge && acct.upstream_user_id !== prev.upstream_user_id) {
+        return openError(res, 409, 'Agent 历史所属账号身份已变化，请新建对话', 'pool_error', 'session_account_mismatch');
+      }
     } else acct = pool.resolve(wanted, { allowUnavailable });
   } catch (e) {
     return openError(res, e.status ?? 409, redact(e.message), 'pool_error', prev ? 'response_account_unavailable' : failureResponse(e).code);
@@ -283,7 +296,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
   const controller = new AbortController();
   res.once?.('close', () => { if (!res.writableFinished) controller.abort(); });
   const created = Math.floor(Date.now() / 1000);
-  const sessionKey = prev?.session_key ?? deriveSessionKey({ sessionKey: req.headers['x-kuku-session'], messages, accountId: acct.id });
+  const sessionKey = agent ? `agent:${crypto.randomUUID()}` : prev?.session_key ?? deriveSessionKey({ sessionKey: req.headers['x-kuku-session'], messages, accountId: acct.id });
   const stream = body.stream === true;
   const skeleton = buildResponse({
     id,
@@ -316,7 +329,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
     tried.push(acct.id);
     try {
       turn = await pool.chat(
-          { account: acct, model: { id: model }, messages, sessionKey, requiredSessionId: prev?.session_id, think_mode: think, source: 'responses', store: body.store },
+          { account: acct, model: { id: model }, messages, agent, instructions: body.instructions, sessionKey, requiredSessionId: agent ? undefined : prev?.session_id, think_mode: think, source: 'responses', store: body.store },
           sc ? (delta) => {
             if (controller.signal.aborted) return;
             if (delta.reasoning_content) {
@@ -360,7 +373,8 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
         error: { message: redact(lastErr.message), code: f.code ?? 'upstream_error' } });
       failed.kuku.account = acct.id;
       ledger?.put({ id, session_key: sessionKey, session_id: observed.session_id ?? null, model, account: acct.id,
-        created_at: created, output_text: sc.text, response: failed });
+        created_at: created, output_text: sc.text, response: failed,
+        ...(agent ? { agent_bridge: true, upstream_user_id: acct.upstream_user_id } : {}) });
       return sc.failed(redact(lastErr.message), failed);
     }
     return openError(res, f.status, redact(lastErr.message), 'upstream_error', f.code);
@@ -382,8 +396,15 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
     session_id: turn?.session_id ?? null,
     reply_id: turn?.reply_id ?? null,
     account: acct.id,
+    tool_calls: turn?.tool_calls,
   });
   final.kuku.account = acct.id;
+  if (agent) {
+    final.tools = body.tools ?? [];
+    final.tool_choice = body.tool_choice ?? 'auto';
+    final.parallel_tool_calls = body.parallel_tool_calls !== false;
+    final.kuku.tool_adapter = 'native-mcp';
+  }
 
   ledger?.put({
     id,
@@ -395,9 +416,11 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
     output_text: text,
     // GET /v1/responses/:id must hand back a Response object, not the internal record.
     response: final,
+    ...(agent ? { agent_bridge: true, upstream_user_id: acct.upstream_user_id,
+      agent_context: { messages: [...agent.messages, assistantHistory(turn)] } } : {}),
   });
 
-  if (sc) return sc.completed(final);
+  if (sc) return agent ? sc.completedAgent(final) : sc.completed(final);
   json(res, 200, final);
 }
 
@@ -672,8 +695,8 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
       let body;
       try {
         body = await readBody(req);
-      } catch {
-        return openError(res, 400, 'invalid json body');
+      } catch (error) {
+        return openError(res, error.status ?? 400, error.code === 'request_too_large' ? error.message : 'invalid json body', 'invalid_request_error', error.code);
       }
       return handleResponses(pool, req, res, body, ledger, { admin: admined(req) });
     }
@@ -729,8 +752,8 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
       let body;
       try {
         body = await readBody(req);
-      } catch {
-        return openError(res, 400, 'invalid json body');
+      } catch (error) {
+        return openError(res, error.status ?? 400, error.code === 'request_too_large' ? error.message : 'invalid json body', 'invalid_request_error', error.code);
       }
       return handleChat(pool, req, res, body, { admin: admined(req) });
     }

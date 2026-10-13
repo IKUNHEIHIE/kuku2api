@@ -6,10 +6,10 @@ import assert from 'node:assert/strict';
 
 const BASE = 'http://127.0.0.1';
 const profileIdentities = new Map();
-// Upstream item shape, measured verbatim from the real account's list (titles here are fake).
+// Synthetic session items preserve the upstream response shape; identifiers, titles and times are fake.
 function sessionItem(id, i) {
   return {
-    ctime: 1791116000 + i, mtime: 1791116800 + i, is_read: i % 2, session_type: 1, status: 3,
+    ctime: 1700000000 + i, mtime: 1700000800 + i, is_read: i % 2, session_type: 1, status: 3,
     session_id: id, title: `stub conversation ${i}`, download_list: i === 0 ? [{ data_url: 'https://example.invalid/f', message_id: 'm1' }] : [],
   };
 }
@@ -52,14 +52,14 @@ const MODE_DEFAULT = {
   freePointTasks: null,
   claimRefuse: false,
   claimReward: 50,
-  // Measured on the user's main account: a proxied conversation does not always make daily_chat
+  // A proxied conversation does not always make daily_chat
   // claimable. Without this leg the earn step looked infallible.
   freePointChatNeverCounts: false,
   freePointChatReportRefuse: false,
 };
 const mode = { ...MODE_DEFAULT };
 
-// Verbatim from the measured getgfvipremain response: four buckets, `token` is fractional,
+// Synthetic getgfvipremain fixture: four buckets, `token` is fractional,
 // and only `token` is what inference actually drains.
 const VIP_REMAIN = {
   isVip: false,
@@ -69,8 +69,8 @@ const VIP_REMAIN = {
   vipEndTime: '0',
   busAllLeftPoint: '',
   list: [
-    { assetType: 1, assetName: 'token', totalPoint: '2567.39', bonusPoint: '2567.39', vipPoint: '0', chargePoint: '0', freezePoint: '0' },
-    { assetType: 2, assetName: 'duration', totalPoint: '7200', bonusPoint: '0', vipPoint: '0', chargePoint: '0', freezePoint: '0' },
+    { assetType: 1, assetName: 'token', totalPoint: '123.45', bonusPoint: '123.45', vipPoint: '0', chargePoint: '0', freezePoint: '0' },
+    { assetType: 2, assetName: 'duration', totalPoint: '6000', bonusPoint: '0', vipPoint: '0', chargePoint: '0', freezePoint: '0' },
     { assetType: 3, assetName: 'scheduled_task', totalPoint: '2', bonusPoint: '0', vipPoint: '0', chargePoint: '0', freezePoint: '0' },
     { assetType: 4, assetName: 'realtime_t', totalPoint: '0', bonusPoint: '0', vipPoint: '0', chargePoint: '0', freezePoint: '0' },
   ],
@@ -103,45 +103,45 @@ function sseFrames(res, body) {
   const sid = body.session_id;
   const f = (id, obj) => res.write(`id: ${id}\ndata: ${JSON.stringify(obj)}\n\n`);
   if (mode.sseDrained) {
-    // Verbatim from a real drained account: no text frames at all, just the commercial notice
+    // Synthetic drained-account sequence: no text frames, just the commercial notice
     // pair and TURN_DONE. Returning an empty 200 here is the bug this suite now guards.
-    f('1791157794990-0', { type: 'USER_QUERY', msg_id: 'm1', data: { client_added: '{}' } });
-    f('1791157794991-0', {
+    f('1700000001000-0', { type: 'USER_QUERY', msg_id: 'm1', data: { client_added: '{}' } });
+    f('1700000001001-0', {
       type: 'COMMERCIAL_NOTICE', msg_id: 'm1', data_from: 'commercial',
       data: { reason: 'insufficient_balance', reply_id: rid, session_id: sid, text: '积分不足，无法继续任务。' },
     });
-    f('1791157794993-0', {
+    f('1700000001003-0', {
       type: 'COMMERCIAL', msg_id: 'm1', data_from: 'commercial',
       data: { errno: 11002, reason: 'insufficient_balance', reply_id: rid, session_id: sid, uk: 'fixture-upstream-user' },
     });
-    f('1791157794994-0', { type: 'TURN_DONE', data: { reply_id: rid, session_id: sid } });
+    f('1700000001004-0', { type: 'TURN_DONE', data: { reply_id: rid, session_id: sid } });
     res.write('data: [DONE]\n\n');
     return res.end();
   }
-  f('1791080803013-0', { type: 'USER_QUERY', msg_id: 'm1', data: { client_added: '{}' } });
-  f('1791080803013-1', { type: 'REPLY_START', data: { reply_id: rid, session_id: sid } });
-  f('1791080803013-2', {
+  f('1700000000000-0', { type: 'USER_QUERY', msg_id: 'm1', data: { client_added: '{}' } });
+  f('1700000000000-1', { type: 'REPLY_START', data: { reply_id: rid, session_id: sid } });
+  f('1700000000000-2', {
     type: 'HINT_BLOCK',
     data: { block_id: 'b0', hint: '<system-reminder>\n<workspace-root>/app/workspace/SECRETPATH/sessions/1</workspace-root>\n</system-reminder>', reply_id: rid },
   });
-  f('1791080803013-3', { type: 'THINKING_BLOCK_DELTA', data: { delta: 'thinking…', reply_id: rid } });
-  f('1791080803013-4', { type: 'TEXT_BLOCK_START', data: { block_id: 'b1', reply_id: rid } });
+  f('1700000000000-3', { type: 'THINKING_BLOCK_DELTA', data: { delta: 'thinking…', reply_id: rid } });
+  f('1700000000000-4', { type: 'TEXT_BLOCK_START', data: { block_id: 'b1', reply_id: rid } });
   if (!mode.dropContent) {
-    f('1791080803013-5', { type: 'TEXT_BLOCK_DELTA', data: { block_id: 'b1', delta: 'he', reply_id: rid } });
-    f('1791080803013-6', { type: 'TEXT_BLOCK_DELTA', data: { block_id: 'b1', delta: 'llo', reply_id: rid } });
+    f('1700000000000-5', { type: 'TEXT_BLOCK_DELTA', data: { block_id: 'b1', delta: 'he', reply_id: rid } });
+    f('1700000000000-6', { type: 'TEXT_BLOCK_DELTA', data: { block_id: 'b1', delta: 'llo', reply_id: rid } });
   }
-  f('1791080803013-7', { type: 'TEXT_BLOCK_END', data: { block_id: 'b1', reply_id: rid } });
-  f('1791080803013-8', {
+  f('1700000000000-7', { type: 'TEXT_BLOCK_END', data: { block_id: 'b1', reply_id: rid } });
+  f('1700000000000-8', {
     type: 'MODEL_CALL_END',
     data: {
-      reply_id: rid, model_name: body.model_name, input_tokens: 30102, output_tokens: 9,
-      reasoning_tokens: 4, cache_read_tokens: 29824, cache_input_tokens: 29824, cache_write_tokens: 0,
+      reply_id: rid, model_name: body.model_name, input_tokens: 3210, output_tokens: 9,
+      reasoning_tokens: 4, cache_read_tokens: 3000, cache_input_tokens: 3000, cache_write_tokens: 0,
       cache_creation_input_tokens: 0, finish_reasons: ['stop'], finished_reason: 'completed',
       completion_status: 'ok', usage_status: 'reported',
     },
   });
-  f('1791080803013-9', { type: 'ACTUAL_POINT', data: { consume_points: 0.01, reply_id: rid, session_id: sid } });
-  f('1791080803013-10', { type: 'TURN_DONE', data: { reply_id: rid, session_id: sid } });
+  f('1700000000000-9', { type: 'ACTUAL_POINT', data: { consume_points: 0.01, reply_id: rid, session_id: sid } });
+  f('1700000000000-10', { type: 'TURN_DONE', data: { reply_id: rid, session_id: sid } });
   res.write('data: [DONE]\n\n');
   res.end();
 }
@@ -303,7 +303,7 @@ const stub = createServer(async (req, res) => {
     // Measured: this family answers with `errno` and no `status` block at all.
     if (mode.sessionLoginRequired) {
       res.writeHead(200, { 'content-type': 'application/json; charset=UTF-8' });
-      return res.end(JSON.stringify({ data: {}, errno: -6, newno: '', request_id: 1, server_time: 1791116830, show_msg: '未登录' }));
+      return res.end(JSON.stringify({ data: {}, errno: -6, newno: '', request_id: 1, server_time: 1700000830, show_msg: '未登录' }));
     }
     const offset = body?.offset ?? 0;
     const size = body?.size ?? 20;
@@ -311,7 +311,7 @@ const stub = createServer(async (req, res) => {
     res.writeHead(200, { 'content-type': 'application/json; charset=UTF-8' });
     return res.end(JSON.stringify({
       data: { list: all.slice(offset, offset + size), total: all.length, offset, size },
-      errno: 0, newno: '', request_id: 2, server_time: 1791116830, show_msg: '',
+      errno: 0, newno: '', request_id: 2, server_time: 1700000830, show_msg: '',
     }));
   }
   // ---- passport stub (login-to-add-account) ----
@@ -493,15 +493,15 @@ async function callChat(p, body, headers = {}) {
 
 console.log('\n== SSE frame parsing ==');
 await t('data/event/id captured', () => {
-  const f = parseSseBlock('event: foo\nid: 1791080803013-7\ndata: {"type":"X","a":1}');
+  const f = parseSseBlock('event: foo\nid: 1700000000000-7\ndata: {"type":"X","a":1}');
   assert.equal(f.event, 'foo');
-  assert.equal(f.id, '1791080803013-7');
+  assert.equal(f.id, '1700000000000-7');
   assert.equal(f.data.type, 'X');
 });
 await t('[DONE] becomes event done', () => assert.equal(parseSseBlock('data: [DONE]').event, 'done'));
 await t('garbage data line yields null, not a throw', () => assert.equal(parseSseBlock('data: ~~~'), null));
 await t('cmpFrameId orders across digit counts', () => {
-  assert.ok(cmpFrameId('1791080803013-9', '1791080803013-10') < 0);
+  assert.ok(cmpFrameId('1700000000000-9', '1700000000000-10') < 0);
   assert.ok(cmpFrameId('999-0', '1000-0') < 0);
 });
 
@@ -516,14 +516,14 @@ await t('HINT_BLOCK yields nothing (internal system-reminder must stay internal)
   assert.equal(frameToDelta({ data: { type: 'HINT_BLOCK', data: { hint: '<system-reminder>SECRET</system-reminder>' } } }), null);
 });
 await t('MODEL_CALL_END -> real usage, not an estimate', () => {
-  const d = frameToDelta({ data: { type: 'MODEL_CALL_END', data: { input_tokens: 30102, output_tokens: 9, reasoning_tokens: 4, cache_read_tokens: 29824, finished_reason: 'completed', finish_reasons: ['stop'] } } });
-  assert.equal(d.usage.prompt_tokens, 30102);
+  const d = frameToDelta({ data: { type: 'MODEL_CALL_END', data: { input_tokens: 3210, output_tokens: 9, reasoning_tokens: 4, cache_read_tokens: 3000, finished_reason: 'completed', finish_reasons: ['stop'] } } });
+  assert.equal(d.usage.prompt_tokens, 3210);
   assert.equal(d.usage.completion_tokens, 9);
-  assert.equal(d.usage.total_tokens, 30111);
+  assert.equal(d.usage.total_tokens, 3219);
   assert.equal(d.usage.reasoning_tokens, 4);
   assert.equal(d.finish_reason, 'stop');
 });
-await t('ACTUAL_POINT -> consume_points', () => assert.equal(frameToDelta({ data: { type: 'ACTUAL_POINT', data: { consume_points: 0.96 } } }).consume_points, 0.96));
+await t('ACTUAL_POINT -> consume_points', () => assert.equal(frameToDelta({ data: { type: 'ACTUAL_POINT', data: { consume_points: 0.25 } } }).consume_points, 0.25));
 await t('COMMERCIAL_NOTICE/COMMERCIAL -> commercial, never a silent empty turn', () => {
   const notice = frameToDelta({ data: { type: 'COMMERCIAL_NOTICE', data: { reason: 'insufficient_balance', text: '积分不足，无法继续任务。' } } });
   assert.equal(notice.commercial.reason, 'insufficient_balance');
@@ -601,13 +601,22 @@ await t('http 400 is a client param error, network fault is not', () => {
 });
 
 console.log('\n== session state ==');
-await t('only the newest user turn goes on the wire', async () => {
+await t('fresh stateless conversations carry complete user and assistant history', async () => {
   const p = mkPool(1);
   let out = '';
   await p.chat({ account: p.pick(), model: { id: 'gateway-glm-5.3-flash' }, messages: [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'r1' }, { role: 'user', content: 'second' }] }, (d) => (out += d.content ?? ''));
-  assert.equal(seen.sendBodies[0].data.text, 'second');
-  assert.ok(!seen.sendBodies[0].data.text.includes('first'));
+  assert.ok(seen.sendBodies[0].data.text.includes('"content":"second"'));
+  assert.ok(seen.sendBodies[0].data.text.includes('"content":"first"'));
+  assert.ok(seen.sendBodies[0].data.text.includes('"role":"assistant","content":"r1"'));
   assert.equal(out, 'hello');
+});
+await t('caller system and developer instructions reach the native instruction field', async () => {
+  const p = mkPool(1);
+  await p.chat({ account: p.pick(), model: { id: 'gateway-glm-5.3-flash' }, messages: [
+    { role: 'system', content: 'Summarize only.' }, { role: 'developer', content: 'Keep the caller working directory.' },
+    { role: 'user', content: 'Summarize this history.' }], instructions: 'Be brief.' });
+  assert.equal(seen.sendBodies[0].data.custom_instructions, 'Summarize only.\n\nKeep the caller working directory.\n\nBe brief.');
+  assert.equal(seen.sseBodies[0].custom_instructions, seen.sendBodies[0].data.custom_instructions);
 });
 await t('session_id stable across turns, reply_id fresh each turn', async () => {
   const p = mkPool(1);
@@ -632,7 +641,7 @@ await t('content-less turn resolves without crashing', async () => {
   const p = mkPool(1);
   const r = await p.chat({ account: p.pick(), model: { id: 'gateway-glm-5.3-flash' }, messages: [{ role: 'user', content: 'x' }] });
   assert.equal(r.content, '');
-  assert.equal(r.usage.prompt_tokens, 30102);
+  assert.equal(r.usage.prompt_tokens, 3210);
 });
 
 console.log('\n== http surface ==');
@@ -644,7 +653,7 @@ await t('non-stream default; content excludes hint and thinking; usage upstream'
   assert.ok(!res.body.includes('system-reminder'));
   assert.ok(!res.body.includes('SECRETPATH'));
   assert.ok(!res.body.includes('thinking'));
-  assert.equal(j.usage.prompt_tokens, 30102);
+  assert.equal(j.usage.prompt_tokens, 3210);
   assert.equal(j.kuku.consume_points, 0.01);
   assert.equal(res.headers['content-type'], 'application/json; charset=utf-8');
 });
@@ -660,7 +669,7 @@ await t('stream emits deltas then stop then [DONE]', async () => {
 await t('stream_options.include_usage adds a usage frame', async () => {
   const p = mkPool(1);
   const res = await callChat(p, { model: 'gateway-glm-5.3-flash', stream: true, stream_options: { include_usage: true }, messages: [{ role: 'user', content: 'hi' }] });
-  assert.ok(/"usage":\{.*"prompt_tokens":30102/.test(res.body));
+  assert.ok(/"usage":\{.*"prompt_tokens":3210/.test(res.body));
 });
 await t('business failure cools the account and retries the next', async () => {
   mode.failSendmsg = 'business';
@@ -752,11 +761,11 @@ await t('GET /pool/points reports the token bucket as the balance, not a sum of 
   assert.equal(j.accounts.length, 1);
   const a = j.accounts[0];
   assert.equal(a.ok, true);
-  assert.equal(a.balance_points, 2567.39, 'assetType 1 (token) is the spendable balance, fractional precision preserved');
-  assert.equal(a.duration_points, 7200, 'duration is a separate quota, not money');
+  assert.equal(a.balance_points, 123.45, 'assetType 1 (token) is the spendable balance, fractional precision preserved');
+  assert.equal(a.duration_points, 6000, 'duration is a separate quota, not money');
   assert.equal(a.assets.length, 4);
   assert.deepEqual(a.assets.map((x) => x.asset_name), ['token', 'duration', 'scheduled_task', 'realtime_t'], 'upstream bucket names pass through');
-  assert.equal(j.total_balance_points, 2567.39, 'pool total must ignore non-token buckets');
+  assert.equal(j.total_balance_points, 123.45, 'pool total must ignore non-token buckets');
 });
 await t('a dead credential on the balance route marks auth_dead without cooling', async () => {
   mode.pointsLoginRequired = true;
@@ -1783,10 +1792,10 @@ await t('non-stream response object carries the contract fields', async () => {
 await t('usage uses Responses naming and carries cache details', async () => {
   const p = mkPool(1);
   const { json: j } = await callResp(p, { model: 'gateway-glm-5.3-flash', input: 'hi' });
-  assert.equal(j.usage.input_tokens, 30102);
+  assert.equal(j.usage.input_tokens, 3210);
   assert.equal(j.usage.output_tokens, 9);
-  assert.equal(j.usage.total_tokens, 30111);
-  assert.equal(j.usage.input_tokens_details.cached_tokens, 29824);
+  assert.equal(j.usage.total_tokens, 3219);
+  assert.equal(j.usage.input_tokens_details.cached_tokens, 3000);
   assert.equal(typeof j.usage.input_tokens_details.cache_write_tokens, 'number');
   assert.equal(j.usage.output_tokens_details.reasoning_tokens, 4);
 });
@@ -1795,7 +1804,7 @@ await t('instructions are echoed back on the response object', async () => {
   const { json: j } = await callResp(p, { model: 'gateway-glm-5.3-flash', input: 'hi', instructions: 'be terse' });
   assert.equal(j.instructions, 'be terse');
 });
-await t('input item array is accepted and the newest user turn is what goes upstream', async () => {
+await t('input item arrays preserve the entire stateless transcript', async () => {
   const p = mkPool(1);
   await callResp(p, {
     model: 'gateway-glm-5.3-flash',
@@ -1805,7 +1814,9 @@ await t('input item array is accepted and the newest user turn is what goes upst
       { role: 'user', content: [{ type: 'input_text', text: 'latest question' }] },
     ],
   });
-  assert.equal(seen.sendBodies[0].data.text, 'latest question');
+  assert.ok(seen.sendBodies[0].data.text.includes('latest question'));
+  assert.ok(seen.sendBodies[0].data.text.includes('earlier'));
+  assert.ok(seen.sendBodies[0].data.text.includes('prior answer'));
 });
 await t('empty input is a 400', async () => {
   const { res } = await callResp(mkPool(1), { model: 'gateway-glm-5.3-flash', input: [] });
@@ -2113,7 +2124,7 @@ await t('stub host is the fake id space, not the real account', () => {
   assert.ok(seen.sendBodies.every((b) => b.data.device_id === 'dev-stub'));
 });
 await t('stub saw only fake credentials, with the genflow UA', () => {
-  assert.ok(seen.cookies.every((c) => !c.includes('gxNjREZlJmU2RQ')), 'real BDUSS must never appear');
+  assert.ok(seen.cookies.every(c => [...c.matchAll(/(?:^|;\s*)BDUSS=([^;]*)/g)].every(([, value]) => /^(?:([A-Za-z])\1{31,191}|STUBBDUSSVALUE-abcdefghijklmnop|SECRETBDUSSVALUE)$/.test(value))), 'only allowlisted synthetic BDUSS values may reach the stub');
   assert.ok(seen.cookies.some((c) => c.includes(FAKE_BDUSS)));
   assert.ok(seen.userAgents.some((u) => u.startsWith('genflow;1.6.5;PC;PC-Windows')));
 });

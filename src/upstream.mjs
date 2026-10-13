@@ -1,3 +1,8 @@
+import { createHash, randomUUID } from 'node:crypto';
+function imageBlocks(files) {
+  return files.map((file,index) => ({ id: `image${index}`, version: '1.0', type: 'file', text: file.name,
+    data: { fsId: String(file.fsId), name: file.name } }));
+}
 function base() {
   return process.env.KUKU_BASE_URL ?? 'https://kuku.baidu.com';
 }
@@ -198,13 +203,13 @@ export class KukuAccount {
     } });
   }
 
-  sendmsg({ session_id, reply_id, client_session_id, device_id, text, model_name, model_display_name, think_mode, project_type = 1, signal }) {
+  sendmsg({ session_id, reply_id, client_session_id, device_id, text, model_name, model_display_name, think_mode, project_type = 1, custom_instructions = '', memory_sign = true, skill_dig_sign = true, connector_list, attachments = [], signal }) {
     const block = { id: 'textId', version: '1.0', type: 'text', text, data: { content: text } };
     const data = {
       project_type,
       text,
-      rich_input_params: [block],
-      fsid: [],
+      rich_input_params: [block, ...imageBlocks(attachments)],
+      fsid: attachments.map(f => String(f.fsId)),
       quotes: [],
       skills: [],
       experts: [],
@@ -214,9 +219,10 @@ export class KukuAccount {
       show_text: '',
       device_id,
       premake_data: {},
-      custom_instructions: '',
-      memory_sign: true,
-      skill_dig_sign: true,
+      custom_instructions,
+      memory_sign,
+      skill_dig_sign,
+      ...(connector_list ? { connector_list } : {}),
       client_added: JSON.stringify({
         client_session_id,
         permission_type: 0,
@@ -246,12 +252,12 @@ export class KukuAccount {
   }
 
   // Yields parsed SSE frames. Resume semantics live upstream: msg_id carries the last seen frame id.
-  async *sse({ text, session_id, reply_id, client_session_id, device_id, model_name, model_display_name, think_mode, msg_id, signal }) {
+  async *sse({ text, session_id, reply_id, client_session_id, device_id, model_name, model_display_name, think_mode, msg_id, custom_instructions = '', memory_sign = true, skill_dig_sign = true, connector_list, attachments = [], signal }) {
     const payload = {
       project_type: 1,
       text,
-      rich_input_params: [{ id: 'textId', version: '1.0', type: 'text', text, data: { content: text } }],
-      fsid: [],
+      rich_input_params: [{ id: 'textId', version: '1.0', type: 'text', text, data: { content: text } }, ...imageBlocks(attachments)],
+      fsid: attachments.map(f => String(f.fsId)),
       quotes: [],
       skills: [],
       experts: [],
@@ -262,16 +268,79 @@ export class KukuAccount {
       device_id,
       premake_data: {},
       session_id,
-      custom_instructions: '',
-      memory_sign: true,
-      skill_dig_sign: true,
+      custom_instructions,
+      memory_sign,
+      skill_dig_sign,
+      ...(connector_list ? { connector_list } : {}),
       msg_type: 1,
       reply_id,
       client_session_id,
       traceparent: '',
       ...(msg_id ? { msg_id } : {}),
     };
-    const url = `${base()}/wenchain/genflowpro/sse/getchatcontent?${qs()}`;
+    yield* this.stream('/wenchain/genflowpro/sse/getchatcontent', payload, signal);
+  }
+
+  controlStream(kind, payload, signal) {
+    const path = kind === 'sandbox' ? '/api/genflowprosse/call' : '/wenchain/genflowpro/sse/msgexchange';
+    return this.stream(path, payload, signal);
+  }
+
+  async uploadImage({ bytes, mime }, signal) {
+    const extension = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' }[mime];
+    const path = `/genflow/uploads/kuku2api-${randomUUID()}.${extension}`;
+    const blocks = [];
+    for (let offset = 0; offset < bytes.length; offset += 4*1024*1024) blocks.push(bytes.subarray(offset, offset + 4*1024*1024));
+    const hashes = blocks.map(block => createHash('md5').update(block).digest('hex'));
+    const params = { path, size: bytes.length, block_list: JSON.stringify(hashes), rtype: 1, from_type: 5 };
+    const pre = await this.json('/api/genflowpro/clouddisk/precreate', { method: 'POST', form: params, signal });
+    if (!pre.uploadid) throw new UpstreamError('Image upload did not return an upload ID', { status: 502, code: 'image_upload_failed', retryUnsafe: true });
+    for (const [index,block] of blocks.entries()) {
+      const url = new URL('https://c.pcs.baidu.com/rest/2.0/pcs/superfile2');
+      url.search = qs({ method: 'upload', path, uploadid: pre.uploadid, partseq: String(index), product_type: 'genflowpro' });
+      const form = new FormData(); form.append('file', new Blob([block], { type: mime }), `attachment.${extension}`);
+      const headers = this.headers(); delete headers['Content-Type'];
+      const deadline = requestSignal(signal, this.requestTimeoutMs);
+      let response, uploaded;
+      try { response = await fetch(url, { method: 'POST', headers, body: form, signal: deadline, redirect: 'error' }); uploaded = await response.json(); }
+      catch(e) { throw networkError(e, deadline, true); }
+      if (!response.ok || uploaded.md5 !== hashes[index]) throw new UpstreamError('Image block upload failed validation', { status: 502, code: 'image_upload_failed', retryUnsafe: true });
+    }
+    const created = await this.json('/api/genflowpro/clouddisk/create', { method: 'POST', form: { ...params, uploadid: pre.uploadid }, signal });
+    if (!created.fs_id || !Number.isSafeInteger(Number(created.fs_id))) throw new UpstreamError('Image upload returned an invalid file ID', { status: 502, code: 'image_upload_failed', retryUnsafe: true });
+    const risk = await this.json('/api/genflowpro/workspace/checkfilerisk', { method: 'POST', body: {
+      event_type: 82002, check_entity: String(created.fs_id), request_id: Date.now()*1000,
+    }, signal });
+    if (risk.auth_code !== 0) throw new UpstreamError('Upstream image safety check refused the attachment', { status: 400, code: 'image_rejected', retryUnsafe: true });
+    return { fsId: String(created.fs_id), name: created.path?.split('/').at(-1) ?? path.split('/').at(-1) };
+  }
+
+  async attachImages(fsids, session_id, signal) {
+    const data = await this.json('/api/genflowpro/clouddisk/synctocfs', { method: 'POST', body: {
+      fsids: fsids.map(Number), session_id, cfsPathType: 1,
+    }, signal });
+    if (fsids.some(id => !data.info?.some(row => String(row.fsid) === id && row.errno === 0))) {
+      throw new UpstreamError('Image could not be attached to the upstream conversation', { status: 502, code: 'image_upload_failed', retryUnsafe: true });
+    }
+  }
+
+  nativeToolResult({ task_id, device_id, client_session_id, request_id, result, errno = 0, signal }) {
+    return this.json('/api/genflowprosse/callback', { method: 'POST', signal, body: {
+      type: 'sandbox', sub_type: 'result', task_id, device_id, client_session_id, client_type: Number(CLIENT_TYPE),
+      payload: [JSON.stringify({ logid: logid(), errno, errmsg: errno ? 'This tool is not available to this client' : '',
+        data: errno ? null : { jsonrpc: '2.0', id: request_id, result } })],
+    } });
+  }
+
+  closeTurn({ session_id, reply_id, client_session_id, signal }) {
+    return this.json('/wenchain/genflowpro/sendmsg', { method: 'POST', signal, body: {
+      type: 'message', sub_type: 'close', session_id, reply_id, client_session_id, channel: CHANNEL,
+      device_type: Number(CLIENT_TYPE), msg_type: 1, data: { session_id, reply_id },
+    } });
+  }
+
+  async *stream(path, payload, signal) {
+    const url = `${base()}${path}?${qs()}`;
     const controller = new AbortController();
     const deadline = requestSignal(signal ? AbortSignal.any([signal, controller.signal]) : controller.signal, this.streamTimeoutMs);
     try {

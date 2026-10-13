@@ -11,7 +11,7 @@ export function responseRecordForStorage(rec) {
     if (rec.response.kuku?.[key] !== undefined) response.kuku[key] = rec.response.kuku[key];
   }
   const saved = { response, output_text: '' };
-  for (const key of ['id', 'session_key', 'session_id', 'model', 'account', 'created_at']) {
+  for (const key of ['id', 'session_key', 'session_id', 'model', 'account', 'created_at', 'agent_bridge', 'upstream_user_id']) {
     if (rec[key] !== undefined) saved[key] = rec[key];
   }
   return saved;
