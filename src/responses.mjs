@@ -1,6 +1,7 @@
 // OpenAI Responses API contract, verified against openai SDK 7.27.0 type definitions
 // (resources/responses/responses.d.ts), not from memory.
 import { makeChunk } from './gateway.mjs';
+import { normalizeResponseInput } from './messages.mjs';
 
 export const EFFORT_TO_THINK = { minimal: 1, low: 1, medium: 2, high: 3, xhigh: 4 };
 
@@ -23,22 +24,8 @@ export function resolveThink(body) {
   return EFFORT_TO_THINK[effort] ?? Number.NaN;
 }
 
-function contentToText(content) {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
-  return content
-    .filter((p) => p?.type === 'input_text' || p?.type === 'output_text' || p?.type === 'text')
-    .map((p) => p.text ?? '')
-    .join('');
-}
-
 export function normalizeInput(input) {
-  if (typeof input === 'string') return [{ role: 'user', content: input }];
-  if (!Array.isArray(input)) return [];
-  return input
-    .filter((it) => it && (it.type == null || it.type === 'message') && typeof it.role === 'string')
-    .map((it) => ({ role: it.role === 'developer' ? 'system' : it.role, content: contentToText(it.content) }))
-    .filter((m) => m.content.length);
+  return normalizeResponseInput(input);
 }
 
 export function newResponseId() {

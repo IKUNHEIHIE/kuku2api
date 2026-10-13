@@ -1,4 +1,5 @@
 import { KukuAccount, UpstreamError } from './upstream.mjs';
+import { normalizeChatMessages } from './messages.mjs';
 
 export function frameToDelta(frame) {
   const d = frame?.data;
@@ -454,6 +455,7 @@ export class Pool {
   }
 
   async chat(args, onDelta = () => {}, signal) {
+    args = { ...args, messages: normalizeChatMessages(args.messages) };
     const logicalKey = deriveSessionKey({ sessionKey: args.sessionKey, messages: args.messages, accountId: args.account.id });
     args = { ...args, sessionKey: logicalKey };
     // Every entry point (Chat, Responses, reward earning) shares this account-scoped queue.
@@ -548,7 +550,7 @@ export class Pool {
     Object.assign(observation, { session_id: s.session_id, reply_id });
     // The upstream session already holds history; only the newest user turn goes on the wire.
     // Re-sending the whole transcript re-bloats a ~30k system prompt and doubles point burn.
-    const text = String([...messages].reverse().find((m) => m.role === 'user')?.content ?? '');
+    const text = messages.findLast((m) => m.role === 'user').content;
     const beforeSend = this.accounts.find(a => a.id === account.id);
     if (!beforeSend || beforeSend.upstream_user_id !== account.upstream_user_id) {
       throw sessionError('请求处理期间账号已删除或更换身份，请新建对话', 'session_account_mismatch');

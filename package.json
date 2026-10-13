@@ -1,6 +1,6 @@
 {
   "name": "kuku2api",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "license": "0BSD",
   "type": "module",
@@ -9,7 +9,7 @@
   "scripts": {
     "postinstall": "node src/admin-token.mjs",
     "start": "node src/server.mjs",
-    "test": "node test/offline.mjs && node test/backend-hardening.mjs && node --test test/database.mjs && node --test test/accounts.mjs && node --test test/sms-login.mjs && node --test test/desktop-login.mjs && node --test test/claim-stream.mjs && node --test test/session-isolation.mjs && node --test test/installation.mjs && node --test test/background-service.mjs && node --test test/installer-bootstrap.mjs && node --test test/upgrade.mjs && node --test test/prebuilt.mjs && node --test test/audit-fixes.mjs",
+    "test": "node test/offline.mjs && node test/backend-hardening.mjs && node --test test/message-compat.mjs && node --test test/database.mjs && node --test test/accounts.mjs && node --test test/sms-login.mjs && node --test test/desktop-login.mjs && node --test test/claim-stream.mjs && node --test test/session-isolation.mjs && node --test test/installation.mjs && node --test test/background-service.mjs && node --test test/installer-bootstrap.mjs && node --test test/upgrade.mjs && node --test test/prebuilt.mjs && node --test test/audit-fixes.mjs",
     "accept": "node test/live.mjs"
   }
 }

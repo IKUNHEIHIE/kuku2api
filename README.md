@@ -2,7 +2,7 @@
 
 将百度「库库AI」接入 OpenAI 兼容客户端，提供多账号池、流式对话和网页管理控制台。
 
-[快速安装](#快速安装) · [使用说明](docs/usage.md) · [API 文档](docs/api.md) · [全部文档](docs/README.md) · [v1.0.0 发布说明](docs/releases/v1.0.0.md) · [发布包](https://github.com/IKUNHEIHIE/kuku2api/releases/latest)
+[快速安装](#快速安装) · [使用说明](docs/usage.md) · [API 文档](docs/api.md) · [全部文档](docs/README.md) · [v1.0.1 发布说明](docs/releases/v1.0.1.md) · [发布包](https://github.com/IKUNHEIHIE/kuku2api/releases/latest)
 
 ## 功能
 

@@ -1,6 +1,6 @@
 # API 文档
 
-版本：1.0.0 · 更新：2026-10-12
+版本：1.0.1 · 更新：2026-10-13
 
 本文描述当前接口。旧版差异与验收过程见 [历史归档](archive/api-history.md)，安装参数和环境变量见 [安装与升级](installation.md)、[运行维护](operations.md)。
 
@@ -118,7 +118,7 @@ JSON 请求使用 `Content-Type: application/json`。`OPTIONS` 预检返回 204�
 | 字段 | 说明 |
 |---|---|
 | `model` | 可选，默认 `gateway-glm-5.3-flash`；取模型目录的 ID |
-| `messages` | 必须为非空数组；主要支持文本对话 |
+| `messages` | 必须为非空数组；`content` 支持字符串或 `[{"type":"text","text":"..."}]`，多个文本块按顺序拼接，保留原换行 |
 | `stream` | 只有 `true` 开启 SSE，默认非流式 |
 | `think_mode` / `reasoning.effort` / `reasoning_effort` | 思考设置，见上节 |
 | `store` | 本项目扩展；`false` 不存正文/思考，但保留用量与最小续接数据 |
@@ -126,6 +126,12 @@ JSON 请求使用 `Content-Type: application/json`。`OPTIONS` 预检返回 204�
 | `kuku_meta` | 流式末尾附加非标准 kuku 元信息帧，默认关闭 |
 
 可选请求头：`x-kuku-account` 指定账号 ID 或别名；`x-kuku-session` 指定逻辑会话标识。指定账号不能绕过停用、冷却或失效状态。`x-kuku-allow-unavailable: 1` 是需管理员权限的诊断选项，不是普通模型调用的授权替代。
+
+必须包含非空的最新 `user` 文本；支持 `system/developer/user/assistant` 角色，`developer` 归一为 `system`。当前上游桥接只发送最新用户输入，额外的 system/developer 消息不等同于可替换上游系统指令；完整历史的处理限制见 [会话隔离](#会话隔离)。
+
+**客户端工具调用尚未实现。** 非空 `tools/functions` 默认返回 HTTP 400 `unsupported_tools`，不会分配上游会话、发送对话或消耗上游积分；仅显式 `tool_choice:"none"` / `function_call:"none"` 时允许携带对应定义。空工具数组与 `auto/none` 可用于纯文本请求。强制/指定工具选择、工具调用历史及 `role:"tool"/"function"` 均拒绝。不会把库库AI电脑客户端的工具当作 OpenCode 的本地工具执行。
+
+图片、文件、音频等内容块返回 400 `unsupported_content_type`，混合文本与不支持内容也整体拒绝；内容结构或 `text` 类型不正确返回 `invalid_message_content`，工具定义不是数组返回 `invalid_tools`。不再静默丢弃内容或发送 `[object Object]`。校验发生在开启 SSE 和访问上游前，流式请求同样返回普通 JSON 错误。
 
 非流式响应包含 `id`、`object:"chat.completion"`、秒级 `created`、`model`、`choices`、`usage`，另有扩展块：
 
@@ -152,6 +158,8 @@ JSON 请求使用 `Content-Type: application/json`。`OPTIONS` 预检返回 204�
 ```
 
 `input` 接受非空文本或文本消息项数组；`developer` 归一为 `system`。支持 `instructions`、`previous_response_id`、`stream`、`store` 及思考字段；这不是完整的 OpenAI 多模态或工具执行实现，不应依赖图片、工具调用项或客户端工具任务。
+
+文本消息的 `content` 支持字符串及 `input_text/output_text/text` 块；数组需含非空用户文本。工具定义的限制与 Chat 相同；函数调用/工具结果等非消息项返回 400 `unsupported_input_type`，不支持的内容块返回 `unsupported_content_type`，不会过滤后重发较早的用户消息。
 
 返回 Response 对象，含 `id`、`object:"response"`、`created_at`（秒）、`status`、`output`、`output_text`、`usage`、`kuku` 等字段。SSE 使用 Responses 事件名，包含创建、文本增量和完成事件；失败可能返回失败事件，应按事件状态处理。
 
@@ -366,7 +374,7 @@ v1.0.0 起，新安装的日志默认保留 7 天，对话默认长期保留。�
 
 | HTTP | 典型情况 |
 |---|---|
-| 400 | 参数、模型、档位或游标错误 |
+| 400 | 参数、模型、档位或游标错误；`unsupported_tools`、`unsupported_content_type`、`unsupported_input_type`、`invalid_message_content`、`invalid_tools` 表示文本桥接能力或消息结构不符合要求 |
 | 401 | 管理员令牌或普通 API 密钥不正确 |
 | 402 | 全池积分不足，`insufficient_balance` |
 | 404 | 账号、记录、会话或路由不存在 |

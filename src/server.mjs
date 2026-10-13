@@ -17,6 +17,7 @@ import { createStaticUi } from './static-ui.mjs';
 import { listenPort, listenHost } from './listen-port.mjs';
 import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
+import { normalizeChatMessages, validateTextOnlyTools } from './messages.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -122,8 +123,9 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
   if (unknownModelId(model)) return rejectUnknownModel(res, model);
   const think = resolveThink(reqBody);
   if (Number.isNaN(think) || unknownThinkMode(think)) return rejectThinkMode(res);
-  const messages = reqBody.messages;
-  if (!Array.isArray(messages) || !messages.length) return openError(res, 400, 'messages must be a non-empty array');
+  let messages;
+  try { validateTextOnlyTools(reqBody); messages = normalizeChatMessages(reqBody.messages); }
+  catch (error) { return openError(res, 400, error.message, 'invalid_request_error', error.code); }
   const stream = reqBody.stream === true;
 
   const wanted = req.headers['x-kuku-account'];
@@ -246,7 +248,9 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
   if (unknownModelId(model)) return rejectUnknownModel(res, model);
   const think = resolveThink(body);
   if (Number.isNaN(think) || unknownThinkMode(think)) return rejectThinkMode(res);
-  const messages = normalizeInput(body.input);
+  let messages;
+  try { validateTextOnlyTools(body); messages = normalizeInput(body.input); }
+  catch (error) { return openError(res, 400, error.message, 'invalid_request_error', error.code); }
   if (!messages.length) return openError(res, 400, 'input must be a non-empty string or item array');
 
   const prevId = body.previous_response_id ?? null;
