@@ -2,11 +2,12 @@
 
 将百度「库库AI」接入 OpenAI 兼容客户端，提供多账号池、流式对话和网页管理控制台。
 
-[快速安装](#快速安装) · [使用说明](docs/usage.md) · [API 文档](docs/api.md) · [全部文档](docs/README.md) · [v1.1.0 发布说明](docs/releases/v1.1.0.md) · [发布包](https://github.com/IKUNHEIHIE/kuku2api/releases/latest)
+[快速安装](#快速安装) · [使用说明](docs/usage.md) · [API 文档](docs/api.md) · [全部文档](docs/README.md) · [v1.1.1 发布说明](docs/releases/v1.1.1.md) · [发布包](https://github.com/IKUNHEIHIE/kuku2api/releases/latest)
 
 ## 功能
 
 - 支持 Chat Completions 与 Responses，支持流式输出和思考档位。
+- v1.1.1 实时输出工具模式的正文与思考，积分领取按账号串行处理，账号之间等待 15 秒。
 - v1.1.0 支持原生 MCP 客户端工具及图片附件适配，支持工具定义、调用与结果往返；GLM/DeepSeek Flash、OpenCode 与 Pi 验收范围见 [说明](docs/agent-upstream-verification.md)。
 - 扫码、短信登录，多账号去重、调度及会话隔离。
 - 管理员令牌与模型 API 密钥独立，控制台管理账号、积分和密钥。
