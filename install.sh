@@ -2,6 +2,7 @@
 set -euo pipefail
 umask 077
 
+# Downloads the latest stable prebuilt release (v1.3.0 or newer); no server-side build.
 REPOSITORY='IKUNHEIHIE/kuku2api'
 SOURCE_URL="https://codeload.github.com/$REPOSITORY/tar.gz/refs/heads/main"
 RELEASE_URL="https://github.com/$REPOSITORY/releases/latest/download"

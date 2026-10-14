@@ -15,6 +15,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# Downloads the latest stable prebuilt release (v1.3.0 or newer); no server-side build.
 $taskRepository = 'IKUNHEIHIE/kuku2api'
 $taskAction = 'auto'
 $taskActions = @()
