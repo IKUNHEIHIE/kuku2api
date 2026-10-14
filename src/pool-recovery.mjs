@@ -1,6 +1,6 @@
 import { UpstreamError } from './upstream.mjs';
 
-const neutral = new Set(['invalid_tool_response','session_account_mismatch','session_history_unavailable','account_unavailable','upstream_requires_client','invalid_image','unsafe_image_url','image_too_large','image_download_failed','image_upload_failed','image_rejected']);
+const neutral = new Set(['agent_continuation_unavailable','invalid_tool_response','session_account_mismatch','session_history_unavailable','account_unavailable','upstream_requires_client','invalid_image','unsafe_image_url','image_too_large','image_download_failed','image_upload_failed','image_rejected']);
 const reasons = { network: '上游连接暂不可用', access: '上游访问受限，未确认登录失效', model: '上游模型生成暂时失败' };
 const delayFor = count => Math.min(120_000, 10_000 * 2 ** Math.min(4, count - 1));
 

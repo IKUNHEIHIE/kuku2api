@@ -1,7 +1,7 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { frameToDelta } from './gateway.mjs';
 import { UpstreamError, turnError } from './upstream.mjs';
-import { validateAgentTurn } from './agent.mjs';
+import { renderAgent, validateAgentTurn } from './agent.mjs';
 import { callerInstructions } from './messages.mjs';
 import { prepareImages } from './images.mjs';
 import { stableToolDefinitions } from './tool-definitions.mjs';
@@ -15,23 +15,29 @@ function failure(message, code = 'upstream_requires_client') {
   return new UpstreamError(message, { status: code === 'upstream_timeout' ? 504 : code === 'session_account_mismatch' ? 409 : 502, code });
 }
 
-// Each OpenAI round gets an isolated native session. At a client tool handoff we close
-// that native turn instead of holding a desktop callback open while a caller runs a
-// potentially long command. The next round carries the actual results and full history.
+// The default path closes at handoff. An optional bounded continuation bridge keeps
+// the original turn alive and supplies subsequent caller tool results through callbacks.
 // No caller tools, files or commands are executed by this process.
-export async function nativeAgentTurn({ client, model, agent, think_mode, observation, signal, onDelta = () => {}, ownsAccount = () => true, beforeSend = () => {} }) {
-  const started = performance.now();
-  const timing = observation.agent_timing = { think_mode, tool_count: agent.tools.length, tool_list_count: 0, tool_call_count: 0, model_ends_ms: [] };
+export async function nativeAgentTurn({ client, model, agent, think_mode, observation, signal, onDelta = () => {}, ownsAccount = () => true, beforeSend = () => {}, continuation = null }) {
+  let started = performance.now();
+  let timing = observation.agent_timing = { think_mode, tool_count: agent.tools.length, tool_list_count: 0, tool_call_count: 0, model_ends_ms: [] };
   const mark = key => { if (timing[key] == null) timing[key] = Math.round(performance.now() - started); };
   const abort = new AbortController();
   const deadline = AbortSignal.timeout(client.streamTimeoutMs ?? 180_000);
-  const combined = AbortSignal.any([abort.signal, deadline, ...(signal ? [signal] : [])]);
+  const ownerSignal = continuation?.signal ?? signal;
+  const combined = AbortSignal.any([abort.signal, deadline, ...(ownerSignal ? [ownerSignal] : [])]);
   const baseId = randomUUID(), sandboxId = randomUUID(), deviceId = `kuku2api-agent-${randomUUID()}`;
-  const handoff = deferred(), broken = deferred(), sandboxReady = deferred(), baseReady = deferred();
+  let handoff = deferred();
+  const broken = deferred(), sandboxReady = deferred(), baseReady = deferred(), cancelled = deferred();
+  const onAbort = () => cancelled.reject(combined.reason?.code === 'agent_continuation_unavailable' ? combined.reason : failure('Agent turn cancelled or timed out', 'upstream_timeout'));
+  combined.addEventListener('abort', onAbort, { once: true });
+  if (combined.aborted) onAbort();
   const calls = [], seen = new Set();
+  const callbacks = [];
+  let pointBase = 0, latestPoints = 0, resumed = false, handedOff = false;
   let batchTimer, connectTimer, ids, reply_id, args, preparation, sent = false, closed = false, complete = false, content = '', reasoning = '';
   // All promises participate in races below; suppress a late rejection during cleanup.
-  for (const d of [handoff, broken, sandboxReady, baseReady]) d.promise.catch(() => {});
+  for (const d of [handoff, broken, sandboxReady, baseReady, cancelled]) d.promise.catch(() => {});
   const available = agent.choice === 'none' ? [] : agent.tools.filter(tool => typeof agent.choice !== 'object' || tool.name === agent.choice.name);
   const tools = stableToolDefinitions(available.map(tool => ({ name: tool.name, description: tool.description,
     inputSchema: tool.type === 'function' ? tool.parameters : { type: 'object', properties: { input: { type: 'string' } }, required: ['input'], additionalProperties: false } })));
@@ -73,12 +79,14 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
           protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: connector, version: '1' },
         } });
         else if (params.sub_method === 'tools/call') {
+          if (handedOff) throw failure('Native tool batch changed after handoff; no late calls were executed', 'invalid_tool_response');
           mark('tool_call_ms');
           const tool = available.find(tool => tool.name === params.tool_name);
           if (!tool) throw failure('Native model selected an undefined client tool', 'invalid_tool_response');
           let arguments_ = params.arguments;
           if (typeof arguments_ === 'string') { try { arguments_ = JSON.parse(arguments_); } catch { throw failure('Invalid native tool arguments', 'invalid_tool_response'); } }
           calls.push(tool.type === 'custom' ? { name: tool.name, input: arguments_?.input } : { name: tool.name, arguments: arguments_ });
+          callbacks.push(callback);
           // Validate before handing any call to the caller, including named/none/parallel.
           validateAgentTurn({ content, tool_calls: calls }, agent);
           timing.tool_call_count = calls.length;
@@ -122,13 +130,11 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
       const attachments = await prepareImages(agent.messages, client, ids.chat_id, combined, ownsAccount);
       mark('images_ready_ms');
       args = { session_id: ids.chat_id, reply_id, client_session_id: baseId, device_id: deviceId,
-        text: agent.prompt + (attachments.length ? `\nATTACHED_IMAGES: ${JSON.stringify(attachments.map(({reference,name}) => ({ reference, name })))}` : ''),
+        text: renderAgent(agent, connector) + (attachments.length ? `\nATTACHED_IMAGES: ${JSON.stringify(attachments.map(({reference,name}) => ({ reference, name })))}` : ''),
         attachments, model_name: model.model_name, model_display_name: model.display_name, think_mode,
-        custom_instructions: [callerInstructions(agent.messages, agent.instructions, { labelRoles: true }),
-          'Act only for the caller. Use the supplied external_agent connector tools; do not execute desktop tools or use other connectors. Follow the complete caller conversation.',
-          attachments.length ? 'The attached image files are real input. You may inspect these attachments with the upstream image reader, then use client tools for all caller workspace actions.' : 'Do not use built-in tools.'].filter(Boolean).join('\n\n'),
+        custom_instructions: callerInstructions(agent.messages, agent.instructions, { labelRoles: true }),
         memory_sign: false, skill_dig_sign: false,
-        connector_list: tools.length ? [{ name: connector, description: 'external_agent: tools executed by the caller on its own computer. Load this connector to discover the client tool definitions.', type: 'custom' }] : [],
+        connector_list: tools.length ? [{ name: connector, description: 'Client tools for the caller workspace; discover definitions when needed.', type: 'custom' }] : [],
         signal: combined };
       timing.prompt_bytes = Buffer.byteLength(args.text);
       timing.instruction_bytes = Buffer.byteLength(args.custom_instructions);
@@ -144,10 +150,30 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
     iterator = client.sse(args)[Symbol.asyncIterator]();
     next = iterator.next();
     while (true) {
-      const event = await Promise.race([next.then(value => ({ value })), handoff.promise.then(() => ({ handoff: true })), broken.promise]);
+      const event = await Promise.race([next.then(value => ({ value })), handoff.promise.then(() => ({ handoff: true })), broken.promise, cancelled.promise]);
       if (event.handoff) {
-        await close();
         if (!ownsAccount()) throw failure('Account identity changed during the turn', 'session_account_mismatch');
+        if (continuation) {
+          handedOff = true;
+          mark('total_ms');
+          const turn = { ...validateAgentTurn({ content, tool_calls: calls }, agent), reasoning,
+            ...observation, tool_adapter: 'native-mcp', handoff: true };
+          const resume = await Promise.race([continuation.exchange(turn, { agent }), broken.promise, cancelled.promise]);
+          if (!ownsAccount()) throw failure('Account identity changed during tool continuation', 'session_account_mismatch');
+          resume.beforeSend();
+          const pending = callbacks.splice(0);
+          handedOff = false;
+          calls.length = 0; clearTimeout(batchTimer); batchTimer = undefined; handoff = deferred();
+          handoff.promise.catch(() => {});
+          agent = resume.agent; observation = resume.observation; onDelta = resume.onDelta;
+          started = performance.now(); content = ''; reasoning = ''; pointBase = latestPoints; resumed = true;
+          timing = observation.agent_timing = { think_mode, tool_count: agent.tools.length, tool_list_count: 0, tool_call_count: 0,
+            model_ends_ms: [], resumed: true, tool_fingerprint: fingerprint, tool_definition_bytes: Buffer.byteLength(toolJson), prompt_bytes: 0, instruction_bytes: 0 };
+          Object.assign(observation, { session_id: ids.chat_id, reply_id });
+          for (const [index, callback] of pending.entries()) await callback({ result: resume.results[index] });
+          continue;
+        }
+        await close();
         return { ...validateAgentTurn({ content, tool_calls: calls }, agent), reasoning,
           ...observation, tool_adapter: 'native-mcp', handoff: true };
       }
@@ -156,6 +182,7 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
       mark('first_event_ms');
       if (!ownsAccount()) throw failure('Account identity changed during the turn', 'session_account_mismatch');
       if (frame.data?.data?.reply_id != null && String(frame.data.data.reply_id) !== String(reply_id)) { next = iterator.next(); continue; }
+      if (type === 'MODEL_CALL_START') resumed = false;
       if (frame.event === 'done' || ((type === 'TURN_DONE' || type === 'FINISH') && (frame.data.data?.reply_id == null || String(frame.data.data.reply_id) === String(reply_id)))) {
         complete = true;
         if (!ownsAccount()) throw failure('Account identity changed during the turn', 'session_account_mismatch');
@@ -169,7 +196,10 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
         observation.usage = Object.fromEntries(['prompt_tokens', 'completion_tokens', 'total_tokens', 'reasoning_tokens', 'cache_read_tokens']
           .map(key => [key, observation.usage_events.reduce((sum, event) => sum + (event[key] ?? 0), 0)]));
       }
-      if (delta?.consume_points != null) observation.consume_points = delta.consume_points; // Cumulative per native reply.
+      if (delta?.consume_points != null) {
+        latestPoints = Math.max(latestPoints, delta.consume_points);
+        observation.consume_points = Math.max(0, latestPoints - pointBase);
+      }
       if (delta?.content) content += delta.content;
       if (delta?.reasoning_content) reasoning += delta.reasoning_content;
       Object.assign(observation, { content, reasoning });
@@ -177,7 +207,7 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
       // A registered native MCP call legitimately waits for the caller. The
       // validated batch already schedules handoff; do not treat that wait as an
       // unsupported desktop action merely because it races the batching timer.
-      if (delta?.requires_client && !calls.length) throw failure('Native model requested desktop input instead of a client tool');
+      if (delta?.requires_client && !calls.length && !resumed) throw failure('Native model requested desktop input instead of a client tool');
       if (delta?.error) throw turnError(delta.error);
       if (delta?.commercial) {
         const drained = delta.commercial.reason === 'insufficient_balance' || Number(delta.commercial.errno) === 11002;
@@ -206,6 +236,7 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
     try { await close(); } catch { /* Preserve the original error; never generate another turn. */ }
     abort.abort();
     await Promise.allSettled([sandbox, base, next, preparation]);
+    combined.removeEventListener('abort', onAbort);
     mark('total_ms');
   }
 }

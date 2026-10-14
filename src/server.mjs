@@ -16,7 +16,7 @@ import { databaseAdminRoute } from './database-api.mjs';
 import { createDesktopLogin } from './desktop-login.mjs';
 import { createStaticUi } from './static-ui.mjs';
 import { listenPort, listenHost } from './listen-port.mjs';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { normalizeChatMessages } from './messages.mjs';
 import { prepareAgent, assistantHistory } from './agent.mjs';
@@ -138,7 +138,7 @@ function failureResponse(err) {
   }
   const status = Number(err?.status);
   return { status: Number.isInteger(status) && status >= 400 && status <= 599 ? status : (err instanceof UpstreamError || err?.network ? 502 : 500),
-    code: ['pool_cooling_down', 'pool_unavailable', 'upstream_turn_error', 'upstream_timeout', 'upstream_incomplete', 'upstream_requires_client', 'invalid_tool_response', 'session_account_mismatch', 'session_history_unavailable', 'invalid_image', 'unsafe_image_url', 'image_too_large', 'image_download_failed', 'image_upload_failed', 'image_rejected'].includes(err?.code) ? err.code : undefined };
+    code: ['pool_cooling_down', 'pool_unavailable', 'upstream_turn_error', 'upstream_timeout', 'upstream_incomplete', 'upstream_requires_client', 'agent_continuation_unavailable','invalid_tool_response', 'session_account_mismatch', 'session_history_unavailable', 'invalid_image', 'unsafe_image_url', 'image_too_large', 'image_download_failed', 'image_upload_failed', 'image_rejected'].includes(err?.code) ? err.code : undefined };
 }
 
 // reqBody.kuku_meta adds a final non-standard `data: {"kuku":{...}}` frame so a console UI
@@ -158,9 +158,14 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
   // Documented as an admin-only probe switch: without the admin token it must not let a caller
   // route traffic to a disabled or condemned account.
   const allowUnavailable = opts.admin === true && req.headers['x-kuku-allow-unavailable'] === '1';
-  let acct;
+  if (agent) agent.scope = `${opts.scope ?? 'local'}:chat`;
+  let acct, continuation;
   try {
-    acct = pool.resolve(wanted, { allowUnavailable, model });
+    continuation = pool.agentContinuations?.lookup(agent, agent?.scope);
+    if (continuation && wanted && ![continuation.account.id, continuation.account.alias].includes(wanted)) {
+      throw Object.assign(new Error('Native tool continuation cannot change accounts'), { status: 409, code: 'agent_continuation_unavailable', retryUnsafe: true });
+    }
+    acct = pool.resolve(continuation?.account.id ?? wanted, { allowUnavailable, model });
   } catch (e) {
     return openError(res, e.status ?? 409, redact(e.message), 'pool_error', failureResponse(e).code, e.retry_after_ms);
   }
@@ -226,7 +231,7 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
     } catch (err) {
       lastErr = err;
       const paramError = await noteAccountFailure(pool, acct, err, model);
-      if (wanted || paramError || sentAny || controller.signal.aborted) break;
+      if (continuation || wanted || paramError || sentAny || controller.signal.aborted) break;
       const next = pool.pick({ allowUnavailable, exclude: tried, model });
       if (!next) break;
       acct = next;
@@ -298,9 +303,16 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
   // Documented as an admin-only probe switch: without the admin token it must not let a caller
   // route traffic to a disabled or condemned account.
   const allowUnavailable = opts.admin === true && req.headers['x-kuku-allow-unavailable'] === '1';
-  let acct;
+  if (agent) agent.scope = `${opts.scope ?? 'local'}:responses`;
+  let acct, continuation;
   try {
-    if (prev) {
+    continuation = pool.agentContinuations?.lookup(agent, agent?.scope);
+    if (continuation) {
+      if ((wanted && ![continuation.account.id, continuation.account.alias].includes(wanted)) || (prev && prev.account !== continuation.account.id)) {
+        throw Object.assign(new Error('Native tool continuation cannot change accounts'), { status: 409, code: 'agent_continuation_unavailable', retryUnsafe: true });
+      }
+      acct = pool.resolve(continuation.account.id, { allowUnavailable, model });
+    } else if (prev) {
       if (!prev.account || !prev.session_key || !prev.session_id) return openError(res, 409, '历史回复缺少账号或会话归属，请新建对话', 'pool_error', 'response_account_unverified');
       const owner = pool.accounts.find(a => a.id === prev.account);
       if (!owner) return openError(res, 404, '历史回复所属账号已不存在，请新建对话', 'pool_error', 'response_account_not_found');
@@ -380,7 +392,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
     } catch (err) {
       lastErr = err;
       const paramError = await noteAccountFailure(pool, acct, err, model);
-      if ((prev && !agent) || wanted || paramError || sentAny || controller.signal.aborted) break;
+      if (continuation || (prev && !agent) || wanted || paramError || sentAny || controller.signal.aborted) break;
       const next = pool.pick({ allowUnavailable, exclude: tried, model });
       if (!next) break;
       acct = next;
@@ -462,6 +474,11 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
     const h = req.headers.authorization ?? '';
     const key = h.startsWith('Bearer ') ? h.slice(7) : req.headers['x-api-key'] ?? '';
     return keys.ok(key);
+  };
+  const callerScope = req => {
+    if (keys.count() === 0) return 'unkeyed';
+    const h = req.headers.authorization ?? '';
+    return createHash('sha256').update(h.startsWith('Bearer ') ? h.slice(7) : req.headers['x-api-key'] ?? '').digest('hex');
   };
 
   // Admin surface is separately keyed and never falls back to "no keys configured".
@@ -751,7 +768,7 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
       } catch (error) {
         return openError(res, error.status ?? 400, error.code === 'request_too_large' ? error.message : 'invalid json body', 'invalid_request_error', error.code);
       }
-      return handleResponses(pool, req, res, body, ledger, { admin: admined(req) });
+      return handleResponses(pool, req, res, body, ledger, { admin: admined(req), scope: callerScope(req) });
     }
 
     // Cursor envelope matches the SDK's CursorPage: data/first_id/last_id/has_more, newest first.
@@ -808,7 +825,7 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
       } catch (error) {
         return openError(res, error.status ?? 400, error.code === 'request_too_large' ? error.message : 'invalid json body', 'invalid_request_error', error.code);
       }
-      return handleChat(pool, req, res, body, { admin: admined(req) });
+      return handleChat(pool, req, res, body, { admin: admined(req), scope: callerScope(req) });
     }
 
     if (url.pathname === '/pool/state') {
@@ -897,7 +914,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
   const keyRing = createKeyRing({ store: database.store('keys'), envKeys });
   const logger = createDatabaseLogger(database, { ...(process.env.KUKU_INSTALLER_QUIET === '1' ? { consoleOutput: { log() {}, warn: console.warn, error: console.error } } : {}), secrets: () => [adminToken, ...envKeys,
     ...database.store('keys').load().keys.map((k) => k.key), ...(pool?.accounts ?? []).flatMap((a) => [a.client.bduss, a.client.stoken, a.ptoken])] });
-  const pool = new Pool(loaded.accounts, { sessionStore: database.store('sessions'), database, logger });
+  const pool = new Pool(loaded.accounts, { sessionStore: database.store('sessions'), database, logger, agentContinuation: process.env.NATIVE_AGENT_CONTINUATION === '1' });
   for (const a of pool.accounts) a.deviceId = deviceId;
   const ledger = database.ledger;
   // Daily free-point claiming stays OFF unless the operator turned it on in SQLite or
@@ -910,9 +927,9 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
   const shutdown = () => {
     if (stopping) return;
     stopping = true;
-    const pendingClaim = autoClaim.stop(), pendingRefresh = app.credentialRefresh.stop(); clearInterval(pruneTimer);
+    const pendingClaim = autoClaim.stop(), pendingRefresh = app.credentialRefresh.stop(), pendingNative = pool.agentContinuations.close(); clearInterval(pruneTimer);
     server.close(async () => {
-      await Promise.allSettled([...pendingRequests, pendingClaim, pendingRefresh]);
+      await Promise.allSettled([...pendingRequests, pendingClaim, pendingRefresh, pendingNative]);
       database.close(); process.exit(0);
     });
   };

@@ -617,6 +617,42 @@ for (const type of ['AWAITING_INPUT', 'REQUIRE_EXTERNAL_EXECUTION']) test(`${typ
   assert(!r.events.some(e => e.error));
 });
 
+test('agent adapter preserves high effort and completed history without advertising disabled tools', async t => {
+  const s = setup(t, () => ({ text: 'done' }));
+  for (const account of s.pool.accounts) {
+    account.client.sendmsg = async args => { s.seen.send.push(args); };
+    account.client.sse = async function* () {
+      yield { data: { type: 'TEXT_BLOCK_DELTA', data: { delta: 'done' } } };
+      yield { data: { type: 'TURN_DONE' } };
+    };
+  }
+  const messages = [user,
+    { role: 'assistant', content: '', tool_calls: [{ id: 'completed-read', type: 'function', function: { name: 'read_file', arguments: '{"value":"demo.txt"}' } }] },
+    { role: 'tool', tool_call_id: 'completed-read', content: 'Already read: sample text' }];
+  for (const tools of [definitions, []]) {
+    const r = await chat(s, { messages, tools, tool_choice: 'none', reasoning_effort: 'high' });
+    assert.equal(r.status, 200, r.body);
+    const sent = s.seen.send.at(-1);
+    assert.equal(sent.think_mode, 3);
+    assert.deepEqual(sent.connector_list, []);
+    assert(sent.text.includes('without tool calls or connector discovery'));
+    assert(!sent.text.includes('Discover its definitions'));
+    const transcript = JSON.parse(sent.text.split('CONVERSATION_JSON: ')[1].split('\nContinue the next')[0]);
+    assert.equal(transcript.at(-1).tool_call_id, 'completed-read');
+    assert.equal(transcript.at(-1).content, messages.at(-1).content);
+  }
+});
+
+test('agent adapter names the actual connector and keeps caller instructions separate', async t => {
+  const s = setup(t, () => ({ text: 'done' }));
+  const r = await chat(s, { messages: [{role:'system',content:'CALLER_RULE'},user] });
+  assert.equal(r.status, 200, r.body);
+  const sent = s.seen.send[0];
+  assert(sent.text.includes(sent.connector_list[0].name));
+  assert(sent.text.includes('when a tool is needed'));
+  assert.equal(sent.custom_instructions, 'CALLER_SYSTEM_INSTRUCTIONS:\nCALLER_RULE');
+});
+
 test('caller instructions are sent once with role labels while all user and tool history remains intact', async t => {
   const s = setup(t, () => ({ text: 'done' }));
   const system = 'SYSTEM_ONLY_' + '规则'.repeat(2000), developer = 'DEVELOPER_ONLY_' + 'detail '.repeat(1000);
@@ -654,4 +690,236 @@ test('bounded agent timing metadata is saved to SQLite logs without caller text 
   assert.equal(timing.tool_definition_bytes, Buffer.byteLength(JSON.stringify(s.seen.definitions[0])));
   assert(!log.includes(definitions[0].function.name));
   assert(db.sql.prepare('SELECT 1 FROM usage_records WHERE id=?').get(timing.turn_id));
+});
+
+function continuationSetup(t, { rounds = 2, callbackFails = false } = {}) {
+  let context, round = 0;
+  const s = setup(t, ctx => { context = ctx; return { text: 'Checking the task.', calls: [{ name: 'read_file', arguments: { value: 'first' } }] }; });
+  s.pool.agentContinuations.enabled = true;
+  t.after(() => s.pool.agentContinuations.close());
+  for (const account of s.pool.accounts) {
+    const original = account.client.nativeToolResult;
+    account.client.nativeToolResult = async result => {
+      if (!result.result?.content) return original(result);
+      s.seen.callbacks.push(result);
+      if (callbackFails) throw new UpstreamError('callback acknowledgement lost', { network: true, status: 502 });
+      round++;
+      const { emit, sandbox, args } = context;
+      emit('MODEL_CALL_END', { input_tokens: 20, output_tokens: 5 });
+      emit('ACTUAL_POINT', { consume_points: 0.1 + round * 0.2 });
+      if (round < rounds) sandbox.push({ data: { type: 'sandbox', sub_type: 'task', task_id: 'continued-' + round, data: {
+        method: 'local_connector', params: { session_id: args.session_id, device_id: args.device_id, server_name: args.connector_list[0].name,
+          sub_method: 'tools/call', tool_name: 'read_file', arguments: { value: 'next' }, request_id: 100 + round },
+      } } });
+      else { emit('TEXT_BLOCK_DELTA', { delta: 'Result: ' + result.result.content[0].text }); emit('TURN_DONE'); }
+    };
+  }
+  return s;
+}
+
+test('native continuation preserves one upstream turn across three Chat requests with incremental usage and no repeated text', async t => {
+  const s = continuationSetup(t); const messages = [user]; const results = [];
+  for (let round = 0; round < 3; round++) {
+    const response = await chat(s, { messages, stream: false });
+    assert.equal(response.status, 200, response.body); results.push(response.json);
+    const message = response.json.choices[0].message;
+    if (round < 2) {
+      assert.match(message.tool_calls[0].id, /^call_kuku_native_/);
+      messages.push(message, { role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'answer-' + round });
+      assert.equal(s.seen.close.length, 0);
+      assert(s.pool.activeAccounts.get('one') > 0, 'pending task protects credentials from background renewal');
+    }
+  }
+  assert.equal(s.seen.send.length, 1); assert.equal(s.seen.definitions.length, 1);
+  assert.equal(s.seen.allocations, 2);
+  assert.equal(new Set(results.map(r => r.kuku.session_id)).size, 1);
+  assert.equal(new Set(results.map(r => r.kuku.reply_id)).size, 1);
+  assert.equal(results[0].choices[0].message.content, 'Checking the task.');
+  assert.equal(results[1].choices[0].message.content, null);
+  assert.equal(results[2].choices[0].message.content, 'Result: answer-1');
+  assert.deepEqual(results.map(r => r.usage.prompt_tokens), [10, 20, 20]);
+  assert(Math.abs(results.reduce((sum, r) => sum + r.kuku.consume_points, 0) - 0.5) < 1e-8);
+  await s.pool.agentContinuations.close();
+  assert.equal(s.pool.activeAccounts.size, 0);
+});
+
+test('native continuation supports Responses previous_response_id and streams only new output', async t => {
+  const s = continuationSetup(t, { rounds: 1 });
+  const first = await responses(s, { input: 'synthetic', stream: false });
+  const call = first.json.output.find(o => o.type === 'function_call');
+  const final = await responses(s, { previous_response_id: first.json.id, stream: true,
+    input: [{ type: 'function_call_output', call_id: call.call_id, output: 'marker' }] });
+  assert.equal(final.status, 200, final.body);
+  const completed = final.events.find(e => e.type === 'response.completed')?.response;
+  assert.equal(completed.output_text, 'Result: marker');
+  assert.equal(s.seen.send.length, 1); assert.equal(s.seen.close.length, 0);
+});
+
+for (const change of ['history', 'tools', 'choice', 'effort', 'account', 'image']) test('native continuation rejects changed ' + change + ' without callback or generation', async t => {
+  const s = continuationSetup(t, { rounds: 1 });
+  const first = await chat(s, { messages: [user], reasoning_effort: 'low' });
+  const message = first.json.choices[0].message;
+  const messages = [user, message, { role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'result' }];
+  const body = { tools: definitions, messages, reasoning_effort: 'low' };
+  if (change === 'history') messages[0] = { role: 'user', content: 'different' };
+  if (change === 'tools') body.tools = definitions.slice(0, 1);
+  if (change === 'choice') body.tool_choice = 'none';
+  if (change === 'effort') body.reasoning_effort = 'high';
+  if (change === 'image') messages.at(-1).content = [{ type: 'image_url', image_url: { url: 'https://example.com/image.png' } }];
+  const result = await request(s.app, '/v1/chat/completions', body, change === 'account' ? { 'x-kuku-account': 'two' } : {});
+  assert.equal(result.status, 409, result.body);
+  assert.equal(result.json.error.code, 'agent_continuation_unavailable');
+  assert.equal(s.seen.send.length, 1); assert.equal(s.seen.callbacks.filter(c => c.result?.content).length, 0);
+});
+
+test('native continuation rejects another API key but permits the owning key', async t => {
+  const s = continuationSetup(t, { rounds: 1 });
+  const app = createApp({ pool: s.pool, apiKeys: ['alpha', 'beta'], ledger: s.ledger });
+  const first = await request(app, '/v1/chat/completions', { tools: definitions, messages: [user] }, { authorization: 'Bearer alpha' });
+  const message = first.json.choices[0].message;
+  const body = { tools: definitions, messages: [user, message, { role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'private' }] };
+  const denied = await request(app, '/v1/chat/completions', body, { authorization: 'Bearer beta' });
+  assert.equal(denied.status, 409); assert.equal(s.seen.send.length, 1);
+  const ok = await request(app, '/v1/chat/completions', body, { authorization: 'Bearer alpha' });
+  assert.equal(ok.status, 200); assert.equal(ok.json.choices[0].message.content, 'Result: private');
+});
+
+test('native callback failure never retries on another account or resends a task', async t => {
+  const s = continuationSetup(t, { callbackFails: true });
+  const first = await chat(s, { messages: [user] }); const message = first.json.choices[0].message;
+  const failed = await chat(s, { messages: [user, message, { role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'done' }] });
+  assert.equal(failed.status, 502); assert.equal(s.seen.send.length, 1);
+  assert.equal(s.seen.callbacks.filter(c => c.result?.content).length, 1);
+  assert.equal(s.seen.close.length, 1);
+});
+
+test('expired native calls fail closed and shutdown releases connections', async t => {
+  const s = continuationSetup(t);
+  const first = await chat(s, { messages: [user] }); const message = first.json.choices[0].message;
+  await s.pool.agentContinuations.close();
+  const result = await chat(s, { messages: [user, message, { role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'late' }] });
+  assert.equal(result.status, 409); assert.equal(s.seen.send.length, 1); assert.equal(s.seen.close.length, 1);
+  assert.equal(s.pool.agentContinuations.sessions.size, 0); assert.equal(s.pool.activeAccounts.size, 0);
+});
+
+
+test('native continuation idle deadline closes the waiting upstream turn', async t => {
+  const s = continuationSetup(t); s.pool.agentContinuations.idleMs = 10;
+  const first = await chat(s, { messages: [user] });
+  assert.equal(first.status, 200);
+  const tasks = [...s.pool.agentContinuations.sessions].map(state => state.task);
+  // Keep the test process alive while the production unref timer expires.
+  const keepAlive = setTimeout(() => {}, 1000);
+  try { await Promise.all(tasks); } finally { clearTimeout(keepAlive); }
+  assert.equal(s.seen.close.length, 1); assert.equal(s.pool.agentContinuations.sessions.size, 0);
+  const msg = first.json.choices[0].message;
+  const late = await chat(s, { messages: [user, msg, { role: 'tool', tool_call_id: msg.tool_calls[0].id, content: 'late' }] });
+  assert.equal(late.status, 409); assert.equal(s.seen.send.length, 1);
+});
+
+test('concurrent duplicate continuation sends exactly one callback', async t => {
+  const s = continuationSetup(t, { rounds: 1 });
+  const first = await chat(s, { messages: [user] }); const msg = first.json.choices[0].message;
+  const original = s.pool.accounts[0].client.nativeToolResult;
+  let release, entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  s.pool.accounts[0].client.nativeToolResult = async args => { if (args.result?.content) { entered(); await gate; } return original(args); };
+  const body = { messages: [user, msg, { role: 'tool', tool_call_id: msg.tool_calls[0].id, content: 'only-once' }] };
+  const running = chat(s, body); await started;
+  try { const duplicate = await chat(s, body); assert.equal(duplicate.status, 409); }
+  finally { release(); }
+  assert.equal((await running).status, 200);
+  assert.equal(s.seen.callbacks.filter(c => c.result?.content).length, 1); assert.equal(s.seen.send.length, 1);
+  assert.equal((await chat(s, body)).status, 409);
+});
+
+test('credential replacement rejects pending continuation without callback', async t => {
+  const s = continuationSetup(t);
+  const first = await chat(s, { messages: [user] }); const msg = first.json.choices[0].message;
+  s.pool.set([{ id: 'one', upstream_user_id: '111', bduss: 'replacement', stoken: 'replacement' }]);
+  const result = await chat(s, { messages: [user, msg, { role: 'tool', tool_call_id: msg.tool_calls[0].id, content: 'done' }] });
+  assert.equal(result.status, 409); assert.equal(s.seen.send.length, 1);
+  assert.equal(s.seen.callbacks.filter(c => c.result?.content).length, 0);
+});
+
+test('persistence failure cancels a native handoff before it is exposed', async t => {
+  const s = continuationSetup(t);
+  s.pool.database = { recordTurn() { throw new Error('disk full'); } };
+  const failed = await chat(s, { messages: [user] });
+  assert.equal(failed.status, 500); assert.equal(s.seen.send.length, 1); assert.equal(s.seen.close.length, 1);
+  assert.equal(s.pool.agentContinuations.sessions.size, 0); assert.equal(s.pool.activeAccounts.size, 0);
+});
+
+
+test('native continuation maps out-of-order parallel results back to their original task IDs', async t => {
+  let context;
+  const s = setup(t, ctx => { context = ctx; return { calls: [
+    { name: 'read_file', arguments: { value: 'A' } }, { name: 'read_file', arguments: { value: 'B' } },
+  ] }; });
+  s.pool.agentContinuations.enabled = true; t.after(() => s.pool.agentContinuations.close());
+  const received = [];
+  const original = s.pool.accounts[0].client.nativeToolResult;
+  s.pool.accounts[0].client.nativeToolResult = async args => {
+    if (!args.result?.content) return original(args);
+    received.push({ task: args.task_id, result: args.result.content[0].text });
+    if (received.length === 2) { context.emit('TEXT_BLOCK_DELTA', { delta: 'both received' }); context.emit('TURN_DONE'); }
+  };
+  const first = await chat(s, { messages: [user] }); const message = first.json.choices[0].message;
+  const results = message.tool_calls.map((call, index) => ({ role: 'tool', tool_call_id: call.id, content: 'result-' + index })).reverse();
+  const final = await chat(s, { messages: [user, message, ...results] });
+  assert.equal(final.status, 200, final.body);
+  assert.deepEqual(received.map(r => r.result), ['result-0', 'result-1']);
+  assert.match(received[0].task, /-0$/); assert.match(received[1].task, /-1$/);
+  assert.equal(s.seen.send.length, 1);
+});
+
+for (const mode of ['capacity', 'required']) test('native continuation retains the legacy path for ' + mode, async t => {
+  const s = continuationSetup(t);
+  if (mode === 'capacity') s.pool.agentContinuations.maxSessions = 0;
+  const result = await chat(s, { messages: [user], ...(mode === 'required' ? { tool_choice: 'required' } : {}) });
+  assert.equal(result.status, 200, result.body);
+  assert(!result.json.choices[0].message.tool_calls[0].id.startsWith('call_kuku_native_'));
+  assert.equal(s.seen.close.length, 1); assert.equal(s.pool.agentContinuations.sessions.size, 0);
+});
+
+test('cancelling an active continuation releases its waiting upstream connections', async t => {
+  const s = continuationSetup(t);
+  const agent = prepareAgent({ tools: definitions, messages: [user] }, 'chat'); agent.scope = 'direct';
+  const controller = new AbortController();
+  const first = await s.pool.chat({ account: s.pool.accounts[0], model: { id: model }, messages: agent.messages, agent,
+    sessionKey: 'first' }, () => {}, controller.signal);
+  const next = prepareAgent({ tools: definitions, messages: [user, { role: 'assistant', content: first.content, tool_calls: first.tool_calls },
+    { role: 'tool', tool_call_id: first.tool_calls[0].id, content: 'result' }] }, 'chat'); next.scope = 'direct';
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  s.pool.accounts[0].client.nativeToolResult = async args => {
+    entered();
+    await new Promise((_, reject) => { if (args.signal.aborted) reject(args.signal.reason); else args.signal.addEventListener('abort', () => reject(args.signal.reason), { once: true }); });
+  };
+  const resumed = s.pool.chat({ account: s.pool.accounts[0], model: { id: model }, messages: next.messages, agent: next,
+    sessionKey: 'second' }, () => {}, controller.signal);
+  resumed.catch(() => {}); await started; controller.abort();
+  await assert.rejects(resumed);
+  await s.pool.agentContinuations.close();
+  assert.equal(s.seen.close.length, 1); assert.equal(s.seen.send.length, 1); assert.equal(s.pool.activeAccounts.size, 0);
+});
+
+
+test('late native tool tasks after handoff cannot receive an invented callback result', async t => {
+  let context;
+  const s = setup(t, ctx => { context = ctx; return { calls: [{ name: 'read_file', arguments: { value: 'first' } }] }; });
+  s.pool.agentContinuations.enabled = true; t.after(() => s.pool.agentContinuations.close());
+  const first = await chat(s, { messages: [user] });
+  const tasks = [...s.pool.agentContinuations.sessions].map(state => state.task);
+  const { args, sandbox } = context;
+  sandbox.push({ data: { type: 'sandbox', sub_type: 'task', task_id: 'late-extra-call', data: {
+    method: 'local_connector', params: { session_id: args.session_id, device_id: args.device_id, server_name: args.connector_list[0].name,
+      sub_method: 'tools/call', tool_name: 'read_file', arguments: { value: 'late' }, request_id: 50 },
+  } } });
+  await Promise.all(tasks);
+  const msg = first.json.choices[0].message;
+  const result = await chat(s, { messages: [user, msg, { role: 'tool', tool_call_id: msg.tool_calls[0].id, content: 'done' }] });
+  assert.equal(result.status, 409); assert.equal(s.seen.callbacks.filter(c => c.result?.content).length, 0);
+  assert.equal(s.seen.send.length, 1); assert.equal(s.seen.close.length, 1);
 });

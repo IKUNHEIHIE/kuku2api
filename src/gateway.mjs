@@ -3,6 +3,7 @@ import { normalizeChatMessages, callerInstructions, visibleContent, visibleMessa
 import { prepareImages } from './images.mjs';
 import { agentMessages } from './agent.mjs';
 import { nativeAgentTurn } from './native-agent.mjs';
+import { AgentContinuations } from './agent-continuations.mjs';
 import { createPoolRecovery } from './pool-recovery.mjs';
 
 export function frameToDelta(frame) {
@@ -100,7 +101,8 @@ export function makeChunk(id, created, model, delta, finish_reason = null) {
 }
 
 export class Pool {
-  constructor(accounts = [], { cooldownMs = 5 * 60_000, authCooldownMs = 60 * 60_000, balanceRetryMs = 10 * 60_000, sessionStore = null, database = null, logger = console, claimNow = () => performance.now(), claimWait = (ms) => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
+  constructor(accounts = [], { cooldownMs = 5 * 60_000, authCooldownMs = 60 * 60_000, balanceRetryMs = 10 * 60_000, sessionStore = null, database = null, logger = console, claimNow = () => performance.now(), claimWait = (ms) => new Promise(resolve => setTimeout(resolve, ms)), agentContinuation = false } = {}) {
+    this.agentContinuations = new AgentContinuations({ enabled: agentContinuation });
     this.database = database;
     this.logger = logger;
     this.cooldownMs = cooldownMs;
@@ -535,6 +537,7 @@ export class Pool {
           error_code: error?.code, result: result?.tool_calls?.length
             ? { ...result, content: JSON.stringify({ content: result.content, tool_calls: result.tool_calls }) } : result ?? observation });
       } catch {
+        await this.agentContinuations.cancelTurn(result);
         const failure = new Error('Database could not persist the inference record');
         failure.persistence = true; // Never spend another account's points retrying a disk failure.
         throw failure;
@@ -576,9 +579,15 @@ export class Pool {
     // silently pick its own default, ignoring the caller's model choice.
     if (!MODEL_INDEX.has(model.id)) await this.refreshModelIndex(account);
     const cfg = MODEL_INDEX.get(model.id) ?? { model_name: model.id, display_name: model.id };
-    if (agent) return nativeAgentTurn({ client: account.client, model: cfg, agent, onDelta, beforeSend: checkAvailable,
-      think_mode: think_mode ?? cfg.think_mode ?? lastCatalog?.default_think_id ?? 3, observation, signal,
-      ownsAccount: () => this.accounts.some(a => a.id === accountId && a.upstream_user_id === upstreamUserId) });
+    if (agent) {
+      const credentials = [account.client.bduss, account.client.stoken];
+      const native = { client: account.client, model: cfg, agent, onDelta, beforeSend: checkAvailable,
+        think_mode: think_mode ?? cfg.think_mode ?? lastCatalog?.default_think_id ?? 3, observation, signal,
+        ownsAccount: () => this.accounts.some(a => a.id === accountId && a.upstream_user_id === upstreamUserId
+          && a.client.bduss === credentials[0] && a.client.stoken === credentials[1] && !a.disabled) };
+      return this.agentContinuations.run({ ...native, account, scope: agent.scope }, continuation =>
+        continuation ? this.withAccountWork(accountId, () => nativeAgentTurn({ ...native, continuation })) : nativeAgentTurn(native));
+    }
     const logicalKey = deriveSessionKey({ sessionKey, messages, accountId: account.id });
     const key = accountSessionKey(account.id, logicalKey);
     let s = this.sessions.get(key);
