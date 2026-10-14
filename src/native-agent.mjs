@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { frameToDelta } from './gateway.mjs';
-import { UpstreamError } from './upstream.mjs';
+import { UpstreamError, turnError } from './upstream.mjs';
 import { validateAgentTurn } from './agent.mjs';
 import { callerInstructions } from './messages.mjs';
 import { prepareImages } from './images.mjs';
@@ -178,7 +178,7 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
       // validated batch already schedules handoff; do not treat that wait as an
       // unsupported desktop action merely because it races the batching timer.
       if (delta?.requires_client && !calls.length) throw failure('Native model requested desktop input instead of a client tool');
-      if (delta?.error) throw failure('Native conversation returned an error');
+      if (delta?.error) throw turnError(delta.error);
       if (delta?.commercial) {
         const drained = delta.commercial.reason === 'insufficient_balance' || Number(delta.commercial.errno) === 11002;
         const refused = drained && !content && !reasoning && !calls.length && !observation.usage_events.length && !(observation.consume_points > 0);

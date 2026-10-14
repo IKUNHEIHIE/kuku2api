@@ -85,6 +85,17 @@ async function request(app, route, body, headers = {}, onWrite = () => {}) {
 const chat = (s, body) => request(s.app, '/v1/chat/completions', { tools: definitions, ...body });
 const responses = (s, body) => request(s.app, '/v1/responses', { tools: definitions.map(t => ({ type: 'function', ...t.function })), ...body });
 
+for(const native of [false,true])test(`upstream error frames are classified as transient generation errors without replay (native=${native})`,async t=>{
+  const s=setup(t),first=s.pool.accounts[0];let sends=0;
+  const send=first.client.sendmsg;
+  first.client.sendmsg=async args=>{sends++;if(native)await send(args);};
+  first.client.sse=async function*(){yield{data:{type:'ERROR',data:{message:'PRIVATE-UPSTREAM-TEXT'}}};};
+  const result=await chat(s,{messages:[user],...(native?{}:{tools:undefined})});
+  assert.equal(result.status,502);assert.equal(result.json.error.code,'upstream_turn_error');
+  assert.equal(sends,1);assert.equal(first.consecutive_failures,1);
+  assert(!result.body.includes('PRIVATE-UPSTREAM-TEXT'));
+});
+
 for (const surface of ['chat', 'responses']) for (const stream of [false, true]) for (const reason of ['auth', 'network', 'send-refused']) {
   test(`${surface} fails over before generation after ${reason} (stream=${stream})`, async t => {
     const s = setup(t, ({ account }) => ({ text: account.id }));

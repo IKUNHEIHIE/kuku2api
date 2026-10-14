@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button'
 import { useUsers } from './users-provider'
 
 export function TokenRefreshPanel() {
-  const { adminEnabled, refreshAccountStatus } = useUsers()
+  const { adminEnabled, refreshAccountStatus, upstreamCooldowns } = useUsers()
   const [state, setState] = useState<TokenRefreshState | null>(null)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState('')
@@ -132,6 +132,11 @@ export function TokenRefreshPanel() {
           {pending || state?.running ? '正在依次刷新…' : '立即刷新全部'}
         </Button>
       </div>
+      {(upstreamCooldowns ?? []).map(item => (
+        <p key={`${item.scope}:${item.model ?? item.reason}`} role='status' className='text-sm text-amber-700 dark:text-amber-400'>
+          {item.model ? `模型 ${item.model}` : '公共上游连接'}：{item.reason}，{item.recovering ? '正在确认恢复' : `约 ${Math.ceil(item.retry_after_ms / 1000)} 秒后重试`}。
+        </p>
+      ))}
       <p className='text-xs text-muted-foreground'>
         账号依次处理，间隔 15
         秒；正在对话或领取积分的账号稍后再试。续期不会发送模型对话。缺少 PTOKEN

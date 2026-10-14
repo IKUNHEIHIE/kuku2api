@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { render } from 'vitest-browser-react'
 import { userEvent } from 'vitest/browser'
-import { kukuApi, type TokenRefreshState } from '@/lib/kuku-api'
+import { kukuApi, type TokenRefreshState, type PoolCooldown } from '@/lib/kuku-api'
 import { TokenRefreshPanel } from './token-refresh-panel'
 
 const context = vi.hoisted(() => ({
   adminEnabled: true,
   refreshAccountStatus: vi.fn(),
+  upstreamCooldowns: [] as PoolCooldown[],
 }))
 vi.mock('./users-provider', () => ({ useUsers: () => context }))
 vi.mock('@/lib/kuku-api', async (importOriginal) => {
@@ -35,11 +36,18 @@ describe('account credential renewal controls', () => {
     vi.restoreAllMocks()
     vi.resetAllMocks()
     context.adminEnabled = true
+    context.upstreamCooldowns = []
     context.refreshAccountStatus.mockResolvedValue(undefined)
     vi.mocked(kukuApi.getTokenRefresh).mockResolvedValue({
       ok: true,
       token_refresh: state,
     })
+  })
+
+  it('shows a model-specific shared failure and the suggested retry time', async () => {
+    context.upstreamCooldowns = [{ scope: 'model', model: 'fixture-model', reason: '上游模型生成暂时失败', retry_after_ms: 10000, recovering: false }]
+    const screen = await render(<TokenRefreshPanel />)
+    await expect.element(screen.getByRole('status')).toHaveTextContent('模型 fixture-model：上游模型生成暂时失败，约 10 秒后重试')
   })
 
   it('loads saved settings, toggles scheduling and manually refreshes accounts without model calls', async () => {

@@ -43,9 +43,9 @@ function redact(msg) {
   return String(msg).replace(/(BDUSS|PTOKEN|STOKEN)=[^;"\s]+/g, '$1=<redacted>');
 }
 
-function json(res, status, obj) {
+function json(res, status, obj, headers = {}) {
   const body = JSON.stringify(obj);
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(body), ...CORS });
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(body), ...CORS, ...headers });
   res.end(body);
 }
 
@@ -85,10 +85,12 @@ const CORS = {
   'access-control-allow-origin': process.env.CORS_ORIGIN ?? '*',
   'access-control-allow-headers': 'authorization, content-type, x-api-key, x-admin-token, x-kuku-account, x-kuku-session, x-kuku-allow-unavailable',
   'access-control-allow-methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+  'access-control-expose-headers': 'Retry-After',
 };
 
-function openError(res, status, message, type = 'invalid_request_error', code) {
-  json(res, status, { error: code ? { message, type, code } : { message, type } });
+function openError(res, status, message, type = 'invalid_request_error', code, retryAfter) {
+  const retry = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.ceil(retryAfter) : null;
+  json(res, status, { error: { message, type, ...(code ? { code } : {}), ...(retry ? { retry_after_ms: retry } : {}) } }, retry ? { 'retry-after': String(Math.ceil(retry / 1000)) } : {});
 }
 
 const DEFAULT_MODEL = 'gateway-glm-5.3-flash';
@@ -121,29 +123,12 @@ async function readBody(req) {
 
 // A 200 that carries a business code is a failure. Network jitter must not be punished the
 // same way, and neither must a caller's own bad request.
-function isDeterministicUpstreamFailure(err) {
-  return err instanceof UpstreamError && !err.network;
-}
 
 // Account-state failures are scheduling facts, not request errors: mark the account so the next
 // pick skips it, then let the caller fail over. A drained account is deliberately NOT cooled —
 // its flag is cleared by the next /pool/points read once upstream refills the daily free points.
-function noteAccountFailure(pool, acct, err) {
-  if (err?.persistence) return true;
-  const paramError = pool.isClientParamError(err);
-  acct = err?.failureAccount ?? acct;
-  // Saving another account rebuilds pool rows while this request can still be in flight.
-  // Apply the scheduling result to the live row, but never condemn a newer credential.
-  const current = pool.accounts.find(a => a.id === acct.id && a.upstream_user_id === acct.upstream_user_id &&
-    a.client.bduss === acct.client.bduss && a.client.stoken === acct.client.stoken);
-  if (!current) return paramError || err?.retryUnsafe === true;
-  acct = current;
-  const neutral = ['invalid_tool_response','session_account_mismatch','upstream_requires_client','invalid_image','unsafe_image_url','image_too_large','image_download_failed','image_upload_failed','image_rejected'].includes(err?.code);
-  if (pool.isInsufficientBalance(err)) pool.markBalanceDead(acct);
-  else if (pool.isAuthFailure(err)) pool.markAuthDead(acct);
-  else if (!paramError && !neutral && (err?.network || [429,500,502,503,504].includes(err?.status))) pool.cool(acct, Math.min(pool.cooldownMs, 30_000));
-  else if (!paramError && !neutral && isDeterministicUpstreamFailure(err)) pool.cool(acct);
-  return paramError || err?.retryUnsafe === true;
+async function noteAccountFailure(pool, acct, err, model) {
+  return pool.recovery ? pool.recovery.failure(acct, err, model) : !!(err?.persistence || err?.retryUnsafe || pool.isClientParamError(err));
 }
 
 // An exhausted pool must not look like "the model answered nothing".
@@ -153,7 +138,7 @@ function failureResponse(err) {
   }
   const status = Number(err?.status);
   return { status: Number.isInteger(status) && status >= 400 && status <= 599 ? status : (err instanceof UpstreamError || err?.network ? 502 : 500),
-    code: ['upstream_timeout', 'upstream_incomplete', 'upstream_requires_client', 'invalid_tool_response', 'session_account_mismatch', 'session_history_unavailable', 'invalid_image', 'unsafe_image_url', 'image_too_large', 'image_download_failed', 'image_upload_failed', 'image_rejected'].includes(err?.code) ? err.code : undefined };
+    code: ['pool_cooling_down', 'pool_unavailable', 'upstream_turn_error', 'upstream_timeout', 'upstream_incomplete', 'upstream_requires_client', 'invalid_tool_response', 'session_account_mismatch', 'session_history_unavailable', 'invalid_image', 'unsafe_image_url', 'image_too_large', 'image_download_failed', 'image_upload_failed', 'image_rejected'].includes(err?.code) ? err.code : undefined };
 }
 
 // reqBody.kuku_meta adds a final non-standard `data: {"kuku":{...}}` frame so a console UI
@@ -175,9 +160,9 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
   const allowUnavailable = opts.admin === true && req.headers['x-kuku-allow-unavailable'] === '1';
   let acct;
   try {
-    acct = pool.resolve(wanted, { allowUnavailable });
+    acct = pool.resolve(wanted, { allowUnavailable, model });
   } catch (e) {
-    return openError(res, e.status ?? 409, redact(e.message), 'pool_error', failureResponse(e).code);
+    return openError(res, e.status ?? 409, redact(e.message), 'pool_error', failureResponse(e).code, e.retry_after_ms);
   }
 
   const id = `chatcmpl-${crypto.randomUUID()}`;
@@ -240,9 +225,9 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
       break;
     } catch (err) {
       lastErr = err;
-      const paramError = noteAccountFailure(pool, acct, err);
+      const paramError = await noteAccountFailure(pool, acct, err, model);
       if (wanted || paramError || sentAny || controller.signal.aborted) break;
-      const next = pool.pick({ allowUnavailable, exclude: tried });
+      const next = pool.pick({ allowUnavailable, exclude: tried, model });
       if (!next) break;
       acct = next;
     }
@@ -251,7 +236,7 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
   if (controller.signal.aborted) return;
   if (lastErr && !sentAny) {
     const f = failureResponse(lastErr);
-    return openError(res, f.status, redact(lastErr.message), 'upstream_error', f.code);
+    return openError(res, f.status, redact(lastErr.message), 'upstream_error', f.code, lastErr.retry_after_ms);
   }
 
   if (stream) {
@@ -326,10 +311,10 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
       if (prev.agent_bridge && owner.upstream_user_id !== prev.upstream_user_id) {
         return openError(res, 409, 'Agent 历史所属账号身份已变化，请新建对话', 'pool_error', 'session_account_mismatch');
       }
-      acct = pool.resolve(prev.agent_bridge && !wanted && !allowUnavailable && pool.isUnavailable(owner) ? null : prev.account, { allowUnavailable });
-    } else acct = pool.resolve(wanted, { allowUnavailable });
+      acct = pool.resolve(prev.agent_bridge && !wanted && !allowUnavailable && pool.isUnavailable(owner) ? null : prev.account, { allowUnavailable, model });
+    } else acct = pool.resolve(wanted, { allowUnavailable, model });
   } catch (e) {
-    return openError(res, e.status ?? 409, redact(e.message), 'pool_error', prev ? 'response_account_unavailable' : failureResponse(e).code);
+    return openError(res, e.status ?? 409, redact(e.message), 'pool_error', failureResponse(e).code ?? (prev ? 'response_account_unavailable' : undefined), e.retry_after_ms);
   }
 
   const id = newResponseId();
@@ -394,9 +379,9 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
       break;
     } catch (err) {
       lastErr = err;
-      const paramError = noteAccountFailure(pool, acct, err);
+      const paramError = await noteAccountFailure(pool, acct, err, model);
       if ((prev && !agent) || wanted || paramError || sentAny || controller.signal.aborted) break;
-      const next = pool.pick({ allowUnavailable, exclude: tried });
+      const next = pool.pick({ allowUnavailable, exclude: tried, model });
       if (!next) break;
       acct = next;
     }
@@ -418,7 +403,7 @@ export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
         ...(agent ? { agent_bridge: true, upstream_user_id: acct.upstream_user_id } : {}) });
       return sc.failed(redact(lastErr.message), failed);
     }
-    return openError(res, f.status, redact(lastErr.message), 'upstream_error', f.code);
+    return openError(res, f.status, redact(lastErr.message), 'upstream_error', f.code, lastErr.retry_after_ms);
   }
 
   const text = turn?.content ?? '';
@@ -498,6 +483,9 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
     balance_dead: (a.balance_dead_until ?? 0) > Date.now(),
     balance_retry_in_ms: Math.max(0, (a.balance_dead_until ?? 0) - Date.now()),
     cooldown_remaining_ms: Math.max(0, a.cooldown_until - Date.now()),
+    cooldown_reason: a.cooldown_until > Date.now() ? a.cooldown_reason ?? null : null,
+    consecutive_failures: a.consecutive_failures ?? 0,
+    last_error_code: a.last_error_code ?? null,
     // Credential material is never echoed back; the UI only ever needs to tell accounts apart.
     has_credential: Boolean(a.client?.bduss && a.client?.stoken),
     credential: { status: a.auth_dead ? 'invalid' : a.credential?.status ?? 'unknown', can_refresh: !!a.ptoken,
@@ -599,7 +587,9 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
           a.cooldown_until = 0;
           a.auth_dead = false;
           a.balance_dead_until = 0;
+          a.consecutive_failures = 0; a.last_failure_at = 0; a.last_failure_seq = 0; a.last_error_code = null; a.cooldown_reason = null;
         }
+        if (!body.id) pool.recovery?.reset();
         return json(res, 200, { ok: true, accounts: pool.accounts.map(shape) });
       }
 
@@ -824,6 +814,7 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
     if (url.pathname === '/pool/state') {
       return json(res, 200, {
         accounts: pool.accounts.map(shape),
+        upstream_cooldowns: pool.recovery?.state ?? [],
         sessions: pool.sessions.size,
         admin_enabled: Boolean(adminToken),
         // The UI needs to be able to say "this server is currently unauthenticated".

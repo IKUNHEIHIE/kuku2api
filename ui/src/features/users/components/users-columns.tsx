@@ -106,8 +106,8 @@ export const usersColumns: ColumnDef<Account>[] = [
       if (a.cooldown_remaining_ms > 0) {
         const secs = Math.ceil(a.cooldown_remaining_ms / 1000)
         return (
-          <Badge className='flex w-fit items-center gap-1 bg-yellow-500/15 text-yellow-700 dark:text-yellow-400 border-yellow-500/30 font-normal'>
-            冷却中 ({secs}s)
+          <Badge title={a.cooldown_reason ?? undefined} className='flex w-fit items-center gap-1 bg-yellow-500/15 text-yellow-700 dark:text-yellow-400 border-yellow-500/30 font-normal'>
+            {a.cooldown_reason || '冷却中'} ({secs}s，连续失败 {a.consecutive_failures ?? 0} 次)
           </Badge>
         )
       }

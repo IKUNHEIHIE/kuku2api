@@ -50,6 +50,14 @@ function requestSignal(signal, timeoutMs) {
   return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
+// Keep only a bounded numeric code; upstream bodies may contain private input.
+export function turnError(data) {
+  const candidate = data?.code ?? data?.errno ?? data?.error_code ?? data?.status?.code;
+  const raw = ['number','string'].includes(typeof candidate) ? String(candidate) : '';
+  const code = /^-?\d{1,10}$/.test(raw) && Number(candidate) !== 0 ? Number(candidate) : 'upstream_turn_error';
+  return new UpstreamError('上游对话生成失败，请稍后重试', { code, status: 502, retryUnsafe: true });
+}
+
 function networkError(error, signal, retryUnsafe = false) {
   const timeout = signal.aborted && signal.reason?.name === 'TimeoutError';
   return new UpstreamError(timeout ? '上游请求超时；结果可能尚未确认，请先刷新任务和余额，不要自动重试对话' : `network: ${error.message}`, {

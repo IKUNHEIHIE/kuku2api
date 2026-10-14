@@ -6,12 +6,14 @@ import {
   type AccountHealthResult,
   type AccountPointsResult,
   type AutoClaimState,
+  type PoolCooldown,
 } from '@/lib/kuku-api'
 import { toast } from 'sonner'
 
 export type UsersDialogType = 'add' | 'edit' | 'delete' | 'resequence' | 'free-points'
 
 export type UsersContextType = {
+  upstreamCooldowns: PoolCooldown[]
   open: UsersDialogType | null
   setOpen: (str: UsersDialogType | null) => void
   addTab: 'qr' | 'sms' | 'manual'
@@ -73,6 +75,7 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
   }, [setOpen])
 
   const [accounts, setAccounts] = useState<Account[]>([])
+  const [upstreamCooldowns, setUpstreamCooldowns] = useState<PoolCooldown[]>([])
   const [loading, setLoading] = useState(true)
   const [checkingHealth, setCheckingHealth] = useState(false)
   const [healthResults, setHealthResults] = useState<Record<string, AccountHealthResult>>({})
@@ -98,6 +101,7 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
       const accs = state.accounts || []
       if (version === accountRequest.current) {
         setAccounts(accs)
+        setUpstreamCooldowns(state.upstream_cooldowns || [])
         setGap(detectPriorityGap(accs))
       }
       setAdminEnabled(state.admin_enabled)
@@ -133,6 +137,7 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
           const accs = state.accounts || []
           if (version === accountRequest.current) {
             setAccounts(accs)
+            setUpstreamCooldowns(state.upstream_cooldowns || [])
             setGap(detectPriorityGap(accs))
           }
           setAdminEnabled(state.admin_enabled)
@@ -167,7 +172,10 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
   const refreshAccountStatus = useCallback(async () => {
     const version = ++accountRequest.current
     const state = await kukuApi.getPoolState()
-    if (version === accountRequest.current) setAccounts(state.accounts || [])
+    if (version === accountRequest.current) {
+      setAccounts(state.accounts || [])
+      setUpstreamCooldowns(state.upstream_cooldowns || [])
+    }
   }, [])
 
   const runHealthCheck = useCallback(
@@ -342,6 +350,7 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
 
   const contextValue = React.useMemo<UsersContextType>(
     () => ({
+      upstreamCooldowns,
       open,
       setOpen,
       addTab,
@@ -377,6 +386,7 @@ export function UsersProvider({ children }: { children: React.ReactNode }) {
       deleteAccount,
     }),
     [
+      upstreamCooldowns,
       open,
       setOpen,
       addTab,

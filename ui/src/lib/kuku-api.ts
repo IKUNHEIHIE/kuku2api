@@ -7,6 +7,9 @@ export interface Account {
   balance_dead?: boolean
   balance_retry_in_ms?: number
   cooldown_remaining_ms: number
+  cooldown_reason?: string | null
+  consecutive_failures?: number
+  last_error_code?: string | null
   has_credential: boolean
   credential?: {
     status: 'unknown' | 'valid' | 'invalid' | 'refresh_failed' | 'error'
@@ -49,6 +52,15 @@ export interface PoolState {
   api_open?: boolean
   api_key_count?: number
   auto_claim?: AutoClaimState
+  upstream_cooldowns?: PoolCooldown[]
+}
+
+export interface PoolCooldown {
+  scope: 'model' | 'upstream'
+  model: string | null
+  reason: string
+  retry_after_ms: number
+  recovering: boolean
 }
 
 export interface AccountHealthResult {

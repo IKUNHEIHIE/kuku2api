@@ -1,8 +1,9 @@
-import { KukuAccount, UpstreamError } from './upstream.mjs';
+import { KukuAccount, UpstreamError, turnError } from './upstream.mjs';
 import { normalizeChatMessages, callerInstructions, visibleContent, visibleMessages } from './messages.mjs';
 import { prepareImages } from './images.mjs';
 import { agentMessages } from './agent.mjs';
 import { nativeAgentTurn } from './native-agent.mjs';
+import { createPoolRecovery } from './pool-recovery.mjs';
 
 export function frameToDelta(frame) {
   const d = frame?.data;
@@ -110,6 +111,7 @@ export class Pool {
     this.queues = new Map();
     this.activeAccounts = new Map();
     this.credentialRefreshes = new Map();
+    this.recovery = createPoolRecovery(this);
     this.claimQueueKey = Symbol('free-point claims');
     this.nextClaimAt = 0;
     this.claimNow = claimNow;
@@ -155,6 +157,8 @@ export class Pool {
     const prev = new Map((this.accounts ?? []).map((a) => [a.id, a]));
     this.accounts = accounts.map((a, i) => {
       const old = prev.get(a.id);
+      const client = new KukuAccount(a);
+      const sameCredential = old?.client.bduss === client.bduss && old?.client.stoken === client.stoken;
       return {
         id: a.id ?? `acct-${i}`,
         alias: a.alias ?? a.id ?? `acct-${i}`,
@@ -166,7 +170,12 @@ export class Pool {
         cooldown_until: old?.cooldown_until ?? 0,
         auth_dead: old?.auth_dead ?? (a.credential?.status === 'invalid'),
         balance_dead_until: old?.balance_dead_until ?? 0,
-        client: new KukuAccount(a),
+        consecutive_failures: sameCredential ? old.consecutive_failures ?? 0 : 0,
+        last_failure_at: sameCredential ? old.last_failure_at ?? 0 : 0,
+        last_failure_seq: sameCredential ? old.last_failure_seq ?? 0 : 0,
+        last_error_code: sameCredential ? old.last_error_code ?? null : null,
+        cooldown_reason: sameCredential ? old.cooldown_reason ?? null : null,
+        client,
       };
     });
     this.accounts.sort((x, y) => x.priority - y.priority);
@@ -174,7 +183,8 @@ export class Pool {
 
   // Drain the lowest priority number completely before touching the next one.
   // Round-robin over the sorted list silently degrades into weighted polling.
-  pick({ allowUnavailable = false, exclude = [] } = {}) {
+  pick({ allowUnavailable = false, exclude = [], model } = {}) {
+    if (!allowUnavailable) { try { this.recovery.check(model); } catch { return null; } }
     const now = Date.now();
     for (const a of this.accounts) {
       if (exclude.includes(a.id)) continue;
@@ -196,11 +206,13 @@ export class Pool {
   // Codes measured per family: /wenchain/* -> 1000004, /bizapi/* -> 200001,
   // /api/genflowpro/* -> errno -6 "未登录" (the client also treats -7/-8 as auth-class).
   isAuthFailure(err) {
-    return err instanceof UpstreamError && ([1000004, 200001, -6, -7, -8].includes(Number(err.code)) || [401,403].includes(err.status));
+    return err instanceof UpstreamError && ([1000004, 200001, -6, -7, -8].includes(Number(err.code)) || err.status === 401);
   }
 
-  markAuthDead(account) {
+  markAuthDead(account, code = null) {
     account.auth_dead = true;
+    account.cooldown_reason = '登录已失效，请检测登录或续期';
+    account.last_error_code = typeof code === 'number' && Number.isFinite(code) ? String(code) : 'upstream_auth_error';
     account.cooldown_until = Date.now() + this.authCooldownMs;
   }
 
@@ -213,19 +225,27 @@ export class Pool {
 
   markBalanceDead(account) {
     account.balance_dead_until = Date.now() + this.balanceRetryMs;
+    account.last_error_code = '11002';
   }
 
   // Client-directed account selection must not bypass the disabled/cooldown gates.
-  resolve(wanted, { allowUnavailable = false } = {}) {
+  resolve(wanted, { allowUnavailable = false, model } = {}) {
+    if (!allowUnavailable) this.recovery.check(model);
     const a = wanted ? (this.accounts.find(x => x.id === wanted) ?? this.accounts.find(x => x.alias === wanted)) : null;
     if (wanted && !a) throw Object.assign(new Error(`unknown account: ${wanted}`), { status: 404 });
-    const acct = a ?? this.pick({ allowUnavailable });
+    const acct = a ?? this.pick({ allowUnavailable, model });
     if (!acct) {
       // Every account excluded because upstream said "out of points": keep the 402 contract the
       // first request got, instead of degrading to a generic pool exhaustion 409.
-      const drained = this.accounts.length > 0 && this.accounts.every((x) => x.balance_dead_until > Date.now());
+      const enabled = this.accounts.filter(a => !a.disabled);
+      const drained = enabled.length > 0 && enabled.every((x) => x.balance_dead_until > Date.now());
       if (drained) throw Object.assign(new Error('积分不足，无法继续任务。'), { status: 402, insufficient_balance: true });
-      throw new Error('no available account in pool');
+      const candidates = this.accounts.filter(a => !a.disabled && !a.auth_dead);
+      if (candidates.length) {
+        const wait = Math.min(...candidates.map(a => Math.max(a.cooldown_until, a.balance_dead_until) - Date.now()));
+        if (wait > 0) throw this.recovery.blockedError(wait, '账号暂时冷却中');
+      }
+      throw Object.assign(new Error(this.accounts.some(a => !a.disabled) ? '账号登录均不可用，请检测登录或续期' : '号池为空或所有账号已停用'), { status: 409, code: 'pool_unavailable' });
     }
     if (!allowUnavailable && a && this.isUnavailable(a)) {
       throw Object.assign(new Error(`account ${acct.id} is unavailable`), { status: 409 });
@@ -495,12 +515,13 @@ export class Pool {
       const current = this.accounts.find(a => a.id === args.account.id && a.upstream_user_id === args.account.upstream_user_id);
       if (!current) throw sessionError('账号已删除或身份已变化', 'session_account_mismatch');
       if (!args.allowUnavailable && this.isUnavailable(current)) throw Object.assign(new Error('排队期间账号已不可用'), { status: 409, code: 'account_unavailable' });
-      return this.recordedChat({ ...args, account: current }, onDelta, signal);
+      return this.recovery.run(args.model.id, recoveryLease => this.recordedChat({ ...args, account: current, recoveryLease }, onDelta, signal), args.allowUnavailable);
     }));
   }
 
   async recordedChat(args, onDelta, signal) {
     const started = Date.now();
+    const recoveryRevision = this.recovery.revision;
     const observation = { usage_events: [] };
     let result, error, turnId, usedAccount = args.account;
     try { result = await this._chat(args, onDelta, signal, observation, account => { usedAccount = account; }); }
@@ -528,14 +549,16 @@ export class Pool {
       // Private request context: never serialize credentials into observations or API errors.
       Object.defineProperty(error, 'failureAccount', { value: usedAccount, configurable: true });
       error.observation = observation;
+      await this.recovery.failure(usedAccount, error, args.model.id);
       try { this.logger.warn('inference failed:', args.source ?? 'chat', args.account.id, args.model.id, error.message); }
       catch { console.error('Database inference error log could not be saved'); }
       throw error;
     }
+    if (!result?.cancelled) this.recovery.success(usedAccount, args.model.id, started, recoveryRevision);
     return result;
   }
 
-  async _chat({ account, model, messages, sessionKey, think_mode, requiredSessionId, agent, instructions, allowUnavailable = false }, onDelta = () => {}, signal, observation = { usage_events: [] }, observeAccount = () => {}) {
+  async _chat({ account, model, messages, sessionKey, think_mode, requiredSessionId, agent, instructions, allowUnavailable = false, recoveryLease = false }, onDelta = () => {}, signal, observation = { usage_events: [] }, observeAccount = () => {}) {
     if (signal?.aborted) return { content: '', reasoning: '', usage: null, consume_points: null, usage_events: [], cancelled: true };
     const current = this.accounts.find(a => a.id === account.id);
     if (!current || current.upstream_user_id !== account.upstream_user_id) {
@@ -545,6 +568,7 @@ export class Pool {
     observeAccount(account);
     const accountId = account.id, upstreamUserId = account.upstream_user_id;
     const checkAvailable = () => {
+      if (!allowUnavailable) this.recovery.check(model.id, recoveryLease);
       const live = this.accounts.find(a => a.id === accountId && a.upstream_user_id === upstreamUserId);
       if (live && !allowUnavailable && this.isUnavailable(live)) throw Object.assign(new Error('发送前账号已不可用'), { status: 409, code: 'account_unavailable' });
     };
@@ -673,7 +697,7 @@ export class Pool {
       if (delta.requires_client) throw new UpstreamError('上游对话正在等待电脑客户端执行工具或补充输入，后端无法继续；请先查看任务状态，不要自动重复发送对话', {
         code: 'upstream_requires_client', status: 422, retryUnsafe: true,
       });
-      if (delta.error) throw new UpstreamError(`upstream turn error`, { body: delta.error });
+      if (delta.error) throw turnError(delta.error);
       if (delta.commercial) {
         const c = delta.commercial;
         const drained = c.reason === 'insufficient_balance' || Number(c.errno) === 11002;
