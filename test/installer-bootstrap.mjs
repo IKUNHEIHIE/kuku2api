@@ -188,17 +188,22 @@ for (const [name, executable] of runners) {
       const environment = { ...process.env, PATH: mocks + path.delimiter + path.dirname(process.execPath) + path.delimiter + process.env.PATH,
         ADMIN_TOKEN: '', DATABASE_FILE: path.join(root, 'data/kukuai.sqlite'), PORT: undefined, LISTEN_HOST: '127.0.0.1', NPM_CONFIG_OFFLINE: 'true',
         KUKU_TEST_ARCHIVE: archive.replaceAll('\\', '/'), KUKU_TEST_CHECKSUMS: checksums.replaceAll('\\', '/'), KUKU_TEST_ROOT: root,
-        KUKU_TEST_ENTRY: path.join(ROOT, name === 'Bash' ? 'install.sh' : 'install.ps1'), KUKU_TEST_MOCKS: mocks };
+        KUKU_TEST_ENTRY: path.join(ROOT, name === 'Bash' ? 'install.sh' : 'install.ps1'), KUKU_TEST_MOCKS: mocks,
+        KUKU_TEST_DOWNLOAD_LOG: path.join(base, 'downloads.txt') };
       if (name === 'Bash') writeFileSync(path.join(mocks, 'curl'), `#!/usr/bin/env bash
 while (($#)); do case "$1" in -o) output="$2"; shift 2;; https://*) url="$1"; shift;; *) shift;; esac; done
-case "$url" in */SHA256SUMS) cp -- "$KUKU_TEST_CHECKSUMS" "$output";; */kuku2api.tar.gz) cp -- "$KUKU_TEST_ARCHIVE" "$output";; *) echo 'Unexpected source or dependency download' >&2; exit 77;; esac
+printf '%s\\n' "$url" >> "$KUKU_TEST_DOWNLOAD_LOG"
+case "$url" in */SHA256SUMS'?'kuku2api_refresh=*) cp -- "$KUKU_TEST_CHECKSUMS" "$output";; */kuku2api.tar.gz'?'kuku2api_refresh=*) cp -- "$KUKU_TEST_ARCHIVE" "$output";; *) echo 'Stale cached redirect or unexpected download' >&2; exit 77;; esac
 `, { mode: 0o755 });
       const invoke = first => {
         const command = name === 'Bash'
           ? `export PATH="$(cd -- "$KUKU_TEST_MOCKS" && pwd):$PATH"; bash "$KUKU_TEST_ENTRY" --dir "$KUKU_TEST_ROOT" --no-start --lang en ${first ? '--port 19778' : ''}`
           : `function Invoke-WebRequest { param($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec)
-if ($Uri.EndsWith('/SHA256SUMS')) { Copy-Item -LiteralPath $env:KUKU_TEST_CHECKSUMS -Destination $OutFile }
-elseif ($Uri.EndsWith('/kuku2api.zip')) { Copy-Item -LiteralPath $env:KUKU_TEST_ARCHIVE -Destination $OutFile }
+Add-Content -LiteralPath $env:KUKU_TEST_DOWNLOAD_LOG -Value $Uri -Encoding utf8
+$parsed = [Uri]$Uri
+if (-not $parsed.Query.StartsWith('?kuku2api_refresh=')) { throw 'Stale cached redirect' }
+if ($parsed.AbsolutePath.EndsWith('/SHA256SUMS')) { Copy-Item -LiteralPath $env:KUKU_TEST_CHECKSUMS -Destination $OutFile }
+elseif ($parsed.AbsolutePath.EndsWith('/kuku2api.zip')) { Copy-Item -LiteralPath $env:KUKU_TEST_ARCHIVE -Destination $OutFile }
 else { throw 'Unexpected source or dependency download' } }
 & $env:KUKU_TEST_ENTRY -InstallDir $env:KUKU_TEST_ROOT -NoStart -Lang en ${first ? '-Port 19778' : ''}`;
         return spawnSync(executable, name === 'Bash' ? ['-c', command] : ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(command, 'utf16le').toString('base64')], {
@@ -210,6 +215,11 @@ else { throw 'Unexpected source or dependency download' } }
       db.store('accounts').save({ accounts: [{ id: 'keep-account', bduss: 'fake-cookie' }] }); db.close();
       const repeated = invoke(false); assert.equal(repeated.status, 0, repeated.stderr); assert.equal(repeated.stdout, first.stdout);
       assert(repeated.stdout.includes(token)); assert.equal(existsSync(path.join(root, 'ui/node_modules')), false);
+      const refreshes = readFileSync(environment.KUKU_TEST_DOWNLOAD_LOG, 'utf8').replaceAll('\uFEFF', '').trim().split(/\r?\n/)
+        .map(url => new URL(url).searchParams.get('kuku2api_refresh'));
+      assert.equal(refreshes.length, 4); assert(refreshes.every(Boolean));
+      assert.equal(refreshes[0], refreshes[1]); assert.equal(refreshes[2], refreshes[3]);
+      assert.notEqual(refreshes[0], refreshes[2]);
       const before = readFileSync(environment.DATABASE_FILE);
       writeFileSync(checksums, `${'0'.repeat(64)}  ${path.basename(archive)}\n`);
       const rejected = invoke(false); assert.notEqual(rejected.status, 0); assert.match(rejected.stdout + rejected.stderr, /checksum mismatch/);

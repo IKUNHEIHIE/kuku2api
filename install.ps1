@@ -59,11 +59,12 @@ function Test-TaskNode([string]$Executable) {
 function Get-TaskSource {
   if (-not $BuildFromSource -and -not $BackendOnly) {
     $taskReleaseUrl = "https://github.com/$taskRepository/releases/latest/download"
+    $taskReleaseQuery = '?kuku2api_refresh=' + [guid]::NewGuid().ToString('N')
     $taskChecksum = Join-Path $taskTemp 'release-checksums.txt'
     $taskZip = Join-Path $taskTemp 'release.zip'
-    try { Get-TaskDownload "$taskReleaseUrl/SHA256SUMS" $taskChecksum }
+    try { Get-TaskDownload "$taskReleaseUrl/SHA256SUMS$taskReleaseQuery" $taskChecksum }
     catch { throw (Get-TaskMessage '预编译发布包暂不可用，请稍后重试；不会转为本机构建。' 'Prebuilt release unavailable; retry later. No local build will run.') }
-    Get-TaskDownload "$taskReleaseUrl/kuku2api.zip" $taskZip
+    Get-TaskDownload "$taskReleaseUrl/kuku2api.zip$taskReleaseQuery" $taskZip
     $taskMatch = @(Get-Content -LiteralPath $taskChecksum | Select-String -Pattern '^([a-f0-9]{64})\s+kuku2api\.zip$')
     if ($taskMatch.Count -ne 1 -or (Get-TaskSha256 $taskZip) -ne $taskMatch[0].Matches[0].Groups[1].Value) { throw (Get-TaskMessage '发布包校验失败，请重新运行；不会转为本机构建。' 'Release checksum mismatch; rerun the installer. No local build will run.') }
     $taskSourceDirectory = Join-Path $taskTemp 'source'

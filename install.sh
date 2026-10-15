@@ -49,8 +49,9 @@ trap 'rm -rf -- "$work"' EXIT
 download() { curl --silent --show-error --fail --location --retry 3 --connect-timeout 20 --max-time 600 --proto '=https' --tlsv1.2 "$1" -o "$2"; }
 download_source() {
   if [[ "$source_build" == false && "$backend_only" == false ]]; then
-    download "$RELEASE_URL/SHA256SUMS" "$work/release-checksums.txt" || { message '预编译发布包暂不可用，请稍后重试；不会转为本机构建。' 'Prebuilt release unavailable; retry later. No local build will run.' >&2; exit 1; }
-    download "$RELEASE_URL/kuku2api.tar.gz" "$work/source.tar.gz"
+    local release_nonce="$(date +%s)-$$-${RANDOM}"
+    download "$RELEASE_URL/SHA256SUMS?kuku2api_refresh=$release_nonce" "$work/release-checksums.txt" || { message '预编译发布包暂不可用，请稍后重试；不会转为本机构建。' 'Prebuilt release unavailable; retry later. No local build will run.' >&2; exit 1; }
+    download "$RELEASE_URL/kuku2api.tar.gz?kuku2api_refresh=$release_nonce" "$work/source.tar.gz"
     expected="$(awk '$2=="kuku2api.tar.gz" {print $1}' "$work/release-checksums.txt")"
     if command -v sha256sum >/dev/null; then actual="$(sha256sum "$work/source.tar.gz" | awk '{print $1}')";
     elif command -v shasum >/dev/null; then actual="$(shasum -a 256 "$work/source.tar.gz" | awk '{print $1}')";
