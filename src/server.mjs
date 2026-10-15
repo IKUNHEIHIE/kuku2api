@@ -914,7 +914,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
   const keyRing = createKeyRing({ store: database.store('keys'), envKeys });
   const logger = createDatabaseLogger(database, { ...(process.env.KUKU_INSTALLER_QUIET === '1' ? { consoleOutput: { log() {}, warn: console.warn, error: console.error } } : {}), secrets: () => [adminToken, ...envKeys,
     ...database.store('keys').load().keys.map((k) => k.key), ...(pool?.accounts ?? []).flatMap((a) => [a.client.bduss, a.client.stoken, a.ptoken])] });
-  const pool = new Pool(loaded.accounts, { sessionStore: database.store('sessions'), database, logger, agentContinuation: process.env.NATIVE_AGENT_CONTINUATION === '1' });
+  const pool = new Pool(loaded.accounts, { sessionStore: database.store('sessions'), database, logger, agentContinuation: process.env.NATIVE_AGENT_CONTINUATION !== '0' });
   for (const a of pool.accounts) a.deviceId = deviceId;
   const ledger = database.ledger;
   // Daily free-point claiming stays OFF unless the operator turned it on in SQLite or

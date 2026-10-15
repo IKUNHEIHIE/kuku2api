@@ -266,7 +266,7 @@ export class KukuAccount {
   }
 
   // Yields parsed SSE frames. Resume semantics live upstream: msg_id carries the last seen frame id.
-  async *sse({ text, session_id, reply_id, client_session_id, device_id, model_name, model_display_name, think_mode, msg_id, custom_instructions = '', memory_sign = true, skill_dig_sign = true, connector_list, attachments = [], signal }) {
+  async *sse({ text, session_id, reply_id, client_session_id, device_id, model_name, model_display_name, think_mode, msg_id, custom_instructions = '', memory_sign = true, skill_dig_sign = true, connector_list, attachments = [], signal, streamTimeoutMs }) {
     const payload = {
       project_type: 1,
       text,
@@ -292,12 +292,12 @@ export class KukuAccount {
       traceparent: '',
       ...(msg_id ? { msg_id } : {}),
     };
-    yield* this.stream('/wenchain/genflowpro/sse/getchatcontent', payload, signal);
+    yield* this.stream('/wenchain/genflowpro/sse/getchatcontent', payload, signal, { timeoutMs: streamTimeoutMs });
   }
 
-  controlStream(kind, payload, signal) {
+  controlStream(kind, payload, signal, options) {
     const path = kind === 'sandbox' ? '/api/genflowprosse/call' : '/wenchain/genflowpro/sse/msgexchange';
-    return this.stream(path, payload, signal);
+    return this.stream(path, payload, signal, options);
   }
 
   async uploadImage({ bytes, mime }, signal) {
@@ -353,10 +353,10 @@ export class KukuAccount {
     } });
   }
 
-  async *stream(path, payload, signal) {
+  async *stream(path, payload, signal, { timeoutMs = this.streamTimeoutMs } = {}) {
     const url = `${base()}${path}?${qs()}`;
     const controller = new AbortController();
-    const deadline = requestSignal(signal ? AbortSignal.any([signal, controller.signal]) : controller.signal, this.streamTimeoutMs);
+    const deadline = requestSignal(signal ? AbortSignal.any([signal, controller.signal]) : controller.signal, timeoutMs);
     try {
       const res = await fetch(url, { method: 'POST', headers: this.headers(), body: JSON.stringify(payload), signal: deadline });
       if (!res.ok) throw new UpstreamError(`http ${res.status}`, { status: res.status });

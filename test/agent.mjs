@@ -635,8 +635,8 @@ test('agent adapter preserves high effort and completed history without advertis
     const sent = s.seen.send.at(-1);
     assert.equal(sent.think_mode, 3);
     assert.deepEqual(sent.connector_list, []);
-    assert(sent.text.includes('without tool calls or connector discovery'));
-    assert(!sent.text.includes('Discover its definitions'));
+    assert(sent.text.includes('Answer without tools.'));
+    assert(!/discover/i.test(sent.text.split('CONVERSATION_JSON: ')[0]));
     const transcript = JSON.parse(sent.text.split('CONVERSATION_JSON: ')[1].split('\nContinue the next')[0]);
     assert.equal(transcript.at(-1).tool_call_id, 'completed-read');
     assert.equal(transcript.at(-1).content, messages.at(-1).content);
@@ -649,7 +649,7 @@ test('agent adapter names the actual connector and keeps caller instructions sep
   assert.equal(r.status, 200, r.body);
   const sent = s.seen.send[0];
   assert(sent.text.includes(sent.connector_list[0].name));
-  assert(sent.text.includes('when a tool is needed'));
+  assert(sent.text.includes('discover once when needed'));
   assert.equal(sent.custom_instructions, 'CALLER_SYSTEM_INSTRUCTIONS:\nCALLER_RULE');
 });
 
@@ -667,6 +667,76 @@ test('caller instructions are sent once with role labels while all user and tool
   const instructions = 'RESPONSES_INSTRUCTIONS_UNIQUE';
   const response = await responses(s, { input: 'next request', instructions }); assert.equal(response.status, 200);
   const next = s.seen.send[1]; assert.equal((next.text + next.custom_instructions).split(instructions).length - 1, 1);
+});
+
+for (const stream of [false, true]) test(`Responses namespace selection, stream metadata and complete history roundtrip (stream=${stream})`, async t => {
+  const tools = [{ type: 'namespace', name: 'workspace', description: 'Caller files', tools: [{
+    type: 'function', name: 'read_file', description: 'Read a file', parameters: definitions[0].function.parameters,
+  }] }, { type: 'namespace', name: 'other', tools: [{ type: 'function', name: 'read_file', parameters: definitions[0].function.parameters }] }];
+  const s = setup(t, ({ messages, tools: native }) => messages.some(m => m.role === 'tool')
+    ? { text: 'Observed ' + messages.at(-1).content } : { calls: [{ name: native[0].name, arguments: { value: 'demo.txt' } }] });
+  const body = { tools, input: 'read it', stream, tool_choice: { type: 'function', namespace: 'workspace', name: 'read_file' } };
+  const first = await responses(s, body); assert.equal(first.status, 200, first.body);
+  const firstResponse = stream ? first.events.find(e => e.type === 'response.completed').response : first.json;
+  const call = firstResponse.output.find(i => i.type === 'function_call');
+  assert.equal(call.name, 'read_file'); assert.equal(call.namespace, 'workspace');
+  assert.equal(s.seen.definitions[0].length, 1, 'named choice exposes only its selected tool');
+  assert.equal(s.seen.definitions[0][0].name, 'workspace.read_file');
+  assert.match(s.seen.definitions[0][0].description, /Caller files/);
+  if (stream) assert(first.events.filter(e => e.type === 'response.output_item.added' || e.type === 'response.output_item.done')
+    .filter(e => e.item.type === 'function_call').every(e => e.item.namespace === 'workspace' && e.item.name === 'read_file'));
+  const output = { type: 'function_call_output', call_id: call.call_id, output: 'real-content' };
+  for (const history of [{ previous_response_id: firstResponse.id, input: [output] }, { input: [{ role: 'user', content: 'read it' }, call, output] }]) {
+    const next = await responses(s, { tools, stream, ...history }); assert.equal(next.status, 200, next.body);
+    const final = stream ? next.events.find(e => e.type === 'response.completed').response : next.json;
+    assert.equal(final.output_text, 'Observed real-content');
+    const prompt = s.seen.send.at(-1).text;
+    assert(prompt.includes('workspace.read_file')); assert(!prompt.includes('workspace/read_file'));
+  }
+});
+
+test('namespaces keep root/qualified/dotted/long names distinct without losing the public identity', async t => {
+  const parameters = definitions[0].function.parameters;
+  const tools = [
+    { type: 'function', name: 'a.b.c', parameters },
+    { type: 'namespace', name: 'a.b', tools: [{ type: 'function', name: 'c', parameters }] },
+    { type: 'namespace', name: 'a', tools: [{ type: 'function', name: 'b.c', parameters }] },
+    { type: 'namespace', name: 'n'.repeat(128), tools: [{ type: 'function', name: 't'.repeat(128), parameters }] },
+  ];
+  const s = setup(t, ({ tools: native }) => ({ calls: native.map(tool => ({ name: tool.name, arguments: { value: tool.name } })) }));
+  const first = await responses(s, { tools, input: 'all four' }); assert.equal(first.status, 200, first.body);
+  const calls = first.json.output.filter(i => i.type === 'function_call');
+  assert.deepEqual(calls.map(c => [c.namespace ?? null, c.name]), [[null, 'a.b.c'], ['a.b', 'c'], ['a', 'b.c'], ['n'.repeat(128), 't'.repeat(128)]]);
+  const nativeNames = s.seen.definitions[0].map(t => t.name);
+  assert.equal(new Set(nativeNames).size, 4); assert(nativeNames.every(n => /^[A-Za-z0-9_.:-]{1,128}$/.test(n)));
+  const replay = prepareAgent({ tools, input: [{ role: 'user', content: 'all four' }, ...calls,
+    ...calls.map(c => ({ type: 'function_call_output', call_id: c.call_id, output: 'ok' }))] }, 'responses');
+  assert.equal(replay.messages.filter(m => m.role === 'tool').length, 4);
+  const reordered = prepareAgent({ tools: [...tools].reverse(), input: 'same definitions' }, 'responses');
+  assert.deepEqual(new Map(replay.tools.map(t => [t.name, t.native_name])), new Map(reordered.tools.map(t => [t.name, t.native_name])));
+});
+
+test('namespaced free-text custom tools retain namespace in output, full history and previous ID history', async t => {
+  const tools = [{ type: 'namespace', name: 'editor', tools: [{ type: 'custom', name: 'patch', format: { type: 'text' } }] }];
+  const s = setup(t, ({ messages, tools: native }) => messages.some(m => m.role === 'tool') ? { text: 'patched' }
+    : { calls: [{ name: native[0].name, arguments: { input: 'literal patch text' } }] });
+  const first = await responses(s, { tools, input: 'patch' }); assert.equal(first.status, 200, first.body);
+  const call = first.json.output.find(i => i.type === 'custom_tool_call');
+  assert.equal(call.name, 'patch'); assert.equal(call.namespace, 'editor'); assert.equal(call.input, 'literal patch text');
+  const output = { type: 'custom_tool_call_output', call_id: call.call_id, output: 'applied' };
+  for (const history of [{ previous_response_id: first.json.id, input: [output] }, { input: [{ role: 'user', content: 'patch' }, call, output] }]) {
+    const final = await responses(s, { tools, ...history }); assert.equal(final.status, 200, final.body); assert.equal(final.json.output_text, 'patched');
+  }
+});
+
+for (const tools of [
+  [{ type: 'namespace', name: 'x', tools: [{ type: 'namespace', name: 'y', tools: [] }] }],
+  [{ type: 'namespace', name: 'x', tools: [null] }],
+  [{ type: 'namespace', name: 'x', tools: [{ type: 'function', name: 'a' }, { type: 'function', name: 'a' }] }],
+  [{ type: 'namespace', name: 'x', tools: [] }, { type: 'namespace', name: 'x', tools: [] }],
+]) test('invalid or ambiguous namespace definitions fail before contacting upstream: ' + JSON.stringify(tools), async t => {
+  const s = setup(t); const r = await responses(s, { tools, input: 'invalid' });
+  assert.equal(r.status, 400); assert.equal(s.seen.send.length, 0);
 });
 
 test('bounded agent timing metadata is saved to SQLite logs without caller text or tool arguments', async t => {
@@ -755,7 +825,72 @@ test('native continuation supports Responses previous_response_id and streams on
   assert.equal(s.seen.send.length, 1); assert.equal(s.seen.close.length, 0);
 });
 
-for (const change of ['history', 'tools', 'choice', 'effort', 'account', 'image']) test('native continuation rejects changed ' + change + ' without callback or generation', async t => {
+test('native continuation does not count client tool execution against the generation deadline', async t => {
+  const s = continuationSetup(t, { rounds: 1 });
+  for (const a of s.pool.accounts) a.client.streamTimeoutMs = 200;
+  s.pool.agentContinuations.maxMs = 2000;
+  const first = await chat(s, { messages: [user] }); assert.equal(first.status, 200, first.body);
+  await new Promise(resolve => setTimeout(resolve, 250));
+  const message = first.json.choices[0].message;
+  const final = await chat(s, { messages: [user, message, { role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'long tool result' }] });
+  assert.equal(final.status, 200, final.body); assert.equal(s.seen.send.length, 1);
+  assert.equal(final.json.choices[0].message.content, 'Result: long tool result');
+});
+
+test('native continuation retains an absolute lifetime bound while waiting for tool execution', async t => {
+  const s = continuationSetup(t, { rounds: 1 }); s.pool.agentContinuations.maxMs = 150;
+  const first = await chat(s, { messages: [user] }); assert.equal(first.status, 200, first.body);
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const message = first.json.choices[0].message;
+  const final = await chat(s, { messages: [user, message, { role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'late' }] });
+  assert.equal(final.status, 409); assert.equal(final.json.error.code, 'agent_continuation_unavailable');
+  assert.equal(s.seen.send.length, 1); assert.equal(s.pool.agentContinuations.sessions.size, 0);
+});
+
+test('native continuation generation still times out after receiving the tool result', async t => {
+  const s = continuationSetup(t, { rounds: 1 });
+  for (const a of s.pool.accounts) a.client.streamTimeoutMs = 200;
+  const first = await chat(s, { messages: [user] }); assert.equal(first.status, 200, first.body);
+  const original = s.pool.accounts[0].client.nativeToolResult;
+  s.pool.accounts[0].client.nativeToolResult = async result => {
+    if (!result.result?.content) return original(result);
+    s.seen.callbacks.push(result); // Upstream accepts the callback but never produces another event.
+  };
+  const message = first.json.choices[0].message;
+  const final = await chat(s, { messages: [user, message, { role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'accepted' }] });
+  assert.equal(final.status, 504, final.body); assert.equal(s.seen.send.length, 1);
+  assert.equal(s.pool.agentContinuations.sessions.size, 0);
+});
+
+test('long-lived native streams receive an isolated timeout override without changing normal client defaults', async t => {
+  const client = new KukuAccount({ bduss: 'fake', stoken: 'fake' }), seen = [];
+  client.stream = async function*(url, payload, signal, options) { seen.push({ url, payload, options }); };
+  for await (const _ of client.sse({ text: 'hello', streamTimeoutMs: 1800000 })) {}
+  for await (const _ of client.controlStream('sandbox', {}, undefined, { timeoutMs: 1800000 })) {}
+  assert.equal(seen[0].options.timeoutMs, 1800000); assert.equal(seen[1].options.timeoutMs, 1800000);
+  assert.equal(client.streamTimeoutMs, 180000); assert(!('streamTimeoutMs' in seen[0].payload));
+});
+
+for (const stream of [false, true]) test(`namespaced tool continues through the same native callback with correct public metadata (stream=${stream})`, async t => {
+  let context;
+  const tools = [{ type: 'namespace', name: 'fs', tools: [{ type: 'function', name: 'read', parameters: definitions[0].function.parameters }] }];
+  const s = setup(t, ctx => { context = ctx; return { calls: [{ name: 'fs.read', arguments: { value: 'demo' } }] }; });
+  s.pool.agentContinuations.enabled = true; t.after(() => s.pool.agentContinuations.close());
+  const original = s.pool.accounts[0].client.nativeToolResult;
+  s.pool.accounts[0].client.nativeToolResult = async args => {
+    if (!args.result?.content) return original(args);
+    s.seen.callbacks.push(args); context.emit('TEXT_BLOCK_DELTA', { delta: args.result.content[0].text }); context.emit('TURN_DONE');
+  };
+  const first = await responses(s, { tools, input: 'read', stream }); assert.equal(first.status, 200, first.body);
+  const r = stream ? first.events.find(e => e.type === 'response.completed').response : first.json;
+  const call = r.output.find(i => i.type === 'function_call');
+  assert.equal(call.namespace, 'fs'); assert.equal(call.name, 'read'); assert.match(call.call_id, /^call_kuku_native_/);
+  const final = await responses(s, { tools, stream, previous_response_id: r.id, input: [{ type: 'function_call_output', call_id: call.call_id, output: 'actual' }] });
+  assert.equal(final.status, 200, final.body); assert.equal(s.seen.send.length, 1);
+  assert.equal((stream ? final.events.find(e => e.type === 'response.completed').response : final.json).output_text, 'actual');
+});
+
+for (const change of ['history', 'account']) test('native continuation rejects changed ' + change + ' without callback or generation', async t => {
   const s = continuationSetup(t, { rounds: 1 });
   const first = await chat(s, { messages: [user], reasoning_effort: 'low' });
   const message = first.json.choices[0].message;
@@ -770,6 +905,76 @@ for (const change of ['history', 'tools', 'choice', 'effort', 'account', 'image'
   assert.equal(result.status, 409, result.body);
   assert.equal(result.json.error.code, 'agent_continuation_unavailable');
   assert.equal(s.seen.send.length, 1); assert.equal(s.seen.callbacks.filter(c => c.result?.content).length, 0);
+});
+
+function transitionSetup(t) {
+  const s = setup(t, ({ messages }) => messages.some(m => m.role === 'tool') ? { text: 'Observed: ' + messages.at(-1).content }
+    : { calls: [{ name: 'read_file', arguments: { value: 'first' } }] });
+  s.pool.agentContinuations.enabled = true; t.after(() => s.pool.agentContinuations.close());
+  for (const a of s.pool.accounts) {
+    const send = a.client.sendmsg, stream = a.client.sse;
+    a.client.sendmsg = async args => args.connector_list.length ? send(args) : s.seen.send.push(args);
+    a.client.sse = args => args.connector_list.length ? stream(args) : (async function*() {
+      yield { data: { type: 'TEXT_BLOCK_DELTA', data: { delta: 'Observed: actual-result' } } }; yield { data: { type: 'TURN_DONE' } };
+    })();
+    a.client.uploadImage = async () => ({ fsId: '101', name: 'result.png' }); a.client.attachImages = async () => {};
+  }
+  return s;
+}
+
+for (const change of ['tools', 'choice', 'effort', 'system', 'parallel', 'image']) test('valid changed ' + change + ' retires the old native turn before sending the answered history', async t => {
+  const s = transitionSetup(t), first = await chat(s, { messages: [user], reasoning_effort: 'low' });
+  assert.equal(first.status, 200, first.body); const message = first.json.choices[0].message;
+  const messages = [user, message, { role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'actual-result' }];
+  const body = { tools: definitions, messages, reasoning_effort: 'low' };
+  if (change === 'tools') body.tools = definitions.slice(0, 1);
+  if (change === 'choice') body.tool_choice = 'none';
+  if (change === 'effort') body.reasoning_effort = 'high';
+  if (change === 'system') messages.unshift({ role: 'system', content: 'New rule' });
+  if (change === 'parallel') body.parallel_tool_calls = false;
+  if (change === 'image') messages.at(-1).content = [{ type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jW4kAAAAASUVORK5CYII=' } }];
+  const final = await chat(s, body); assert.equal(final.status, 200, final.body);
+  assert.equal(s.seen.send.length, 2); assert.equal(s.seen.close.length, 1);
+  assert.equal(s.seen.callbacks.filter(c => c.result?.content).length, 0);
+  const sent = s.seen.send.at(-1), transcript = JSON.parse(sent.text.split('CONVERSATION_JSON: ')[1].split('\nContinue the next')[0]);
+  assert.equal(transcript.at(-1).tool_call_id, message.tool_calls[0].id);
+  if (change === 'image') assert.equal(sent.attachments.length, 1);
+  else assert.equal(transcript.at(-1).content, 'actual-result');
+  const replay = await chat(s, body); assert.equal(replay.status, 409); assert.equal(s.seen.send.length, 2);
+});
+
+test('Responses per-request instructions may change after a tool result without losing previous-ID history', async t => {
+  const s = transitionSetup(t), tools = definitions.map(d => ({ type: 'function', ...d.function }));
+  const first = await responses(s, { tools, input: 'read first', instructions: 'First rule' }); assert.equal(first.status, 200, first.body);
+  const call = first.json.output.find(i => i.type === 'function_call');
+  const final = await responses(s, { tools, previous_response_id: first.json.id, instructions: 'Second rule',
+    input: [{ type: 'function_call_output', call_id: call.call_id, output: 'actual-result' }] });
+  assert.equal(final.status, 200, final.body); assert.equal(final.json.output_text, 'Observed: actual-result');
+  assert.equal(s.seen.send.length, 2); assert.equal(s.seen.close.length, 1);
+  assert(s.seen.send.at(-1).custom_instructions.includes('Second rule'));
+  assert.equal(s.seen.callbacks.filter(c => c.result?.content).length, 0);
+});
+
+test('unconfirmed native retirement never generates a replacement or posts the old tool callback', async t => {
+  const s = transitionSetup(t), first = await chat(s, { messages: [user] });
+  s.pool.accounts[0].client.closeTurn = async args => { s.seen.close.push(args); throw new UpstreamError('close acknowledgement lost', { status: 502, network: true }); };
+  const message = first.json.choices[0].message;
+  const final = await chat(s, { tools: definitions.slice(0, 1), messages: [user, message, { role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'done' }] });
+  assert.equal(final.status, 502, final.body); assert.equal(s.seen.send.length, 1);
+  assert.equal(s.seen.callbacks.filter(c => c.result?.content).length, 0);
+});
+
+test('concurrent duplicate retirement only starts one replacement generation after confirmed close', async t => {
+  const s = transitionSetup(t), first = await chat(s, { messages: [user] });
+  const original = s.pool.accounts[0].client.closeTurn; let entered, release;
+  const started = new Promise(resolve => { entered = resolve; }), gate = new Promise(resolve => { release = resolve; });
+  s.pool.accounts[0].client.closeTurn = async args => { entered(); await gate; return original(args); };
+  const message = first.json.choices[0].message;
+  const body = { tools: definitions.slice(0, 1), messages: [user, message, { role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'done' }] };
+  const running = chat(s, body); await started;
+  try { assert.equal((await chat(s, body)).status, 409); assert.equal(s.seen.send.length, 1); }
+  finally { release(); }
+  assert.equal((await running).status, 200); assert.equal(s.seen.send.length, 2);
 });
 
 test('native continuation rejects another API key but permits the owning key', async t => {
@@ -922,4 +1127,66 @@ test('late native tool tasks after handoff cannot receive an invented callback r
   const result = await chat(s, { messages: [user, msg, { role: 'tool', tool_call_id: msg.tool_calls[0].id, content: 'done' }] });
   assert.equal(result.status, 409); assert.equal(s.seen.callbacks.filter(c => c.result?.content).length, 0);
   assert.equal(s.seen.send.length, 1); assert.equal(s.seen.close.length, 1);
+});
+
+
+for (const event of ['AWAITING_INPUT', 'REQUIRE_EXTERNAL_EXECUTION']) test('native waiting event may precede its sandbox tool task: ' + event, async t => {
+  const s = setup(t, ({ sandbox, args, emit }) => {
+    emit(event);
+    setTimeout(() => sandbox.push({ data: { type: 'sandbox', sub_type: 'task', task_id: 'delayed-task', data: {
+      method: 'local_connector', params: { session_id: args.session_id, device_id: args.device_id, server_name: args.connector_list[0].name,
+        sub_method: 'tools/call', tool_name: 'read_file', arguments: { value: 'safe-mock' }, request_id: 12 },
+    } } }), 30);
+    return { incomplete: true, calls: [] };
+  });
+  const result = await chat(s, { messages: [user] });
+  assert.equal(result.status, 200, result.body);
+  assert.equal(result.json.choices[0].finish_reason, 'tool_calls');
+  assert.equal(result.json.choices[0].message.tool_calls[0].function.name, 'read_file');
+  assert.equal(s.seen.send.length, 1);
+});
+
+
+for (const stream of [false, true]) test('reasoning about connector and ask does not replace structured tool calls (stream=' + stream + ')', async t => {
+  const reasoning = 'I should discover the connector, then use ask if confirmation is required. '.repeat(200);
+  const s = setup(t, () => ({ reasoning, calls: [{ name: 'read_file', arguments: { value: 'safe-mock' } }] }));
+  const result = await chat(s, { messages: [user], stream });
+  assert.equal(result.status, 200, result.body);
+  const calls = stream ? result.events.flatMap(e => e.choices?.[0]?.delta?.tool_calls ?? []) : result.json.choices[0].message.tool_calls;
+  assert.equal(calls.length, 1); assert.equal(calls[0].function.name, 'read_file');
+  assert.equal(s.seen.definitions.length, 1);
+  if (stream) assert.equal(result.events.map(e => e.choices?.[0]?.delta?.reasoning_content ?? '').join(''), reasoning);
+});
+
+for (const stream of [false, true]) test('caller dynamic discovery and ask remain real registered tools (stream=' + stream + ')', async t => {
+  const named = name => ({ type: 'function', function: { ...definitions[0].function, name } });
+  const s = setup(t, ({ messages, tools }) => ({ calls: [{ name: messages.some(m => m.role === 'tool') ? 'execute_command' : 'connector', arguments: { value: 'safe-mock' } }] }));
+  const first = await chat(s, { tools: [named('connector'), named('ask')], messages: [user] });
+  const msg = first.json.choices[0].message;
+  const second = await chat(s, { tools: [named('execute_command'), named('ask')], stream,
+    messages: [user, msg, { role: 'tool', tool_call_id: msg.tool_calls[0].id, content: 'The mock discovery result describes execute_command.' }] });
+  assert.equal(second.status, 200, second.body);
+  assert.deepEqual(s.seen.definitions.map(list => list.map(tool => tool.name)), [['connector', 'ask'], ['execute_command', 'ask']]);
+  const calls = stream ? second.events.flatMap(e => e.choices?.[0]?.delta?.tool_calls ?? []) : second.json.choices[0].message.tool_calls;
+  assert.equal(calls[0].function.name, 'execute_command');
+  assert.notEqual(s.seen.send[0].connector_list[0].name, s.seen.send[1].connector_list[0].name);
+});
+
+
+test('native wait without a matching tool still fails and never retries generation', async t => {
+  const s = setup(t, ({ emit }) => { emit('AWAITING_INPUT'); return { calls: [], incomplete: true }; });
+  const result = await chat(s, { messages: [user] });
+  assert.equal(result.status, 502); assert.equal(result.json.error.code, 'upstream_requires_client');
+  assert.equal(s.seen.send.length, 1); assert.equal(s.seen.close.length, 1);
+});
+
+for (const stream of [false, true]) test('named forced tool survives reasoning and has correct finish semantics (stream=' + stream + ')', async t => {
+  const s = setup(t, () => ({ reasoning: 'The supplied tool must be called.', calls: [{ name: 'read_file', arguments: { value: 'hello' } }] }));
+  const result = await chat(s, { messages: [user], stream, tool_choice: { type: 'function', function: { name: 'read_file' } } });
+  assert.equal(result.status, 200, result.body);
+  const calls = stream ? result.events.flatMap(e => e.choices?.[0]?.delta?.tool_calls ?? []) : result.json.choices[0].message.tool_calls;
+  assert.equal(calls.length, 1); assert.equal(calls[0].function.name, 'read_file');
+  assert.deepEqual(JSON.parse(calls[0].function.arguments), { value: 'hello' });
+  assert(stream ? result.events.some(e => e.choices?.[0]?.finish_reason === 'tool_calls') : result.json.choices[0].finish_reason === 'tool_calls');
+  assert.deepEqual(s.seen.definitions[0].map(tool => tool.name), ['read_file']);
 });

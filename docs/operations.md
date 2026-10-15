@@ -12,7 +12,7 @@
 | `ADMIN_TOKEN` | SQLite 中保存或自动生成的令牌 | 非空显式值优先，不自动写入数据库 |
 | `API_KEYS` | 空 | 逗号分隔的普通 API 密钥，与控制台创建的密钥共存 |
 | `CORS_ORIGIN` | `*` | 跨源访问允许的 Origin |
-| `NATIVE_AGENT_CONTINUATION` | 未启用 | `1` 开启实验性短时文本工具续接；限制见 [API 文档](api.md#实验性原生工具续接) |
+| `NATIVE_AGENT_CONTINUATION` | 启用 | `0` 关闭原生文本工具续接，使用独立轮；单工具等待 300 秒、整体最多 30 分钟，限制见 [API 文档](api.md#原生工具续接) |
 | `AUTO_CLAIM` | 未启用 | `1` 可启用每日领取；通常在控制台配置 |
 | `KUKU_BASE_URL` | `https://kuku.baidu.com` | 模拟上游测试使用 |
 

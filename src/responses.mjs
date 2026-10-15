@@ -63,8 +63,8 @@ export function buildResponse({ id, model, created, text, thinking, usage, consu
     content: [{ type: 'output_text', text, annotations: [] }],
   });
   for (const call of tool_calls) output.push(call.type === 'custom'
-    ? { id: `ctc_${call.id.slice(5)}`, type: 'custom_tool_call', call_id: call.id, name: call.name, input: call.input, status: 'completed' }
-    : { id: `fc_${call.id.slice(5)}`, type: 'function_call', call_id: call.id, name: call.function.name, arguments: call.function.arguments, status: 'completed' });
+    ? { id: `ctc_${call.id.slice(5)}`, type: 'custom_tool_call', call_id: call.id, name: call.external_name ?? call.name, ...(call.namespace != null ? { namespace: call.namespace } : {}), input: call.input, status: 'completed' }
+    : { id: `fc_${call.id.slice(5)}`, type: 'function_call', call_id: call.id, name: call.external_name ?? call.function.name, ...(call.namespace != null ? { namespace: call.namespace } : {}), arguments: call.function.arguments, status: 'completed' });
   return {
     id,
     object: 'response',

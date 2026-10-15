@@ -8,7 +8,7 @@
 
 - 支持 Chat Completions 与 Responses，支持流式输出和思考档位。
 - 工具模式实时输出正文与思考，支持原生 MCP 客户端工具及图片附件适配；GLM/DeepSeek Flash、OpenCode 与 Pi 验收范围见 [说明](docs/agent-upstream-verification.md)。
-- v1.3.0 改进账号冷却与上游故障恢复，精简 Agent 提示词，并提供默认关闭的实验性原生工具续接。
+- 支持 Responses 工具命名空间，符合条件的文本工具链默认原生续接，减少重复发现工具与重传历史；兼容条件见 [API 文档](docs/api.md#原生工具续接)。
 - 扫码、短信登录，多账号去重、调度及会话隔离。
 - 管理员令牌与模型 API 密钥独立，控制台管理账号、积分和密钥。
 - SQLite 保存设置、日志、对话与用量，支持 token 和积分统计。

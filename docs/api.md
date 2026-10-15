@@ -171,6 +171,10 @@ JSON 请求使用 `Content-Type: application/json`。`OPTIONS` 预检返回 204�
 
 函数工具采用扁平格式：`{"type":"function","name":"read_file","parameters":{...},"strict":false}`，指定选择为 `{"type":"function","name":"read_file"}`。同时支持 `{"type":"custom","name":"apply_patch","format":{"type":"text"}}`；其调用项使用 `input` 文本，结果使用 `output` 文本与 `call_id`。grammar 格式返回 400 `unsupported_tool_format`。
 
+Responses 还支持一层命名空间：`{"type":"namespace","name":"workspace","description":"调用方工作区工具","tools":[{"type":"function","name":"read_file","parameters":{...}}]}`。成员可以是 function 或 text 格式 custom 工具；不支持嵌套 namespace 或托管工具。工具名称在各自命名空间内唯一，不同命名空间及顶层可以使用同名工具。
+
+指定其中的函数时使用 `{"type":"function","namespace":"workspace","name":"read_file"}`（custom 同理）。返回的 `function_call/custom_tool_call` 以及流式调用项保留原始 `name` 和 `namespace`；客户端回传完整历史时也须保留这两个字段，结果仍通过 `call_id` 对应。内部 MCP 名称可能包含命名空间前缀，发生限定名称冲突或长度超限时使用稳定别名；客户端不应使用该内部别名替换公开名称。Chat Completions 工具格式保持不变，不接受 namespace 工具包。协议参考 [OpenAI 函数调用](https://developers.openai.com/api/docs/guides/function-calling)。
+
 返回 Response 对象，含 `id`、`object:"response"`、`created_at`（秒）、`status`、`output`、`output_text`、`usage`、`kuku` 等字段。SSE 使用 Responses 事件名，包含创建、文本增量和完成事件；失败可能返回失败事件，应按事件状态处理。
 
 | 请求 | 行为 |
@@ -191,22 +195,25 @@ JSON 请求使用 `Content-Type: application/json`。`OPTIONS` 预检返回 204�
 
 后端只返回调用建议，**读写客户端工作目录、命令和 MCP 工具的权限检查与执行全部由客户端负责**。上传的图片由上游图片读取能力解析；不会在本后端执行上游电脑端工具，也不接管其他桌面客户端的任务。其他二进制附件、托管 web/file-search/code-interpreter 工具、grammar 自定义工具及提供商加密推理状态尚不支持；不能据此宣称所有 Agent 客户端完全兼容。
 
-默认每次工具轮使用独立上游会话；交出工具调用前结束该轮，不长期挂起桌面回调。下一次请求把完整历史和真实工具结果送入新会话。这样客户端执行长命令时不会占用等待中的上游生成任务。Chat 工具模式忽略 `x-kuku-session`，必须每轮重传历史及工具定义；Responses 可在 `store:true` 时通过 previous ID 从 SQLite 恢复历史，固定原账号与上游身份。
+默认符合条件的文本工具链使用下述原生续接，保持同一上游轮次，减少反复发现工具和重新发送历史。不符合条件或主动关闭续接时，交出工具调用前结束原生轮，下一次请求将完整历史和真实工具结果送入新会话。Chat 工具模式忽略 `x-kuku-session`，必须每轮重传历史及工具定义；Responses 可在 `store:true` 时通过 previous ID 从 SQLite 恢复历史，固定原账号与上游身份。
 
-### 实验性原生工具续接
+<a id="实验性原生工具续接"></a>
 
-后端启动环境变量 `NATIVE_AGENT_CONTINUATION=1` 开启；默认关闭。该功能已通过本地协议模拟，尚未完成当前版本的真实上游续接验收。无需修改前端或增加 API 请求字段。
+### 原生工具续接
+
+后端服务默认开启；启动时设置 `NATIVE_AGENT_CONTINUATION=0` 可关闭。已通过真实 DeepSeek / GLM 5.3 Flash 顺序依赖工具链、DeepSeek 命名空间工具往返和 Codex 两项复杂编码任务验收，以及本地协议回归。无需修改前端或增加 API 请求字段。这是有限条件下的续接能力，不代表所有客户端或工具类型均已验收；真实命名空间探测中模型选择了串行调用，并行批次与逆序结果对应目前由模拟回归覆盖。
 
 - 初始请求为 `tool_choice:auto`、有工具定义且全部历史内容为文本时，可以保留原生任务。符合条件但同时保留的会话已达 32 个时，新请求使用默认独立轮路径。
 - 返回的 `call_kuku_native_...` 调用 ID 必须原样传回。Chat 继续提交完整历史；Responses 可使用已保存的 `previous_response_id`，或提交完整 input 历史。`store:false` 不支持 previous ID 取回历史；仍可在有效期内携带完整历史续接，必要状态仅暂存在内存。
-- 下一次请求使用同一 API 密钥、同一接口，并保持历史前缀、工具定义、模型、实际思考档位、instructions、tool_choice 和并行设置一致。所有本批次结果须一次提交，当前仅支持文本工具结果；结果顺序可不同，以 call ID 对应。
+- 下一次请求使用同一 API 密钥、同一接口，并保留原始用户/助手/工具历史前缀。所有本批次结果须一次提交；结果顺序可不同，以 call ID 对应。工具定义、模型、实际思考档位、调用方指令、tool_choice、并行设置均相同且结果为文本时，直接通过原回调续接。
+- 合法改变工具/模型/思考/指令/选择设置，或返回图片内容时，后端先核验原账号、登录凭据、历史及全部结果，确认关闭旧原生轮后，携带完整已回答历史进入新轮。旧回调不会收到这些结果，旧调用 ID 随之失效。关闭失败或结果不明时明确报错，不自动发送替代生成。system/developer 与 Responses instructions 视为调用方本次指令；改变它们会切换原生轮，但改变既有用户、助手或工具历史仍拒绝。
 - 后端绑定原账号、上游身份和登录凭据；通过原生 callback 回传工具结果，不重新发送用户消息。不允许把待完成任务切换到其他账号。持有任务期间延缓该账号的后台凭据刷新。
-- 每次交出调用后最多等待 60 秒；整条原生轮还受上游流超时限制（当前默认 180 秒，自首次连接开始，不因续接重置）。状态仅保留在当前进程，不支持服务重启或断线后的自动恢复。退出服务时会关闭保留的原生任务。
-- 过期、重启后丢失状态、重复或正在处理的提交、调用方不符、参数/历史变化、非文本结果，返回 HTTP 409，`error.code="agent_continuation_unavailable"`；不会自动转成新生成或换号重试。缺失、重复的历史工具结果仍可能在输入校验时先返回 400 `invalid_tool_history`。账号冷却、删除等仍使用对应账号错误。
+- 每次交出调用后最多等待 300 秒；单次生成仍受上游流超时设置限制（默认 180 秒），收到工具结果后重新计算，等待客户端工具执行的时间不计入该次生成期限。整条原生轮最多 30 分钟，包含工具等待；三个上游长连接仅在原生续接中使用这一整体期限，普通文本和独立工具轮的上游超时不变。状态仅保留在当前进程，不支持服务重启或断线后的自动恢复。退出服务时会关闭保留的原生任务。
+- 过期、重启后丢失状态、重复或正在处理的提交、调用方不符、账号/凭据或已执行历史变化，返回 HTTP 409，`error.code="agent_continuation_unavailable"`；不会自动转成新生成或换号重试。缺失、重复的历史工具结果仍可能在输入校验时先返回 400 `invalid_tool_history`。账号冷却、删除等仍使用对应账号错误。
 - 回调发生网络错误时，不自动重试回调或重新生成，避免已成功但应答丢失时重复执行。409 后应检查已执行工具的实际结果；不要让 Agent 自动重做整个任务。经用户确认后可新建对话携带必要结果。
 - 每个 API 响应只包含该段新正文、推理及用量。积分按上游累计值的差额记录。同一条原生轮的多个响应可共享 `kuku.session_id` 和 `kuku.reply_id`。续接段的 `agent timing` 包含 `resumed:true`，`prompt_bytes`、`instruction_bytes` 为 0。
 
-需要图片工具结果、长命令、途中修改工具/模型或重启续接的客户端，应保持该开关关闭。关闭开关并重启不能恢复之前的保留任务。
+图片结果或动态工具/设置会按上述规则安全切换原生轮。单个命令需要超过 300 秒、或不希望持有等待回调的客户端，可设置 `NATIVE_AGENT_CONTINUATION=0` 使用独立工具轮。关闭开关并重启不能恢复之前的保留任务；此前未完成的原生调用 ID 仍会明确拒绝，不能悄悄重放。托管网页工具等仍不支持，客户端应提供自己的函数工具；后端不会静默删除不支持的定义。
 
 ### 一次往返示例
 
@@ -237,7 +244,7 @@ Responses 的同一往返使用 `output` 中的 `function_call.call_id`，下一
 
 ### 校验、流式与用量
 
-- 不再对工具定义单独限制数量或合计大小。整个 JSON 请求体仍最多 32 MiB，序列化后的完整会话仍最多 2 MiB；这两者与工具定义数量无关。工具名称须唯一，匹配 `[A-Za-z0-9_.:-]{1,128}`；函数参数根节点描述 JSON 对象。上游实际可接受的工具规模仍由上游决定。
+- 不再对工具定义单独限制数量或合计大小。整个 JSON 请求体仍最多 32 MiB，序列化后的完整会话仍最多 2 MiB；这两者与工具定义数量无关。工具名称（以及 Responses 命名空间名称）匹配 `[A-Za-z0-9_.:-]{1,128}`；顶层名称及每个命名空间内的成员名称分别唯一，命名空间名称不能重复。函数参数根节点描述 JSON 对象。上游实际可接受的工具规模仍由上游决定。
 - 上游工具发现响应及 connector 指纹使用同一份稳定序列化的定义：仅固定 JSON 对象的键顺序，保持工具列表和所有数组的顺序、名称、描述、参数与字符串内容。仅对象字段顺序变化时指纹不变；定义内容或数组顺序改变时指纹仍改变。客户端请求、工具调用及结果格式不变，本地 strict/Schema 校验规则不变。
 - 参数在交给客户端前按 JSON Schema 校验：支持 type/properties/required/additionalProperties、数组、enum/const、anyOf/oneOf/allOf/not、本地 `$ref`、常见数值/长度约束。远程引用不支持。`strict:true` 遇到未支持的关键字（如 format）提前拒绝；这是本地验证，并非原生约束解码承诺。
 - `required` / 指定工具 / `none` / `parallel_tool_calls:false` 会校验实际结果；模型违反选择、调用未知工具或参数不合规时返回 `invalid_tool_response`，不把半成品调用发给客户端，也不自动再次付费生成。尚未输出流时返回 HTTP 502；正文或思考已经输出时，Chat 发送 SSE error 后结束，Responses 发送 error / response.failed，客户端应将其视为失败而非成功回答。
@@ -245,7 +252,7 @@ Responses 的同一往返使用 `output` 中的 `function_call.call_id`，下一
 - 工具调用独立缓冲，参数校验和原生轮交接完成后才交付。Chat 使用 `delta.tool_calls[index]`；Responses 使用 `response.output_item.added`、`response.function_call_arguments.delta/done` 或 `response.custom_tool_call_input.delta/done`，最后 `response.completed`。参数 delta 可以是一次完整字符串，不保证逐 token 到达；工具发现、上游思考和生成仍可能有等待，应保留合理的客户端超时。
 - 两个控制连接、独立 ID 分配及图片准备可并行进行，全部就绪后才发送生成请求。SSE 带 `X-Accel-Buffering: no`，请求 Nginx 及时转发；代理配置若显式忽略该头，仍须配置 `proxy_buffering off`。参见 [OpenAI 流式事件约定](https://developers.openai.com/api/reference/resources/responses/streaming-events) 与 [Nginx 缓冲说明](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_buffering)。
 - 工具模式的 system/developer 及 Responses instructions 通过带角色标签的 `custom_instructions` 完整发送一次，不再同时复制到普通会话 JSON 中。用户消息、assistant 调用与 tool 结果仍完整保留，客户端请求格式不变。
-- 已收到本轮有效原生 MCP 调用时，随后到达的 AWAITING_INPUT / REQUIRE_EXTERNAL_EXECUTION 视为等待工具结果，继续按已校验调用交接。没有本轮有效调用的桌面等待仍明确失败，不会执行上游桌面命令。
+- 已收到本轮有效原生 MCP 调用时，随后到达的 AWAITING_INPUT / REQUIRE_EXTERNAL_EXECUTION 视为等待工具结果，继续按已校验调用交接。由于对话流与 sandbox 工具流独立，等待事件先到且本轮有可用客户端工具时，最多等待 3 秒接收并校验对应工具任务；超时仍返回 `upstream_requires_client`。不会执行上游桌面命令，也不会自动重发生成。日志中的 `waiting_before_tool_ms` 表示等待事件先于有效工具任务被处理的时间点（相对当前段起点），不是等待持续时间。
 - 每轮工具请求在 SQLite 系统日志增加一条 `agent timing: {...}`，可用现有管理员接口 `GET /pool/admin/logs?kind=system&level=info` 查询。记录 `turn_id`、模型、状态、实际思考档、工具/工具发现次数、输入字节数及相对本轮启动的毫秒时间：`ids_ready_ms`、`controls_ready_ms`、`images_ready_ms`、`prepared_ms`、`send_started_ms`、`send_ack_ms`、`tool_list_ms`、`tools_ready_ms`、`first_event_ms`、`first_reasoning_ms`、`first_text_ms`、`tool_call_ms`、`close_started_ms`、`close_done_ms`、`total_ms`。未发生的阶段不出现；`model_ends_ms` 最多记录 16 个模型结束时间。计时不包含进入原生适配前的排队/目录刷新或客户端执行工具的时间，不等于客户端实际首字延迟。日志不包含提示词、工具参数、结果正文或凭据；保留策略沿用系统日志设置。
 - 原生工具轮可能包含多次内部推理。usage 合计当前已观察到的 MODEL_CALL_END，用量包含上游平台提示与工具发现开销，**不是客户端历史的上下文长度**。数据库标记 `usage_scope:"all_model_calls"`。交接时尚未报告的用量/积分保持未知，不编造费用。客户端不应单凭该合计值判断是否必须压缩上下文。
 - `agent timing` 另记录 `tool_fingerprint`（稳定工具定义的 SHA-256 前 24 位）及 `tool_definition_bytes`（对应 UTF-8 JSON 字节数），便于关联相同工具集与缓存命中率；不记录工具定义正文。上游缓存收益须以实际用量记录衡量。

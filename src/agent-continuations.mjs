@@ -4,6 +4,8 @@ import { stableToolDefinitions } from './tool-definitions.mjs';
 
 const prefix = 'call_kuku_native_';
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const isInstruction = message => message.role === 'system' || message.role === 'developer';
+const historyDigest = messages => digest(messages.filter(m => !isInstruction(m)));
 const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); promise.catch(() => {}); return { promise, resolve, reject }; };
 export const continuationError = message => Object.assign(new Error(message), { status: 409, code: 'agent_continuation_unavailable', retryUnsafe: true });
 function tail(agent) {
@@ -12,13 +14,13 @@ function tail(agent) {
   return { start, results: agent.messages.slice(start) };
 }
 const config = ({ agent, model, think_mode }) => digest({ tools: stableToolDefinitions(agent.tools), choice: agent.choice,
-  parallel: agent.parallel, instructions: agent.instructions, model: model.model_name, think_mode });
+  parallel: agent.parallel, instructions: agent.instructions, caller_instructions: agent.messages.filter(isInstruction), model: model.model_name, think_mode });
 
 // Live connections cannot survive a process restart. Reserved call IDs fail closed
 // when their owner disappears instead of silently replaying a possibly active task.
 export class AgentContinuations {
-  constructor({ enabled = false, idleMs = 60_000, maxSessions = 32 } = {}) {
-    this.enabled = enabled; this.idleMs = idleMs; this.maxSessions = maxSessions;
+  constructor({ enabled = false, idleMs = 300_000, maxMs = 30 * 60_000, maxSessions = 32 } = {}) {
+    this.enabled = enabled; this.idleMs = idleMs; this.maxMs = maxMs; this.maxSessions = maxSessions;
     this.calls = new Map(); this.sessions = new Set(); this.stopped = false;
   }
   lookup(agent, scope) {
@@ -38,17 +40,31 @@ export class AgentContinuations {
       const { start: boundary, results } = tail(agent);
       if (state.busy || account.id !== state.account.id || account.upstream_user_id !== state.account.upstream_user_id
           || digest([account.client.bduss, account.client.stoken]) !== state.credentials
-          || config(options) !== state.config || digest(agent.messages.slice(0, boundary)) !== state.history
-          || results.length !== state.ids.length || results.some(r => !state.ids.includes(r.tool_call_id) || typeof r.content !== 'string')) {
-        throw continuationError('Native continuation requires the original account, history, settings and all text tool results');
+          || historyDigest(agent.messages.slice(0, boundary)) !== state.history
+          || results.length !== state.ids.length || results.some(r => !state.ids.includes(r.tool_call_id) || (typeof r.content !== 'string' && !Array.isArray(r.content)))) {
+        throw continuationError('Native continuation requires the original account, history and all tool results');
       }
       if (signal?.aborted) throw continuationError('Native continuation request was cancelled');
       state.busy = true; clearTimeout(state.timer);
       state.detach(); state.output = deferred(); state.watch(signal);
+      if (config(options) !== state.config || results.some(r => typeof r.content !== 'string')) {
+        // Valid results with new tools/settings or images cannot be injected into
+        // a model already using the old definitions. Close that turn first; only
+        // a confirmed close permits a new turn with the complete answered history.
+        state.resume.resolve({ ...options, retire: true });
+        const retired = await state.output.promise;
+        if (retired?.native_retired !== true) throw continuationError('Native turn did not confirm retirement');
+        await state.task;
+        return this.startNew(options, start);
+      }
       const callbacks = state.ids.map(id => ({ content: [{ type: 'text', text: results.find(r => r.tool_call_id === id).content }], isError: false }));
       state.resume.resolve({ ...options, results: callbacks });
       return state.output.promise;
     }
+    return this.startNew(options, start);
+  }
+  async startNew(options, start) {
+    const { agent, scope, account, signal } = options;
     // Only auto choice can safely stay in one model turn across multiple API calls.
     if (this.stopped) throw continuationError('Server is shutting down');
     if (!this.enabled || agent.choice !== 'auto' || !agent.tools.length
@@ -60,12 +76,12 @@ export class AgentContinuations {
         current.detach = () => requestSignal?.removeEventListener('abort', cancel);
       } };
     this.sessions.add(current); current.watch(signal);
-    const bridge = { signal: current.abort.signal, exchange: async (turn, context) => {
+    const bridge = { signal: current.abort.signal, maxMs: this.maxMs, exchange: async (turn, context) => {
       if (current.abort.signal.aborted) throw current.abort.signal.reason;
       for (const id of current.ids) this.calls.delete(id);
       turn.tool_calls = turn.tool_calls.map(call => ({ ...call, id: prefix + randomUUID().replaceAll('-', '') }));
       current.ids = turn.tool_calls.map(call => call.id);
-      current.history = digest([...context.agent.messages, assistantHistory(turn)]);
+      current.history = historyDigest([...context.agent.messages, assistantHistory(turn)]);
       current.resume = deferred(); current.busy = false; current.detach();
       for (const id of current.ids) this.calls.set(id, current);
       current.timer = setTimeout(() => current.abort.abort(continuationError('Native tool continuation timed out')), this.idleMs);

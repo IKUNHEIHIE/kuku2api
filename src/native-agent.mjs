@@ -15,15 +15,17 @@ function failure(message, code = 'upstream_requires_client') {
   return new UpstreamError(message, { status: code === 'upstream_timeout' ? 504 : code === 'session_account_mismatch' ? 409 : 502, code });
 }
 
-// The default path closes at handoff. An optional bounded continuation bridge keeps
-// the original turn alive and supplies subsequent caller tool results through callbacks.
+// A bounded continuation bridge can keep the original turn alive and supplies
+// subsequent caller tool results through callbacks; other requests close at handoff.
 // No caller tools, files or commands are executed by this process.
 export async function nativeAgentTurn({ client, model, agent, think_mode, observation, signal, onDelta = () => {}, ownsAccount = () => true, beforeSend = () => {}, continuation = null }) {
   let started = performance.now();
   let timing = observation.agent_timing = { think_mode, tool_count: agent.tools.length, tool_list_count: 0, tool_call_count: 0, model_ends_ms: [] };
   const mark = key => { if (timing[key] == null) timing[key] = Math.round(performance.now() - started); };
   const abort = new AbortController();
-  const deadline = AbortSignal.timeout(client.streamTimeoutMs ?? 180_000);
+  const generationTimeoutMs = client.streamTimeoutMs ?? 180_000;
+  const streamTimeoutMs = continuation?.maxMs ?? generationTimeoutMs;
+  const deadline = AbortSignal.timeout(streamTimeoutMs);
   const ownerSignal = continuation?.signal ?? signal;
   const combined = AbortSignal.any([abort.signal, deadline, ...(ownerSignal ? [ownerSignal] : [])]);
   const baseId = randomUUID(), sandboxId = randomUUID(), deviceId = `kuku2api-agent-${randomUUID()}`;
@@ -35,11 +37,15 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
   const calls = [], seen = new Set();
   const callbacks = [];
   let pointBase = 0, latestPoints = 0, resumed = false, handedOff = false;
-  let batchTimer, connectTimer, ids, reply_id, args, preparation, sent = false, closed = false, complete = false, content = '', reasoning = '';
+  let batchTimer, connectTimer, generationTimer, ids, reply_id, args, preparation, sent = false, closed = false, complete = false, content = '', reasoning = '';
+  const startGenerationTimer = () => {
+    if (continuation) generationTimer = setTimeout(() => abort.abort(failure('Native generation timed out', 'upstream_timeout')), generationTimeoutMs);
+    generationTimer?.unref?.();
+  };
   // All promises participate in races below; suppress a late rejection during cleanup.
   for (const d of [handoff, broken, sandboxReady, baseReady, cancelled]) d.promise.catch(() => {});
   const available = agent.choice === 'none' ? [] : agent.tools.filter(tool => typeof agent.choice !== 'object' || tool.name === agent.choice.name);
-  const tools = stableToolDefinitions(available.map(tool => ({ name: tool.name, description: tool.description,
+  const tools = stableToolDefinitions(available.map(tool => ({ name: tool.native_name ?? tool.name, description: tool.description,
     inputSchema: tool.type === 'function' ? tool.parameters : { type: 'object', properties: { input: { type: 'string' } }, required: ['input'], additionalProperties: false } })));
   // Hash and tools/list use the same normalized definitions, including the original array order.
   const toolJson = JSON.stringify(tools);
@@ -49,7 +55,7 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
   const connector = `external_agent_${fingerprint}`;
   const listen = async (kind, payload, ready) => {
     try {
-      for await (const frame of client.controlStream(kind, payload, combined)) {
+      for await (const frame of client.controlStream(kind, payload, combined, { timeoutMs: streamTimeoutMs })) {
         const envelope = frame.data;
         if (!envelope) continue;
         if (envelope.type === 'connected' || envelope.sub_type === 'connected') { ready.resolve(); continue; }
@@ -81,7 +87,7 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
         else if (params.sub_method === 'tools/call') {
           if (handedOff) throw failure('Native tool batch changed after handoff; no late calls were executed', 'invalid_tool_response');
           mark('tool_call_ms');
-          const tool = available.find(tool => tool.name === params.tool_name);
+          const tool = available.find(tool => (tool.native_name ?? tool.name) === params.tool_name);
           if (!tool) throw failure('Native model selected an undefined client tool', 'invalid_tool_response');
           let arguments_ = params.arguments;
           if (typeof arguments_ === 'string') { try { arguments_ = JSON.parse(arguments_); } catch { throw failure('Invalid native tool arguments', 'invalid_tool_response'); } }
@@ -134,8 +140,8 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
         attachments, model_name: model.model_name, model_display_name: model.display_name, think_mode,
         custom_instructions: callerInstructions(agent.messages, agent.instructions, { labelRoles: true }),
         memory_sign: false, skill_dig_sign: false,
-        connector_list: tools.length ? [{ name: connector, description: 'Client tools for the caller workspace; discover definitions when needed.', type: 'custom' }] : [],
-        signal: combined };
+        connector_list: tools.length ? [{ name: connector, description: 'Client tools for the caller workspace.', type: 'custom' }] : [],
+        signal: combined, streamTimeoutMs };
       timing.prompt_bytes = Buffer.byteLength(args.text);
       timing.instruction_bytes = Buffer.byteLength(args.custom_instructions);
     })();
@@ -145,6 +151,7 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
     beforeSend();
     sent = true; // A lost send acknowledgement must also close, never silently retry.
     mark('send_started_ms');
+    startGenerationTimer();
     await client.sendmsg(args);
     mark('send_ack_ms');
     iterator = client.sse(args)[Symbol.asyncIterator]();
@@ -154,12 +161,17 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
       if (event.handoff) {
         if (!ownsAccount()) throw failure('Account identity changed during the turn', 'session_account_mismatch');
         if (continuation) {
+          clearTimeout(generationTimer);
           handedOff = true;
           mark('total_ms');
           const turn = { ...validateAgentTurn({ content, tool_calls: calls }, agent), reasoning,
             ...observation, tool_adapter: 'native-mcp', handoff: true };
           const resume = await Promise.race([continuation.exchange(turn, { agent }), broken.promise, cancelled.promise]);
           if (!ownsAccount()) throw failure('Account identity changed during tool continuation', 'session_account_mismatch');
+          if (resume.retire) {
+            await close();
+            return { native_retired: true };
+          }
           resume.beforeSend();
           const pending = callbacks.splice(0);
           handedOff = false;
@@ -170,6 +182,7 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
           timing = observation.agent_timing = { think_mode, tool_count: agent.tools.length, tool_list_count: 0, tool_call_count: 0,
             model_ends_ms: [], resumed: true, tool_fingerprint: fingerprint, tool_definition_bytes: Buffer.byteLength(toolJson), prompt_bytes: 0, instruction_bytes: 0 };
           Object.assign(observation, { session_id: ids.chat_id, reply_id });
+          startGenerationTimer();
           for (const [index, callback] of pending.entries()) await callback({ result: resume.results[index] });
           continue;
         }
@@ -207,7 +220,17 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
       // A registered native MCP call legitimately waits for the caller. The
       // validated batch already schedules handoff; do not treat that wait as an
       // unsupported desktop action merely because it races the batching timer.
-      if (delta?.requires_client && !calls.length && !resumed) throw failure('Native model requested desktop input instead of a client tool');
+      if (delta?.requires_client && !calls.length && !resumed) {
+        // Sandbox tasks and conversation events travel over independent streams.
+        // A wait frame can arrive before its validated tools/call task.
+        let arrivalTimer;
+        mark('waiting_before_tool_ms');
+        try {
+          if (!available.length) throw failure('Native model requested desktop input instead of a client tool');
+          await Promise.race([handoff.promise, broken.promise, cancelled.promise,
+            new Promise((_, reject) => { arrivalTimer = setTimeout(() => reject(failure('Native desktop wait had no matching client tool task')), 3000); })]);
+        } finally { clearTimeout(arrivalTimer); }
+      }
       if (delta?.error) throw turnError(delta.error);
       if (delta?.commercial) {
         const drained = delta.commercial.reason === 'insufficient_balance' || Number(delta.commercial.errno) === 11002;
@@ -232,6 +255,7 @@ export async function nativeAgentTurn({ client, model, agent, think_mode, observ
   } finally {
     clearTimeout(batchTimer);
     clearTimeout(connectTimer);
+    clearTimeout(generationTimer);
     if (cancelConnection) combined.removeEventListener('abort', cancelConnection);
     try { await close(); } catch { /* Preserve the original error; never generate another turn. */ }
     abort.abort();
