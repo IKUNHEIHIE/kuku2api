@@ -1,4 +1,5 @@
 import { KukuAccount, UpstreamError, turnError } from './upstream.mjs';
+import { ScnetAccount } from './scnet-upstream.mjs';
 import { normalizeChatMessages, callerInstructions, visibleContent, visibleMessages } from './messages.mjs';
 import { prepareImages } from './images.mjs';
 import { agentMessages } from './agent.mjs';
@@ -159,13 +160,17 @@ export class Pool {
     const prev = new Map((this.accounts ?? []).map((a) => [a.id, a]));
     this.accounts = accounts.map((a, i) => {
       const old = prev.get(a.id);
-      const client = new KukuAccount(a);
-      const sameCredential = old?.client.bduss === client.bduss && old?.client.stoken === client.stoken;
+      const platform = a.platform === 'scnet' ? 'scnet' : 'baidu';
+      const client = platform === 'scnet' ? new ScnetAccount(a) : new KukuAccount(a);
+      const sameCredential = platform === 'scnet'
+        ? old?.client?.accessToken === client.accessToken && old?.client?.apiKey === client.apiKey
+        : old?.client.bduss === client.bduss && old?.client.stoken === client.stoken;
       return {
         id: a.id ?? `acct-${i}`,
         alias: a.alias ?? a.id ?? `acct-${i}`,
         priority: Number.isFinite(a.priority) ? a.priority : 9999,
         disabled: !!a.disabled,
+        platform,
         upstream_user_id: a.upstream_user_id ?? null,
         ptoken: typeof a.ptoken === 'string' ? a.ptoken : '',
         credential: a.credential ? { ...a.credential } : {},
@@ -185,10 +190,11 @@ export class Pool {
 
   // Drain the lowest priority number completely before touching the next one.
   // Round-robin over the sorted list silently degrades into weighted polling.
-  pick({ allowUnavailable = false, exclude = [], model } = {}) {
-    if (!allowUnavailable) { try { this.recovery.check(model); } catch { return null; } }
+  pick({ allowUnavailable = false, exclude = [], model, platform = 'baidu' } = {}) {
+    if (!allowUnavailable) { try { this.recovery.check(model, false, platform); } catch { return null; } }
     const now = Date.now();
     for (const a of this.accounts) {
+      if ((a.platform ?? 'baidu') !== platform) continue;
       if (exclude.includes(a.id)) continue;
       if (!allowUnavailable && this.isUnavailable(a, now)) continue;
       return a;
@@ -231,23 +237,24 @@ export class Pool {
   }
 
   // Client-directed account selection must not bypass the disabled/cooldown gates.
-  resolve(wanted, { allowUnavailable = false, model } = {}) {
-    if (!allowUnavailable) this.recovery.check(model);
-    const a = wanted ? (this.accounts.find(x => x.id === wanted) ?? this.accounts.find(x => x.alias === wanted)) : null;
+  resolve(wanted, { allowUnavailable = false, model, platform = 'baidu' } = {}) {
+    if (!allowUnavailable) this.recovery.check(model, false, platform);
+    const pool = this.accounts.filter(x => (x.platform ?? 'baidu') === platform);
+    const a = wanted ? (pool.find(x => x.id === wanted) ?? pool.find(x => x.alias === wanted)) : null;
     if (wanted && !a) throw Object.assign(new Error(`unknown account: ${wanted}`), { status: 404 });
-    const acct = a ?? this.pick({ allowUnavailable, model });
+    const acct = a ?? this.pick({ allowUnavailable, model, platform });
     if (!acct) {
       // Every account excluded because upstream said "out of points": keep the 402 contract the
       // first request got, instead of degrading to a generic pool exhaustion 409.
-      const enabled = this.accounts.filter(a => !a.disabled);
+      const enabled = pool.filter(a => !a.disabled);
       const drained = enabled.length > 0 && enabled.every((x) => x.balance_dead_until > Date.now());
       if (drained) throw Object.assign(new Error('积分不足，无法继续任务。'), { status: 402, insufficient_balance: true });
-      const candidates = this.accounts.filter(a => !a.disabled && !a.auth_dead);
+      const candidates = pool.filter(a => !a.disabled && !a.auth_dead);
       if (candidates.length) {
         const wait = Math.min(...candidates.map(a => Math.max(a.cooldown_until, a.balance_dead_until) - Date.now()));
         if (wait > 0) throw this.recovery.blockedError(wait, '账号暂时冷却中');
       }
-      throw Object.assign(new Error(this.accounts.some(a => !a.disabled) ? '账号登录均不可用，请检测登录或续期' : '号池为空或所有账号已停用'), { status: 409, code: 'pool_unavailable' });
+      throw Object.assign(new Error(pool.some(a => !a.disabled) ? '账号登录均不可用，请检测登录或续期' : '号池为空或所有账号已停用'), { status: 409, code: 'pool_unavailable' });
     }
     if (!allowUnavailable && a && this.isUnavailable(a)) {
       throw Object.assign(new Error(`account ${acct.id} is unavailable`), { status: 409 });
@@ -308,6 +315,24 @@ export class Pool {
     const out = [];
     for (const a of targets) {
       const rec = { id: a.id, alias: a.alias, ok: false, code: null, message: '' };
+      // SCNet has no Baidu point buckets. Probe with the real inference credential instead, so a
+      // dead key is never resurrected by a stub success.
+      if (a.platform === 'scnet') {
+        try {
+          await a.client.probe();
+          a.auth_dead = false;
+          rec.ok = true;
+          rec.note = 'SCNet-Max 免费额度（活动 Key）';
+        } catch (e) {
+          rec.code = e.code ?? null;
+          rec.message = String(e.message ?? e).slice(0, 120);
+          if (this.isAuthFailure(e)) this.markAuthDead(a);
+          else if (this.isInsufficientBalance(e)) this.markBalanceDead(a);
+          else if (e.network) rec.unreachable = true;
+        }
+        out.push(rec);
+        continue;
+      }
       try {
         const d = await a.client.vipRemain();
         a.auth_dead = false;
@@ -353,7 +378,7 @@ export class Pool {
   // Measured shape: data.activities[].tabs[].tasks[] where `claimable_point > 0` — not
   // `task_status` — is what says "this can be claimed right now".
   async freePointTasks({ only = null } = {}) {
-    const targets = only ? this.accounts.filter((a) => a.id === only || a.alias === only) : this.accounts;
+    const targets = (only ? this.accounts.filter((a) => a.id === only || a.alias === only) : this.accounts).filter((a) => (a.platform ?? 'baidu') === 'baidu');
     const out = [];
     for (const a of targets) {
       const rec = { id: a.id, alias: a.alias, ok: false, code: null, message: '', tasks: [] };
@@ -386,7 +411,7 @@ export class Pool {
   }
 
   async claimFreePoints({ only = null, runChat = false, chatModel = 'gateway-glm-5.3-flash', chatText = '请只回复 OK，不要调用工具或执行任何任务。' } = {}) {
-    const targets = only ? this.accounts.filter((a) => a.id === only || a.alias === only) : this.accounts;
+    const targets = (only ? this.accounts.filter((a) => a.id === only || a.alias === only) : this.accounts).filter((a) => (a.platform ?? 'baidu') === 'baidu');
     const out = [];
     for (const target of targets) {
       out.push(await this.scheduleClaim(() => this.withAccountWork(target.id, async () => {
@@ -458,7 +483,7 @@ export class Pool {
 
   // The upstream conversation list. Titles are the user's real conversation names, so this
   // stays an explicit, opt-in read — never called from the inference path.
-  async sessionList({ only = null, offset = 0, size = 20 } = {}) {    const targets = only ? this.accounts.filter((a) => a.id === only || a.alias === only) : this.accounts;
+  async sessionList({ only = null, offset = 0, size = 20 } = {}) {    const targets = (only ? this.accounts.filter((a) => a.id === only || a.alias === only) : this.accounts).filter((a) => (a.platform ?? 'baidu') === 'baidu');
     const out = [];
     for (const a of targets) {
       const rec = { id: a.id, alias: a.alias, ok: false, code: null, message: '', offset, size, total: 0, sessions: [] };
@@ -518,6 +543,28 @@ export class Pool {
       if (!current) throw sessionError('账号已删除或身份已变化', 'session_account_mismatch');
       if (!args.allowUnavailable && this.isUnavailable(current)) throw Object.assign(new Error('排队期间账号已不可用'), { status: 409, code: 'account_unavailable' });
       return this.recovery.run(args.model.id, recoveryLease => this.recordedChat({ ...args, account: current, recoveryLease }, onDelta, signal), args.allowUnavailable);
+    }));
+  }
+
+  // SCNet inference shares the pool's serialization, cooldown and recovery bookkeeping, but the
+  // upstream is stateless OpenAI-compatible, so it does not go through the Baidu turn pipeline.
+  async scnetChat({ account, model, messages, params = {}, allowUnavailable = false }, onDelta = () => {}, signal) {
+    const started = Date.now();
+    const revision = this.recovery.revision;
+    return this.serialize(`scnet:${account.id}`, () => this.withAccountWork(account.id, async () => {
+      const current = this.accounts.find(a => a.id === account.id && a.platform === 'scnet');
+      if (!current) throw sessionError('账号已删除或身份已变化', 'session_account_mismatch');
+      if (!allowUnavailable && this.isUnavailable(current)) throw Object.assign(new Error('排队期间账号已不可用'), { status: 409, code: 'account_unavailable' });
+      try {
+        const result = await current.client.chat({ messages, params, onDelta, signal });
+        this.recovery.success(current, model, started, revision);
+        return result;
+      } catch (e) {
+        if (signal?.aborted) throw e; // a disconnected caller is not the account's fault
+        Object.defineProperty(e, 'failureAccount', { value: current, configurable: true });
+        await this.recovery.failure(current, e, model);
+        throw e;
+      }
     }));
   }
 

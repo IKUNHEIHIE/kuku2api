@@ -8,14 +8,19 @@ const delayFor = count => Math.min(120_000, 10_000 * 2 ** Math.min(4, count - 1)
 export function createPoolRecovery(pool, now = Date.now) {
   const shared = new Map(), probes = new Map();
   let sequence = 0;
-  const live = account => pool.accounts.find(a => a.id === account.id && a.upstream_user_id === account.upstream_user_id &&
-    a.client.bduss === account.client.bduss && a.client.stoken === account.client.stoken);
-  const blocks = model => [...shared.values()].filter(s => s.scope === 'upstream' || s.model === model);
+  const platformOf = (a) => a.platform ?? 'baidu';
+  const live = account => {
+    const platform = platformOf(account);
+    return pool.accounts.find(a => a.id === account.id && platformOf(a) === platform && a.upstream_user_id === account.upstream_user_id &&
+      (platform === 'scnet' ? a.client.accessToken === account.client.accessToken : a.client.bduss === account.client.bduss && a.client.stoken === account.client.stoken));
+  };
+  // Shared back-off is per platform: a Baidu link failure must not stall SCNet traffic (and vice versa).
+  const blocks = (model, platform = 'baidu') => [...shared.values()].filter(s => (s.model === model && s.scope === 'model') || (s.scope === 'upstream' && (s.platform ?? 'baidu') === platform));
   const blockedError = (ms, reason) => Object.assign(new Error(`${reason}，请在 ${Math.ceil(ms / 1000)} 秒后重试`), {
     status: 503, code: 'pool_cooling_down', retry_after_ms: Math.max(1, Math.ceil(ms)),
   });
-  function check(model, ownRecovery = false) {
-    const at = now(), blocked = blocks(model).filter(s => s.until > at || (s.recovering && !ownRecovery));
+  function check(model, ownRecovery = false, platform = 'baidu') {
+    const at = now(), blocked = blocks(model, platform).filter(s => s.until > at || (s.recovering && !ownRecovery));
     if (blocked.length) throw blockedError(Math.max(...blocked.map(s => Math.max(1000, s.until - at))), '上游暂时退避中');
   }
   async function confirm403(account) {
@@ -44,6 +49,7 @@ export function createPoolRecovery(pool, now = Date.now) {
     }
     if (!(error instanceof UpstreamError) && !error?.network) return !!stop;
     const category = error.network ? 'network' : error.status === 403 || error.status === 429 ? 'access' : 'model';
+    const platform = platformOf(current);
     const at = now(), code = typeof error.code === 'number' && Number.isFinite(error.code) ? String(error.code) : category === 'network' ? 'upstream_network_error' : category === 'access' ? 'upstream_access_restricted' : 'upstream_turn_error';
     current.consecutive_failures = at - (current.last_failure_at ?? 0) <= 300_000 ? (current.consecutive_failures ?? 0) + 1 : 1;
     current.last_failure_at = at; current.last_error_code = code; current.cooldown_reason = reasons[category];
@@ -51,11 +57,11 @@ export function createPoolRecovery(pool, now = Date.now) {
     current.cooldown_until = at + Math.min(pool.cooldownMs, delayFor(current.consecutive_failures));
     // Two distinct accounts with the same failure class identify a shared problem.
     // Network/access failures affect the connection; generation failures affect only this model.
-    const key = category === 'model' ? `model:${model}` : `upstream:${category}`;
+    const key = category === 'model' ? `model:${model}` : `upstream:${category}:${platform}`;
     for (const [k, s] of shared) if (!s.recovering && at - s.last_at > 300_000 && s.until <= at) shared.delete(k);
     if (!shared.has(key)) {
       if (shared.size >= 64) { const victim = [...shared].find(([,s]) => !s.recovering); if (victim) shared.delete(victim[0]); }
-      shared.set(key, { scope: category === 'model' ? 'model' : 'upstream', model: category === 'model' ? model : null, reason: reasons[category], failures: new Map(), trips: 0, until: 0, last_at: at, recovering: false });
+      shared.set(key, { scope: category === 'model' ? 'model' : 'upstream', model: category === 'model' ? model : null, platform, reason: reasons[category], failures: new Map(), trips: 0, until: 0, last_at: at, recovering: false });
     }
     const state = shared.get(key);
     for (const [id, time] of state.failures) if (at - time > 30_000) state.failures.delete(id);
@@ -76,12 +82,12 @@ export function createPoolRecovery(pool, now = Date.now) {
   return {
     failure, success, check, blockedError,
     get revision() { return sequence; },
-    get state() { const at = now(); return [...shared.values()].filter(s => s.until > at || s.recovering).map(s => ({ scope: s.scope, model: s.model, reason: s.reason, retry_after_ms: Math.max(1000, s.until - at), recovering: s.recovering })); },
+    get state() { const at = now(); return [...shared.values()].filter(s => s.until > at || s.recovering).map(s => ({ scope: s.scope, model: s.model, platform: s.platform ?? 'baidu', reason: s.reason, retry_after_ms: Math.max(1000, s.until - at), recovering: s.recovering })); },
     reset() { shared.clear(); probes.clear(); },
-    async run(model, work, bypass = false) {
+    async run(model, work, bypass = false, platform = 'baidu') {
       if (bypass) return work(false);
-      check(model);
-      const recovering = blocks(model).filter(s => s.trips > 0);
+      check(model, false, platform);
+      const recovering = blocks(model, platform).filter(s => s.trips > 0);
       for (const state of recovering) state.recovering = true;
       try { return await work(recovering.length > 0); } finally { for (const state of recovering) state.recovering = false; }
     },

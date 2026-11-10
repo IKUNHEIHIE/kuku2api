@@ -33,17 +33,26 @@ export function createFileStore(file) {
 // Serialising the pool back to disk must never emit credentials the UI invented, and must
 // never print a key. Only these fields are persisted.
 export function toRecords(accounts) {
-  return accounts.map((a) => ({
-    id: a.id,
-    alias: a.alias,
-    priority: a.priority,
-    disabled: a.disabled,
-    ...(a.upstream_user_id ? { upstream_user_id: a.upstream_user_id } : {}),
-    bduss: a.client.bduss,
-    stoken: a.client.stoken,
-    ...(a.ptoken ? { ptoken: a.ptoken } : {}),
-    ...(a.credential && Object.keys(a.credential).length ? { credential: { ...a.credential } } : {}),
-  }));
+  return accounts.map((a) => {
+    const record = {
+      id: a.id,
+      alias: a.alias,
+      priority: a.priority,
+      disabled: a.disabled,
+      ...(a.upstream_user_id ? { upstream_user_id: a.upstream_user_id } : {}),
+      ...(a.credential && Object.keys(a.credential).length ? { credential: { ...a.credential } } : {}),
+    };
+    // SCNet accounts hold an access token + free activity key instead of Baidu cookies.
+    if (a.platform === 'scnet') {
+      return { ...record, platform: 'scnet', access_token: a.client.accessToken, api_key: a.client.apiKey, cookies: [...(a.client.cookies ?? [])] };
+    }
+    return {
+      ...record,
+      bduss: a.client.bduss,
+      stoken: a.client.stoken,
+      ...(a.ptoken ? { ptoken: a.ptoken } : {}),
+    };
+  });
 }
 
 const KEY_PREFIX = 'sk-kuku-';
