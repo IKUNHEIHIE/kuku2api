@@ -10,6 +10,7 @@ import {
   Smartphone,
   KeyRound,
   Info,
+  Globe2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -39,6 +40,7 @@ import { type Account, kukuApi } from '@/lib/kuku-api'
 import { useUsers } from './users-provider'
 import { AddAccountQr } from './add-account-qr'
 import { AddAccountSms } from './add-account-sms'
+import { AddAccountScnet } from './add-account-scnet'
 
 const accountFormSchema = z.object({
   id: z.string().min(1, '请输入账号 ID (如 kuku-1)'),
@@ -204,11 +206,11 @@ export function UsersActionDialog({
     >
       <DialogContent className='sm:max-w-xl max-h-[90vh] overflow-y-auto'>
         <DialogHeader className='text-start'>
-          <DialogTitle>{isEdit ? `配置账号: ${currentRow?.id ?? ''}` : '添加上游百度账号'}</DialogTitle>
+          <DialogTitle>{isEdit ? `配置账号: ${currentRow?.id ?? ''}` : '添加上游账号'}</DialogTitle>
           <DialogDescription>
             {isEdit
               ? '修改账号的别名、调度优先级、停用状态或换绑新凭据（换绑后自动清空失效标记与冷却）。'
-              : '支持通过百度App扫码、手机验证码，或手动录入 BDUSS+STOKEN/PTOKEN 凭据添加账号。'}
+              : '百度账号支持扫码、手机验证码或手动录入凭据；超算互联网（SCNet）使用手机验证码加号，仅反代免费模型 SCNet-Max。'}
           </DialogDescription>
         </DialogHeader>
 
@@ -365,9 +367,9 @@ export function UsersActionDialog({
             </form>
           </Form>
         ) : (
-          /* Add Tabs: QR Scan / SMS Code / Manual Entry */
-          <Tabs value={addTab} onValueChange={(val) => setAddTab(val as 'qr' | 'sms' | 'manual')} className='w-full'>
-            <TabsList className='grid w-full grid-cols-3 mb-2'>
+          /* Add Tabs: QR Scan / SMS Code / Manual Entry / SCNet */
+          <Tabs value={addTab} onValueChange={(val) => setAddTab(val as 'qr' | 'sms' | 'manual' | 'scnet')} className='w-full'>
+            <TabsList className='grid w-full grid-cols-4 mb-2'>
               <TabsTrigger value='qr' className='gap-1.5 text-xs'>
                 <QrCode size={14} />
                 <span>百度App 扫码</span>
@@ -379,6 +381,10 @@ export function UsersActionDialog({
               <TabsTrigger value='manual' className='gap-1.5 text-xs'>
                 <KeyRound size={14} />
                 <span>手动录入凭据</span>
+              </TabsTrigger>
+              <TabsTrigger value='scnet' className='gap-1.5 text-xs'>
+                <Globe2 size={14} />
+                <span>超算互联网</span>
               </TabsTrigger>
             </TabsList>
 
@@ -601,6 +607,11 @@ export function UsersActionDialog({
                   </form>
                 </Form>
               </div>
+            </TabsContent>
+
+            {/* SCNet (超算互联网) Tab */}
+            <TabsContent value='scnet' forceMount className='data-[state=inactive]:hidden'>
+              <AddAccountScnet onSuccess={() => onOpenChange(false)} />
             </TabsContent>
           </Tabs>
         )}

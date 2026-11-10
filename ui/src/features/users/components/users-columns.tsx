@@ -52,7 +52,17 @@ export const usersColumns: ColumnDef<Account>[] = [
       <DataTableColumnHeader column={column} title='别名 / 备注' />
     ),
     cell: ({ row }) => (
-      <div className='font-medium'>{row.getValue('alias')}</div>
+      <div className='flex items-center gap-1.5 font-medium'>
+        <span>{row.getValue('alias')}</span>
+        {row.original.platform === 'scnet' && (
+          <Badge
+            variant='outline'
+            className='border-sky-500/40 text-[10px] text-sky-600 dark:text-sky-400'
+          >
+            超算
+          </Badge>
+        )}
+      </div>
     ),
   },
   {

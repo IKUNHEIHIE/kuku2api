@@ -16,6 +16,9 @@ import { databaseAdminRoute } from './database-api.mjs';
 import { createDesktopLogin } from './desktop-login.mjs';
 import { createStaticUi } from './static-ui.mjs';
 import { listenPort, listenHost } from './listen-port.mjs';
+import { SCNET_MODEL } from './scnet-passport.mjs';
+import { reasoningEffortOf } from './scnet-upstream.mjs';
+import { createScnetLoginManager } from './scnet-logins.mjs';
 import { randomUUID, createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { normalizeChatMessages } from './messages.mjs';
@@ -146,6 +149,7 @@ function failureResponse(err) {
 // every data line to be a chat.completion.chunk.
 export async function handleChat(pool, req, res, reqBody, opts = {}) {
   const model = String(reqBody.model ?? DEFAULT_MODEL);
+  if (model === SCNET_MODEL) return handleScnetChat(pool, req, res, reqBody, opts);
   if (unknownModelId(model)) return rejectUnknownModel(res, model);
   const think = resolveThink(reqBody);
   if (Number.isNaN(think) || unknownThinkMode(think)) return rejectThinkMode(res);
@@ -281,10 +285,230 @@ export async function handleChat(pool, req, res, reqBody, opts = {}) {
   });
 }
 
+// ---- SCNet-Max（超算互联网免费模型）----
+// Stateless OpenAI-compatible upstream: no session/reply bookkeeping, chunks are passed through.
+function scnetParams(reqBody, stream) {
+  return {
+    stream,
+    maxTokens: Number.isFinite(reqBody.max_completion_tokens) ? reqBody.max_completion_tokens
+      : Number.isFinite(reqBody.max_tokens) ? reqBody.max_tokens : undefined,
+    temperature: Number.isFinite(reqBody.temperature) ? reqBody.temperature : undefined,
+    topP: Number.isFinite(reqBody.top_p) ? reqBody.top_p : undefined,
+    reasoningEffort: reasoningEffortOf(reqBody),
+    tools: Array.isArray(reqBody.tools) ? reqBody.tools : undefined,
+    toolChoice: reqBody.tool_choice,
+    responseFormat: reqBody.response_format,
+  };
+}
+
+// SCNet exposes low/high/max; an unrecognised effort must not be silently dropped.
+function rejectUnknownScnetEffort(reqBody, res) {
+  const raw = reqBody?.reasoning_effort ?? reqBody?.reasoning?.effort;
+  if (raw === undefined || raw === null || raw === '') return false;
+  if (reasoningEffortOf(reqBody)) return false;
+  openError(res, 400, 'SCNet-Max 的 reasoning_effort 仅支持 low/medium/high/xhigh/max', 'invalid_request_error', 'invalid_think_mode');
+  return true;
+}
+
+const scnetAttempts = (pool) => Math.max(1, pool.accounts.filter((a) => a.platform === 'scnet').length);
+
+function scnetStreamHeaders(account) {
+  return {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache',
+    'x-accel-buffering': 'no',
+    connection: 'keep-alive',
+    'x-kuku-account': account.id,
+    ...CORS,
+  };
+}
+
+export async function handleScnetChat(pool, req, res, reqBody, opts = {}) {
+  const model = SCNET_MODEL;
+  if (rejectUnknownScnetEffort(reqBody, res)) return;
+  let messages;
+  try { messages = normalizeChatMessages(reqBody.messages); }
+  catch (error) { return openError(res, 400, error.message, 'invalid_request_error', error.code); }
+  const stream = reqBody.stream === true;
+  const wanted = req.headers['x-kuku-account'];
+  const allowUnavailable = opts.admin === true && req.headers['x-kuku-allow-unavailable'] === '1';
+  let acct;
+  try { acct = pool.resolve(wanted, { allowUnavailable, model, platform: 'scnet' }); }
+  catch (e) { return openError(res, e.status ?? 409, redact(e.message), 'pool_error', failureResponse(e).code, e.retry_after_ms); }
+
+  const id = `chatcmpl-${crypto.randomUUID()}`;
+  const created = Math.floor(Date.now() / 1000);
+  const controller = new AbortController();
+  res.once?.('close', () => { if (!res.writableFinished) controller.abort(); });
+  const params = scnetParams(reqBody, stream);
+  const tried = [];
+  let turn = null, lastErr = null, served = acct, sentAny = false, streamOpen = false;
+  const openStream = (account) => {
+    if (streamOpen) return;
+    res.writeHead(200, scnetStreamHeaders(account));
+    res.write(sseChunk(makeChunk(id, created, model, { role: 'assistant' })));
+    streamOpen = true;
+  };
+
+  for (let i = 0; i < scnetAttempts(pool); i++) {
+    tried.push(acct.id);
+    try {
+      turn = await pool.scnetChat({ account: acct, model, messages, params, allowUnavailable }, (delta) => {
+        if (!stream || controller.signal.aborted) return;
+        openStream(acct);
+        sentAny = true;
+        res.write(sseChunk(makeChunk(id, created, model, delta)));
+      }, controller.signal);
+      served = acct;
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (controller.signal.aborted) break;
+      const status = Number(err?.status);
+      // Request-shaped refusals are not another account's problem; account/quota/rate-limit are.
+      if (status >= 400 && status < 500 && ![401, 402, 429].includes(status)) break;
+      if (wanted || sentAny) break;
+      const next = pool.pick({ allowUnavailable, exclude: tried, model, platform: 'scnet' });
+      if (!next) break;
+      acct = next;
+    }
+  }
+
+  if (controller.signal.aborted) return;
+  if (lastErr && !(stream && sentAny)) {
+    const f = failureResponse(lastErr);
+    return openError(res, f.status, redact(lastErr.message), 'upstream_error', f.code, lastErr.retry_after_ms);
+  }
+  if (stream) {
+    openStream(served);
+    if (lastErr) {
+      res.write(sseChunk({ error: { message: redact(lastErr.message), type: 'upstream_error', code: failureResponse(lastErr).code ?? null } }));
+      return res.end('data: [DONE]\n\n');
+    }
+    res.write(sseChunk(makeChunk(id, created, model, {}, turn?.finish_reason ?? 'stop')));
+    if (reqBody.stream_options?.include_usage) res.write(sseChunk({ ...makeChunk(id, created, model, {}), usage: turn?.usage ?? null }));
+    return res.end('data: [DONE]\n\n');
+  }
+
+  json(res, 200, {
+    id,
+    object: 'chat.completion',
+    created,
+    model,
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: turn?.content ?? '',
+        ...(turn?.reasoning ? { reasoning_content: turn.reasoning } : {}),
+        ...(turn?.tool_calls?.length ? { tool_calls: turn.tool_calls } : {}),
+      },
+      finish_reason: turn?.finish_reason ?? 'stop',
+    }],
+    usage: turn?.usage ?? null,
+    scnet: { account: served.id },
+  });
+}
+
+export async function handleScnetResponses(pool, req, res, body, ledger, opts = {}) {
+  const model = SCNET_MODEL;
+  if (rejectUnknownScnetEffort(body, res)) return;
+  if (body.previous_response_id) {
+    return openError(res, 400, 'SCNet-Max 是无状态上游，暂不支持 previous_response_id；请携带完整 input', 'invalid_request_error', 'unsupported_parameter');
+  }
+  let messages;
+  try { messages = normalizeInput(body.input); }
+  catch (error) { return openError(res, error.status ?? 400, error.message, 'invalid_request_error', error.code); }
+  if (!messages.length) return openError(res, 400, 'input must be a non-empty string or item array');
+  if (typeof body.instructions === 'string' && body.instructions.trim()) messages = [{ role: 'system', content: body.instructions }, ...messages];
+  const stream = body.stream === true;
+  const wanted = req.headers['x-kuku-account'];
+  const allowUnavailable = opts.admin === true && req.headers['x-kuku-allow-unavailable'] === '1';
+  let acct;
+  try { acct = pool.resolve(wanted, { allowUnavailable, model, platform: 'scnet' }); }
+  catch (e) { return openError(res, e.status ?? 409, redact(e.message), 'pool_error', failureResponse(e).code, e.retry_after_ms); }
+
+  const id = newResponseId();
+  const created = Math.floor(Date.now() / 1000);
+  const controller = new AbortController();
+  res.once?.('close', () => { if (!res.writableFinished) controller.abort(); });
+  const params = scnetParams(body, stream);
+  const skeleton = buildResponse({ id, model, created, text: '', thinking: '', usage: null, consume: null,
+    instructions: body.instructions ?? null, previous_response_id: null, store: body.store, status: 'in_progress' });
+  if (stream) res.writeHead(200, scnetStreamHeaders(acct));
+  const sc = stream ? new ResponseStream(res, skeleton) : null;
+  sc?.started();
+
+  let turn = null, lastErr = null, sentAny = false;
+  const reasoningText = { value: '' };
+  const tried = [];
+  for (let i = 0; i < scnetAttempts(pool); i++) {
+    tried.push(acct.id);
+    try {
+      turn = await pool.scnetChat({ account: acct, model, messages, params, allowUnavailable }, (delta) => {
+        if (!sc || controller.signal.aborted) return;
+        if (delta.reasoning_content) {
+          if (!sc.reasoningOpen) { sc.reasoningOpen = true; sc.reasoningStarted(); }
+          reasoningText.value += delta.reasoning_content;
+          sc.reasoningDelta(delta.reasoning_content);
+          sentAny = true;
+        }
+        if (delta.content) {
+          if (!sc.messageOpen) {
+            if (sc.reasoningOpen && !sc.reasoningClosed) { sc.reasoningClosed = true; sc.reasoningDone(reasoningText.value); }
+            sc.messageOpen = true;
+            sc.messageStarted();
+          }
+          sc.delta(delta.content);
+          sentAny = true;
+        }
+      }, controller.signal);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (controller.signal.aborted) break;
+      const status = Number(err?.status);
+      if (status >= 400 && status < 500 && ![401, 402, 429].includes(status)) break;
+      if (wanted || sentAny) break;
+      const next = pool.pick({ allowUnavailable, exclude: tried, model, platform: 'scnet' });
+      if (!next) break;
+      acct = next;
+    }
+  }
+
+  if (controller.signal.aborted) return;
+  if (lastErr) {
+    const f = failureResponse(lastErr);
+    if (sc) {
+      const failed = buildResponse({ id, model, created, text: '', thinking: reasoningText.value, usage: null, consume: null,
+        instructions: body.instructions, previous_response_id: null, store: body.store,
+        error: { message: redact(lastErr.message), code: f.code ?? 'upstream_error' } });
+      failed.kuku.account = acct.id;
+      sc.orderOutput(failed);
+      return sc.failed(redact(lastErr.message), failed);
+    }
+    return openError(res, f.status, redact(lastErr.message), 'upstream_error', f.code, lastErr.retry_after_ms);
+  }
+
+  const final = buildResponse({ id, model, created, text: turn?.content ?? '', thinking: turn?.reasoning ?? '',
+    usage: turn?.usage ?? null, consume: null, instructions: body.instructions ?? null, previous_response_id: null,
+    store: body.store, account: acct.id, tool_calls: turn?.tool_calls });
+  final.kuku.account = acct.id;
+  sc?.orderOutput(final);
+  const sessionKey = deriveSessionKey({ sessionKey: req.headers['x-kuku-session'], messages, accountId: acct.id });
+  ledger?.put({ id, session_key: sessionKey, session_id: null, model, account: acct.id, created_at: created,
+    output_text: final.output_text ?? '', response: final });
+  if (sc) return sc.completed(final);
+  json(res, 200, final);
+}
+
 // OpenAI Responses API. Statefulness (previous_response_id) is resolved through the ledger,
 // which maps a response id back to the upstream session key that produced it.
 export async function handleResponses(pool, req, res, body, ledger, opts = {}) {
   const model = String(body.model ?? DEFAULT_MODEL);
+  if (model === SCNET_MODEL) return handleScnetResponses(pool, req, res, body, ledger, opts);
   if (unknownModelId(model)) return rejectUnknownModel(res, model);
   const think = resolveThink(body);
   if (Number.isNaN(think) || unknownThinkMode(think)) return rejectThinkMode(res);
@@ -493,6 +717,7 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
     alias: a.alias,
     priority: a.priority,
     disabled: a.disabled,
+    platform: a.platform ?? 'baidu',
     auth_dead: !!a.auth_dead,
     // Set when upstream answered a turn with COMMERCIAL/insufficient_balance (errno 11002).
     // It is a retry window, not a latch: a freshly minted STOKEN can read zero for a few minutes
@@ -504,8 +729,11 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
     consecutive_failures: a.consecutive_failures ?? 0,
     last_error_code: a.last_error_code ?? null,
     // Credential material is never echoed back; the UI only ever needs to tell accounts apart.
-    has_credential: Boolean(a.client?.bduss && a.client?.stoken),
-    credential: { status: a.auth_dead ? 'invalid' : a.credential?.status ?? 'unknown', can_refresh: !!a.ptoken,
+    has_credential: a.platform === 'scnet'
+      ? Boolean(a.client?.accessToken && a.client?.apiKey)
+      : Boolean(a.client?.bduss && a.client?.stoken),
+    credential: { status: a.auth_dead ? 'invalid' : a.credential?.status ?? 'unknown',
+      can_refresh: a.platform === 'scnet' ? true : !!a.ptoken,
       checked_at: a.credential?.checked_at ?? null, refreshed_at: a.credential?.refreshed_at ?? null,
       expires_at: null, next_refresh_at: credentialRefresh?.nextFor(a) ?? null,
       refreshing: pool.credentialRefreshes?.has(a.id) ?? false, message: a.credential?.message ?? '' },
@@ -522,6 +750,8 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
 
   // Login sessions (QR / SMS). Inert until the admin routes are called.
   const logins = createLoginManager({ addAccount, listAccounts: () => pool.accounts, deviceId, logger });
+  // SCNet accounts are added with a phone + SMS code; the account manager handles the rest.
+  const scnetLogins = createScnetLoginManager({ addAccount, listAccounts: () => pool.accounts, logger });
 
   const route = async function (req, res) {
     const url = new URL(req.url, 'http://localhost');
@@ -664,6 +894,32 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
         return json(res, 200, r);
       }
 
+      // ---- 超算互联网（SCNet）短信加号 ----
+      // Same shape as the Baidu SMS legs: the route only ever hands back an account id.
+      if (url.pathname === '/pool/admin/login/scnet/sms' && req.method === 'POST') {
+        try {
+          const r = await scnetLogins.start(body);
+          if (r.error) return openError(res, r.status ?? 400, r.error, 'invalid_request_error', r.code);
+          return json(res, 200, r);
+        } catch (e) {
+          return openError(res, 502, `验证码发送失败：${e.message}`, 'upstream_error', 'scnet_login_sms_failed');
+        }
+      }
+      if (url.pathname === '/pool/admin/login/scnet/sms/resend' && req.method === 'POST') {
+        try {
+          const r = await scnetLogins.resend(body.login_id);
+          if (r.error) return openError(res, r.status ?? 400, r.error, 'invalid_request_error', r.code);
+          return json(res, 200, r);
+        } catch (e) {
+          return openError(res, 502, `验证码发送失败：${e.message}`, 'upstream_error', 'scnet_login_sms_failed');
+        }
+      }
+      if (url.pathname === '/pool/admin/login/scnet/sms/verify' && req.method === 'POST') {
+        const r = await scnetLogins.verify(body);
+        if (r.error) return openError(res, r.status ?? 400, r.error, 'invalid_request_error', r.code);
+        return json(res, 200, r);
+      }
+
       if (url.pathname === '/pool/admin/keys' && req.method === 'GET') {
         return json(res, 200, { open: allowUnkeyedModels && keys.count() === 0, keys: keys.list() });
       }
@@ -744,17 +1000,25 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
         if (acct) await pool.refreshModelIndex(acct);
         d = getCachedCatalog();
       }
-      if (!d) return json(res, 200, { object: 'list', data: [] });
+      const scnetListed = pool.accounts.some((a) => a.platform === 'scnet');
+      const scnet = scnetListed ? {
+        id: SCNET_MODEL,
+        object: 'model',
+        owned_by: 'scnet',
+        display_name: SCNET_MODEL,
+        description: '超算互联网 SCNet-Max（免费模型，走活动 Key 免费额度）',
+      } : null;
+      if (!d) return json(res, 200, { object: 'list', data: scnet ? [scnet] : [] });
       return json(res, 200, {
         object: 'list',
-        data: (d.model_list ?? []).map((m) => ({
+        data: [...(d.model_list ?? []).map((m) => ({
           id: m.model_name,
           object: 'model',
           owned_by: `kuku${m.vip_type ? ' (vip)' : ''}`,
           display_name: m.display_name ?? m.model_name,
           cost_ratio: m.cost_ratio,
           description: m.description,
-        })),
+        })), ...(scnet ? [scnet] : [])],
         think_list: d.think_list ?? [],
         default_model: d.default_model,
         default_think_id: d.default_think_id,
@@ -913,7 +1177,9 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
   const envKeys = (process.env.API_KEYS ?? '').split(',').filter(Boolean);
   const keyRing = createKeyRing({ store: database.store('keys'), envKeys });
   const logger = createDatabaseLogger(database, { ...(process.env.KUKU_INSTALLER_QUIET === '1' ? { consoleOutput: { log() {}, warn: console.warn, error: console.error } } : {}), secrets: () => [adminToken, ...envKeys,
-    ...database.store('keys').load().keys.map((k) => k.key), ...(pool?.accounts ?? []).flatMap((a) => [a.client.bduss, a.client.stoken, a.ptoken])] });
+    ...database.store('keys').load().keys.map((k) => k.key), ...(pool?.accounts ?? []).flatMap((a) => a.platform === 'scnet'
+      ? [a.client.accessToken, a.client.apiKey, ...(a.client.cookies ?? [])]
+      : [a.client.bduss, a.client.stoken, a.ptoken])] });
   const pool = new Pool(loaded.accounts, { sessionStore: database.store('sessions'), database, logger, agentContinuation: process.env.NATIVE_AGENT_CONTINUATION !== '0' });
   for (const a of pool.accounts) a.deviceId = deviceId;
   const ledger = database.ledger;

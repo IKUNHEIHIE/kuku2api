@@ -3,6 +3,7 @@ export interface Account {
   alias: string
   priority: number
   disabled: boolean
+  platform?: 'baidu' | 'scnet'
   auth_dead: boolean
   balance_dead?: boolean
   balance_retry_in_ms?: number
@@ -313,6 +314,24 @@ export interface LoginSmsVerifyResponse extends LoginSmsTiming {
   reason?: string
   code?: string | number | null
   slide?: unknown
+}
+
+export interface ScnetLoginStartResponse {
+  state: 'sent'
+  login_id: string
+  message?: string
+  expires_in_ms?: number
+  retry_after_ms?: number
+  sends_remaining?: number
+}
+
+export interface ScnetLoginVerifyResponse {
+  state: 'added' | 'failed'
+  account_id?: string
+  login_type?: string
+  refreshed_existing?: boolean
+  reason?: string
+  code?: string | number | null
 }
 
 export interface ApiKeyItem {
@@ -1073,6 +1092,49 @@ export const kukuApi = {
   }): Promise<LoginSmsVerifyResponse> {
     return apiRequest<LoginSmsVerifyResponse>(
       '/pool/admin/login/sms/verify',
+      {
+        method: 'POST',
+        body: JSON.stringify(params),
+      },
+      true
+    )
+  },
+
+  // 超算互联网（SCNet）短信加号：只用活动 Key（SCNet-Max 免费额度）
+  async startScnetLoginSms(params: {
+    phone: string
+    alias?: string
+    priority?: number
+  }): Promise<ScnetLoginStartResponse> {
+    return apiRequest<ScnetLoginStartResponse>(
+      '/pool/admin/login/scnet/sms',
+      {
+        method: 'POST',
+        body: JSON.stringify(params),
+      },
+      true
+    )
+  },
+
+  async resendScnetLoginSms(params: {
+    login_id: string
+  }): Promise<ScnetLoginStartResponse> {
+    return apiRequest<ScnetLoginStartResponse>(
+      '/pool/admin/login/scnet/sms/resend',
+      {
+        method: 'POST',
+        body: JSON.stringify(params),
+      },
+      true
+    )
+  },
+
+  async verifyScnetLoginSms(params: {
+    login_id: string
+    code: string
+  }): Promise<ScnetLoginVerifyResponse> {
+    return apiRequest<ScnetLoginVerifyResponse>(
+      '/pool/admin/login/scnet/sms/verify',
       {
         method: 'POST',
         body: JSON.stringify(params),
