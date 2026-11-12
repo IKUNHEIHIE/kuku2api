@@ -22,7 +22,7 @@ import { createScnetLoginManager } from './scnet-logins.mjs';
 import { randomUUID, createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { normalizeChatMessages } from './messages.mjs';
-import { prepareAgent, assistantHistory } from './agent.mjs';
+import { prepareAgent, assistantHistory, agentMessages, validateClientTools } from './agent.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -327,8 +327,17 @@ export async function handleScnetChat(pool, req, res, reqBody, opts = {}) {
   const model = SCNET_MODEL;
   if (rejectUnknownScnetEffort(reqBody, res)) return;
   let messages;
-  try { messages = normalizeChatMessages(reqBody.messages); }
-  catch (error) { return openError(res, 400, error.message, 'invalid_request_error', error.code); }
+  try {
+    const hasTools = reqBody.tools != null || reqBody.tool_choice != null || reqBody.functions != null || reqBody.function_call != null;
+    const hasToolHistory = Array.isArray(reqBody.messages) && reqBody.messages.some(message =>
+      message?.role === 'tool' || message?.role === 'function' || message?.tool_call_id != null
+      || message?.tool_calls?.length || message?.function_call != null);
+    if (hasTools || hasToolHistory) {
+      validateClientTools(reqBody, 'chat');
+      messages = agentMessages(reqBody.messages);
+    } else messages = normalizeChatMessages(reqBody.messages);
+  }
+  catch (error) { return openError(res, error.status ?? 400, error.message, 'invalid_request_error', error.code); }
   const stream = reqBody.stream === true;
   const wanted = req.headers['x-kuku-account'];
   const allowUnavailable = opts.admin === true && req.headers['x-kuku-allow-unavailable'] === '1';
@@ -400,7 +409,7 @@ export async function handleScnetChat(pool, req, res, reqBody, opts = {}) {
       index: 0,
       message: {
         role: 'assistant',
-        content: turn?.content ?? '',
+        content: turn?.tool_calls?.length && !turn?.content ? null : (turn?.content ?? ''),
         ...(turn?.reasoning ? { reasoning_content: turn.reasoning } : {}),
         ...(turn?.tool_calls?.length ? { tool_calls: turn.tool_calls } : {}),
       },

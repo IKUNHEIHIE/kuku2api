@@ -300,6 +300,83 @@ test('chat completions handler serves SCNet-Max from the scnet pool', async (t) 
   assert.equal(body.usage.total_tokens, 3);
 });
 
+test('SCNet-Max Chat Completions forwards tools and returns tool calls', async (t) => {
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    if (String(url).endsWith('/chat/completions')) {
+      requests.push(JSON.parse(init.body));
+      return response({ body: { id: 'scnet-tool-turn', choices: [{
+        message: { role: 'assistant', content: null, tool_calls: [{ id: 'upstream-call', type: 'function', function: { name: 'lookup', arguments: '{"q":"kuku"}' } }] },
+        finish_reason: 'tool_calls',
+      }] } });
+    }
+    return response({ status: 404 });
+  });
+  const pool = new Pool([scnetRecord()]);
+  const res = fakeRes();
+  const tools = [{ type: 'function', function: { name: 'lookup', description: 'Look up a value', parameters: {
+    type: 'object', properties: { q: { type: 'string' } }, required: ['q'], additionalProperties: false,
+  } } }];
+  await handleScnetChat(pool, { headers: {} }, res, {
+    model: 'SCNet-Max', messages: [{ role: 'user', content: 'Find kuku' }], tools, tool_choice: { type: 'function', function: { name: 'lookup' } },
+  });
+  assert.equal(res.status, 200);
+  const body = JSON.parse(res.body());
+  assert.equal(body.choices[0].message.content, null);
+  assert.equal(body.choices[0].finish_reason, 'tool_calls');
+  assert.deepEqual(body.choices[0].message.tool_calls[0].function, { name: 'lookup', arguments: '{"q":"kuku"}' });
+  assert.deepEqual(requests[0].tools, tools);
+  assert.deepEqual(requests[0].tool_choice, { type: 'function', function: { name: 'lookup' } });
+});
+
+test('SCNet-Max Chat Completions accepts assistant tool calls and tool results', async (t) => {
+  let request;
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    if (String(url).endsWith('/chat/completions')) {
+      request = JSON.parse(init.body);
+      return response({ body: { id: 'scnet-tool-result', choices: [{ message: { role: 'assistant', content: 'The value is ready' }, finish_reason: 'stop' }] } });
+    }
+    return response({ status: 404 });
+  });
+  const pool = new Pool([scnetRecord()]);
+  const res = fakeRes();
+  await handleScnetChat(pool, { headers: {} }, res, {
+    model: 'SCNet-Max',
+    messages: [
+      { role: 'user', content: 'Find kuku' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'lookup', arguments: '{"q":"kuku"}' } }] },
+      { role: 'tool', tool_call_id: 'call_1', content: '{"value":"ready"}' },
+    ],
+    tools: [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object', properties: { q: { type: 'string' } } } } }],
+  });
+  assert.equal(res.status, 200);
+  assert.equal(JSON.parse(res.body()).choices[0].message.content, 'The value is ready');
+  assert.deepEqual(request.messages[1], {
+    role: 'assistant', content: '', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'lookup', arguments: '{"q":"kuku"}' } }],
+  });
+  assert.deepEqual(request.messages[2], { role: 'tool', tool_call_id: 'call_1', content: '{"value":"ready"}' });
+});
+
+test('SCNet-Max Chat Completions streams tool call deltas', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (url) => String(url).endsWith('/chat/completions')
+    ? response({ stream: sse([
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'lookup', arguments: '{"q"' } }] } }] },
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: ':"kuku"}' } }] } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+    ]) })
+    : response({ status: 404 }));
+  const pool = new Pool([scnetRecord()]);
+  const res = fakeRes();
+  await handleScnetChat(pool, { headers: {} }, res, {
+    model: 'SCNet-Max', messages: [{ role: 'user', content: 'Find kuku' }],
+    tools: [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object', properties: {} } } }], stream: true,
+  });
+  assert.equal(res.status, 200);
+  assert.match(res.body(), /"tool_calls"/);
+  assert.match(res.body(), /"finish_reason":"tool_calls"/);
+  assert.match(res.body(), /data: \[DONE\]/);
+});
+
 test('SCNet-Max without an SCNet account fails with a pool error instead of using Baidu', async () => {
   const pool = new Pool([{ id: 'b1', bduss: 'cookie', stoken: 'stoken' }]);
   const res = fakeRes();

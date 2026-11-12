@@ -94,6 +94,12 @@ function selection(body, tools) {
   return { name };
 }
 
+export function validateClientTools(body, surface) {
+  const tools = agentTools(body, surface);
+  selection(body, tools);
+  return tools;
+}
+
 function callFromMessage(call) {
   const name = call?.namespace != null ? identity(call.external_name, call.namespace) : call?.function?.name;
   if (!object(call) || typeof call.id !== 'string' || !call.id || call.type !== 'function'
