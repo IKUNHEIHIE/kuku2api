@@ -175,6 +175,101 @@ test('login manager derives the activity key and never echoes it', async () => {
   assert.ok(!JSON.stringify(done).includes('sk-activity'));
   assert.ok(!JSON.stringify(done).includes('jsessionid'));
 });
+
+test('passport: password login RSA-encrypts and uses the desktop login shape', async (t) => {
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    calls.push({ url: String(url), body: String(init.body ?? ''), headers: init.headers ?? {} });
+    if (String(url).includes('loginDesktopClient.action')) {
+      return response({ body: { code: '0', data: { id: '11049120341', userName: 'acivdbzsj5', token: 'jwt-pw', 'X-Jwt-Refresh-Token': 'refresh-pw' } },
+        setCookies: ['Token=pwshort; Path=/'] });
+    }
+    return response({ status: 404 });
+  });
+  const passport = createScnetPassport();
+  const logged = await passport.loginWithPassword({ username: 'acivdbzsj5', password: 'secret-plaintext' });
+  assert.equal(logged.accessToken, 'jwt-pw');
+  assert.equal(logged.user.id, '11049120341');
+  assert.ok(logged.cookies.includes('Token=pwshort'));
+  const form = new URLSearchParams(calls[0].body);
+  assert.equal(form.get('username'), 'acivdbzsj5');
+  assert.equal(form.get('encrypted'), 'true');
+  assert.equal(form.get('isSevenDaysValidity'), 'true');
+  // Plaintext must never hit the wire; the password field is 64-byte RSA-512 ciphertext.
+  assert.ok(!calls[0].body.includes('secret-plaintext'));
+  assert.equal(Buffer.from(form.get('password'), 'base64').length, 64);
+  assert.match(calls[0].url, /loginDesktopClient\.action/);
+});
+
+test('passport: bad password (1014) is a friendly 401; captcha endpoints parse', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    const u = String(url);
+    if (u.includes('loginDesktopClient.action')) return response({ body: { code: '1014', msg: 'user not exits or password is not correct' } });
+    if (u.includes('isNeedCpatcha')) return response({ body: { code: '0', data: true } });
+    if (u.includes('getClientCaptcha')) return response({ body: { code: 0, msg: 'success', data: 'data:image/jpeg;base64,AAAA', captchaKey: 'captcha:KEY' } });
+    return response({ status: 404 });
+  });
+  const passport = createScnetPassport();
+  await assert.rejects(() => passport.loginWithPassword({ username: 'x', password: 'y' }), (e) => e.status === 401 && /用户名或密码错误/.test(e.message));
+  assert.equal((await passport.captchaNeeded({})).needed, true);
+  const cap = await passport.getCaptcha({});
+  assert.equal(cap.captchaKey, 'captcha:KEY');
+  assert.match(cap.image, /^data:image/);
+});
+
+test('login manager: password login (no captcha) derives the key and never echoes secrets', async () => {
+  const added = [];
+  const passport = {
+    encryptPassword: (p) => `enc(${p})`,
+    captchaNeeded: async () => ({ needed: false, cookies: ['jsessionid=pw'] }),
+    loginWithPassword: async ({ encryptedPassword }) => {
+      assert.equal(encryptedPassword, 'enc(secret)');
+      return { accessToken: 'jwt', cookies: ['Token=y'], user: { id: '11049120341' } };
+    },
+    activityApiKey: async () => ({ apiKey: 'sk-activity' }),
+  };
+  const manager = createScnetLoginManager({ passport, addAccount: async (spec) => { added.push(spec); return { account: { id: spec.id } }; } });
+  assert.equal((await manager.startPassword({ username: '', password: 'x' })).code, 'invalid_username');
+  assert.equal((await manager.startPassword({ username: 'u', password: '' })).code, 'invalid_password');
+  const done = await manager.startPassword({ username: 'acivdbzsj5', password: 'secret', alias: 'fixture' });
+  assert.equal(done.state, 'added');
+  assert.equal(done.login_type, 'scnet_password');
+  assert.equal(added[0].platform, 'scnet');
+  assert.equal(added[0].apiKey, 'sk-activity');
+  assert.equal(added[0].accessToken, 'jwt');
+  const wire = JSON.stringify(done);
+  assert.ok(!wire.includes('secret') && !wire.includes('sk-activity') && !wire.includes('enc('));
+});
+
+test('login manager: password captcha challenge then verify completes', async () => {
+  const added = [];
+  let loginCalls = 0;
+  const passport = {
+    encryptPassword: (p) => `enc(${p})`,
+    captchaNeeded: async () => ({ needed: true, cookies: ['jsessionid=c'] }),
+    getCaptcha: async () => ({ image: 'data:image/jpeg;base64,AAAA', captchaKey: 'captcha:KEY', cookies: ['jsessionid=c'] }),
+    loginWithPassword: async ({ captcha, captchaKey, encryptedPassword }) => {
+      loginCalls += 1;
+      assert.equal(encryptedPassword, 'enc(secret)');
+      assert.equal(captchaKey, 'captcha:KEY');
+      assert.equal(captcha, 'abcd');
+      return { accessToken: 'jwt', cookies: ['Token=y'], user: { id: '11049120341' } };
+    },
+    activityApiKey: async () => ({ apiKey: 'sk-activity' }),
+  };
+  const manager = createScnetLoginManager({ passport, addAccount: async (spec) => { added.push(spec); return { account: { id: spec.id } }; } });
+  const challenge = await manager.startPassword({ username: 'u', password: 'secret' });
+  assert.equal(challenge.state, 'captcha');
+  assert.match(challenge.captcha_image, /^data:image/);
+  assert.equal(challenge.captcha_key, 'captcha:KEY');
+  assert.equal(loginCalls, 0);
+  assert.equal((await manager.verifyPassword({ login_id: challenge.login_id, captcha: '' })).code, 'invalid_captcha');
+  const done = await manager.verifyPassword({ login_id: challenge.login_id, captcha: 'abcd' });
+  assert.equal(done.state, 'added');
+  assert.equal(loginCalls, 1);
+  assert.ok(!JSON.stringify(done).includes('secret'));
+});
+
 function fakeRes() {
   const chunks = [];
   return {

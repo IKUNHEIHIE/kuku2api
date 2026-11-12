@@ -334,6 +334,19 @@ export interface ScnetLoginVerifyResponse {
   code?: string | number | null
 }
 
+export interface ScnetPasswordStartResponse {
+  state: 'added' | 'captcha' | 'failed'
+  login_id?: string
+  account_id?: string
+  login_type?: string
+  refreshed_existing?: boolean
+  captcha_image?: string
+  captcha_key?: string
+  expires_in_ms?: number
+  reason?: string
+  code?: string | number | null
+}
+
 export interface ApiKeyItem {
   id: string
   hint: string
@@ -1135,6 +1148,37 @@ export const kukuApi = {
   }): Promise<ScnetLoginVerifyResponse> {
     return apiRequest<ScnetLoginVerifyResponse>(
       '/pool/admin/login/scnet/sms/verify',
+      {
+        method: 'POST',
+        body: JSON.stringify(params),
+      },
+      true
+    )
+  },
+
+  // 超算互联网（SCNet）账密加号：密码在服务端 RSA 加密后才发往上游，前端不留存明文
+  async startScnetLoginPassword(params: {
+    username: string
+    password: string
+    alias?: string
+    priority?: number
+  }): Promise<ScnetPasswordStartResponse> {
+    return apiRequest<ScnetPasswordStartResponse>(
+      '/pool/admin/login/scnet/password',
+      {
+        method: 'POST',
+        body: JSON.stringify(params),
+      },
+      true
+    )
+  },
+
+  async verifyScnetLoginPassword(params: {
+    login_id: string
+    captcha: string
+  }): Promise<ScnetLoginVerifyResponse> {
+    return apiRequest<ScnetLoginVerifyResponse>(
+      '/pool/admin/login/scnet/password/verify',
       {
         method: 'POST',
         body: JSON.stringify(params),

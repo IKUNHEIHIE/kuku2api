@@ -1,6 +1,6 @@
 # kuku2api
 
-将百度「库库AI」接入 OpenAI 兼容客户端，提供多账号池、流式对话和网页管理控制台。
+将百度「库库AI」与超算互联网（SCNet）免费模型接入 OpenAI 兼容客户端，提供多账号池、流式对话和网页管理控制台。
 
 [快速安装](#快速安装) · [使用说明](docs/usage.md) · [API 文档](docs/api.md) · [全部文档](docs/README.md) · [v1.4.0 发布说明](docs/releases/v1.4.0.md) · [发布包](https://github.com/IKUNHEIHIE/kuku2api/releases/latest)
 
@@ -10,7 +10,7 @@
 - 工具模式实时输出正文与思考，支持原生 MCP 客户端工具及图片附件适配；GLM/DeepSeek Flash、OpenCode 与 Pi 验收范围见 [说明](docs/agent-upstream-verification.md)。
 - 支持 Responses 工具命名空间，符合条件的文本工具链默认原生续接，减少重复发现工具与重传历史；兼容条件见 [API 文档](docs/api.md#原生工具续接)。
 - 扫码、短信登录，多账号去重、调度及会话隔离。
-- 支持超算互联网（SCNet）账号池：手机验证码加号，反代免费模型 `SCNet-Max`，凭据自动续期，与百度账号故障隔离。
+- 支持超算互联网（SCNet）账号池：验证码或账密加号，反代免费模型 `SCNet-Max`，凭据自动续期，与百度账号故障隔离。
 - 管理员令牌与模型 API 密钥独立，控制台管理账号、积分和密钥。
 - SQLite 保存设置、日志、对话与用量，支持 token 和积分统计。
 - 手动领取积分；每日自动领取默认关闭。
@@ -49,7 +49,7 @@ Invoke-WebRequest https://raw.githubusercontent.com/IKUNHEIHIE/kuku2api/main/ins
 ## 开始使用
 
 1. 使用管理员密钥登录控制台。首次登录自动填入当前页面的 HTTP/HTTPS 地址，也适用于同源反向代理。
-2. 在「号池」扫码或短信登录，添加自己的账号。
+2. 在「号池」添加账号：先选平台（百度账号 / 超算互联网），再选登录方式。百度支持扫码或短信，超算支持验证码或账密。
 3. 在「密钥管理」创建普通 API 密钥并保存。
 4. 在兼容客户端中填写下表内容。
 
@@ -60,6 +60,17 @@ Invoke-WebRequest https://raw.githubusercontent.com/IKUNHEIHIE/kuku2api/main/ins
 | 模型 | 从 `/v1/models` 获取，例如 `gateway-glm-5.3-flash` |
 
 管理员密钥用于控制台；模型调用使用普通 API 密钥。模型可用性与实际积分消耗以上游返回为准。
+
+## 超算互联网（SCNet）
+
+号池除百度账号外，还支持超算互联网（SCNet）账号，**仅反代其免费模型 `SCNet-Max`**：
+
+- **两种加号方式**：在「号池 → 添加账号 → 超算互联网」中选择「验证码登录」（手机号 + 短信验证码）或「账密登录」（用户名 + 密码）。密码在服务端 RSA 加密后才发往超算，控制台与日志不留存明文；若上游要求图形验证码，按提示完成即可。
+- **只用免费额度**：登录后自动派生账号的「活动 Key」（与官方桌面客户端同源），走 `SCNet-Max` 免费额度，不会创建或消耗付费平台 Key。
+- **凭据自动续期**：访问令牌到期前自动刷新，无需重新加号。
+- **故障隔离**：SCNet 与百度账号分池调度，任一上游限流或失效不影响另一池。
+
+调用方式与百度模型一致：Base URL 填 `http://服务器IP:端口/v1`，API Key 用控制台创建的普通密钥，模型名填 `SCNet-Max`。号池中至少需要一个可用的 SCNet 账号，`/v1/models` 才会列出该模型。`SCNet-Max` 为无状态上游，Responses 接口暂不支持 `previous_response_id`，请携带完整 `input`。
 
 ## 升级与重启
 

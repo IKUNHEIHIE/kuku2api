@@ -115,9 +115,9 @@ export function UsersPrimaryButtons() {
 
       <Button
         size='sm'
-        onClick={() => openAddDialog('manual')}
+        onClick={() => openAddDialog('qr')}
         disabled={!adminEnabled}
-        title={!adminEnabled ? adminNotice : '添加账号 / 手动录入凭据'}
+        title={!adminEnabled ? adminNotice : '添加上游账号（百度 / 超算互联网）'}
         className='gap-1.5'
       >
         <Plus size={16} />

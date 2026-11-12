@@ -920,6 +920,24 @@ export function createApp({ pool, apiKeys = [], adminToken = '', store = null, d
         return json(res, 200, r);
       }
 
+      // ---- 超算互联网（SCNet）账密加号 ----
+      // Same contract as the SMS legs: the route only ever hands back an account id (or a
+      // captcha challenge); the password is encrypted server-side and never echoed.
+      if (url.pathname === '/pool/admin/login/scnet/password' && req.method === 'POST') {
+        try {
+          const r = await scnetLogins.startPassword(body);
+          if (r.error) return openError(res, r.status ?? 400, r.error, 'invalid_request_error', r.code);
+          return json(res, 200, r);
+        } catch (e) {
+          return openError(res, 502, `登录失败：${e.message}`, 'upstream_error', 'scnet_login_password_failed');
+        }
+      }
+      if (url.pathname === '/pool/admin/login/scnet/password/verify' && req.method === 'POST') {
+        const r = await scnetLogins.verifyPassword(body);
+        if (r.error) return openError(res, r.status ?? 400, r.error, 'invalid_request_error', r.code);
+        return json(res, 200, r);
+      }
+
       if (url.pathname === '/pool/admin/keys' && req.method === 'GET') {
         return json(res, 200, { open: allowUnkeyedModels && keys.count() === 0, keys: keys.list() });
       }

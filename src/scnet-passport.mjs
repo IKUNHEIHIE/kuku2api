@@ -2,8 +2,10 @@
 // the credential is the account's "activity" API key (the same one the desktop client
 // derives), never a paid platform key created through /llm/api-key/create.
 //
-// Auth chain: SMS code -> access token (JWT, ~7 days) -> createActivityApiKey -> sk-... key
-// used as `Authorization: Bearer` against the OpenAI-compatible LLM gateway.
+// Auth chain: SMS code OR account password -> access token (JWT, ~7 days) ->
+// createActivityApiKey -> sk-... key used as `Authorization: Bearer` against the
+// OpenAI-compatible LLM gateway.
+import crypto from 'node:crypto';
 import { UpstreamError } from './upstream.mjs';
 
 export const SCNET_MODEL = 'SCNet-Max';
@@ -11,6 +13,32 @@ export const SCNET_WEB = 'https://www.scnet.cn';
 export const SCNET_LLM = 'https://api.scnet.cn/api/llm/v1';
 const CLIENT_VERSION = '4.1.2';
 const APP_HEADERS = { source: 'Electron', version: CLIENT_VERSION };
+
+// The desktop client's fixed 512-bit RSA public key; the password is encrypted with
+// PKCS1 before it ever leaves the machine. Only SCNet holds the matching private key.
+const SCNET_RSA_PUBLIC_KEY = 'MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBALaXEnbjI6fjy+t9W9AiO/KS0q+b/OZFS+7ykinLbiriUx9P8BcuuHnVbXNiZp5jW70eVGBtX4DhGUPzJa1YT/8CAwEAAQ==';
+
+function encryptPassword(password) {
+  const pem = `-----BEGIN PUBLIC KEY-----\n${SCNET_RSA_PUBLIC_KEY}\n-----END PUBLIC KEY-----`;
+  return crypto.publicEncrypt({ key: pem, padding: crypto.constants.RSA_PKCS1_PADDING }, Buffer.from(String(password), 'utf8')).toString('base64');
+}
+
+// SMS and password logins return the same platform envelope; normalise both into one shape.
+function loginPayload(data, cookies) {
+  const user = data?.data ?? {};
+  if (!user.token) throw new UpstreamError('登录成功但未返回访问令牌', { status: 502 });
+  return {
+    accessToken: String(user.token),
+    refreshToken: typeof user['X-Jwt-Refresh-Token'] === 'string' ? user['X-Jwt-Refresh-Token'] : '',
+    cookies,
+    user: {
+      id: String(user.id ?? ''),
+      userName: String(user.userName ?? ''),
+      fullName: String(user.fullName ?? ''),
+      phone: String(user.mobilephoneNum ?? ''),
+    },
+  };
+}
 
 const authError = (message, data, status = 401) =>
   new UpstreamError(message, { code: String(data?.code ?? data?.error?.code ?? '401'), status, body: data });
@@ -79,6 +107,7 @@ export function createScnetPassport({ fetchImpl } = {}) {
   const setCookiesOf = (res) => res.headers.getSetCookie?.() ?? [];
 
   return {
+    encryptPassword,
     async sendPhoneCode({ phone, signal } = {}) {
       const res = await request(`${SCNET_WEB}/ac/api/auth/sendDesktopClientPhoneCode.action`, {
         method: 'POST', form: { phoneNum: String(phone) }, signal,
@@ -92,19 +121,46 @@ export function createScnetPassport({ fetchImpl } = {}) {
         method: 'POST', form: { messageCode: String(code), isSevenDaysValidity: 'true' }, cookies, signal,
       });
       const data = await platformJson(res);
-      const user = data?.data ?? {};
-      if (!user.token) throw new UpstreamError('登录成功但未返回访问令牌', { status: 502 });
-      return {
-        accessToken: String(user.token),
-        refreshToken: typeof user['X-Jwt-Refresh-Token'] === 'string' ? user['X-Jwt-Refresh-Token'] : '',
-        cookies: mergeCookies(cookies, setCookiesOf(res)),
-        user: {
-          id: String(user.id ?? ''),
-          userName: String(user.userName ?? ''),
-          fullName: String(user.fullName ?? ''),
-          phone: String(user.mobilephoneNum ?? ''),
-        },
-      };
+      return loginPayload(data, mergeCookies(cookies, setCookiesOf(res)));
+    },
+
+    // Account-password login. The password is RSA-encrypted (PKCS1) exactly as the desktop
+    // client does; pass `encryptedPassword` to reuse a ciphertext across a captcha retry so
+    // the plaintext never has to be retained. A fresh session normally needs no captcha.
+    async loginWithPassword({ username, password, encryptedPassword, captcha = '', captchaKey = '', cookies, signal } = {}) {
+      const enc = encryptedPassword ?? encryptPassword(password);
+      const res = await request(`${SCNET_WEB}/ac/api/auth/loginDesktopClient.action`, {
+        method: 'POST',
+        form: { username: String(username), password: enc, encrypted: 'true', isSevenDaysValidity: 'true', captcha: String(captcha), captchaKey: String(captchaKey) },
+        cookies, signal,
+      });
+      let data;
+      try { data = await platformJson(res); }
+      catch (e) {
+        if (e?.code === '1014') throw authError('用户名或密码错误', { code: '1014' }, 401);
+        throw e;
+      }
+      return loginPayload(data, mergeCookies(cookies, setCookiesOf(res)));
+    },
+
+    // Whether this session must solve a graphic captcha before logging in (endpoint name
+    // keeps upstream's "Cpatcha" typo). Returns the session cookies so the check and the
+    // subsequent login share one jsessionid.
+    async captchaNeeded({ cookies, signal } = {}) {
+      const res = await request(`${SCNET_WEB}/ac/api/auth/isNeedCpatcha.action`, { cookies, signal });
+      const data = await platformJson(res);
+      return { needed: data?.data === true, cookies: mergeCookies(cookies, setCookiesOf(res)) };
+    },
+
+    async getCaptcha({ cookies, signal } = {}) {
+      const res = await request(`${SCNET_WEB}/ac/api/auth/getClientCaptcha.action`, {
+        method: 'POST', form: { ph: '1' }, cookies, signal,
+      });
+      const data = await platformJson(res);
+      const image = typeof data?.data === 'string' ? data.data : '';
+      const captchaKey = String(data?.captchaKey ?? '');
+      if (!image || !captchaKey) throw new UpstreamError('图形验证码不可用', { status: 502 });
+      return { image, captchaKey, cookies: mergeCookies(cookies, setCookiesOf(res)) };
     },
 
     // Session hand-off: the long-lived access token stays the management credential; this

@@ -16,11 +16,11 @@ export type UsersContextType = {
   upstreamCooldowns: PoolCooldown[]
   open: UsersDialogType | null
   setOpen: (str: UsersDialogType | null) => void
-  addTab: 'qr' | 'sms' | 'manual' | 'scnet'
+  addTab: 'qr' | 'sms' | 'scnet-sms' | 'scnet-password'
   setAddTab: React.Dispatch<
-    React.SetStateAction<'qr' | 'sms' | 'manual' | 'scnet'>
+    React.SetStateAction<'qr' | 'sms' | 'scnet-sms' | 'scnet-password'>
   >
-  openAddDialog: (tab?: 'qr' | 'sms' | 'manual' | 'scnet') => void
+  openAddDialog: (tab?: 'qr' | 'sms' | 'scnet-sms' | 'scnet-password') => void
   openFreePointsDialog: (accountId?: string) => void
   selectedClaimAccountId: string | null
   setSelectedClaimAccountId: React.Dispatch<React.SetStateAction<string | null>>
@@ -61,11 +61,11 @@ function detectPriorityGap(accountsList: Account[]): boolean {
 
 export function UsersProvider({ children }: { children: React.ReactNode }) {
   const [open, setOpen] = useDialogState<UsersDialogType>(null)
-  const [addTab, setAddTab] = useState<'qr' | 'sms' | 'manual' | 'scnet'>('qr')
+  const [addTab, setAddTab] = useState<'qr' | 'sms' | 'scnet-sms' | 'scnet-password'>('qr')
   const [currentRow, setCurrentRow] = useState<Account | null>(null)
   const [selectedClaimAccountId, setSelectedClaimAccountId] = useState<string | null>(null)
 
-  const openAddDialog = useCallback((tab: 'qr' | 'sms' | 'manual' | 'scnet' = 'qr') => {
+  const openAddDialog = useCallback((tab: 'qr' | 'sms' | 'scnet-sms' | 'scnet-password' = 'qr') => {
     setCurrentRow(null)
     setAddTab(tab)
     setOpen('add')
