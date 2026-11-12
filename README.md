@@ -2,7 +2,7 @@
 
 将百度「库库AI」接入 OpenAI 兼容客户端，提供多账号池、流式对话和网页管理控制台。
 
-[快速安装](#快速安装) · [使用说明](docs/usage.md) · [API 文档](docs/api.md) · [全部文档](docs/README.md) · [v1.3.0 发布说明](docs/releases/v1.3.0.md) · [发布包](https://github.com/IKUNHEIHIE/kuku2api/releases/latest)
+[快速安装](#快速安装) · [使用说明](docs/usage.md) · [API 文档](docs/api.md) · [全部文档](docs/README.md) · [v1.4.0 发布说明](docs/releases/v1.4.0.md) · [发布包](https://github.com/IKUNHEIHIE/kuku2api/releases/latest)
 
 ## 功能
 
@@ -10,6 +10,7 @@
 - 工具模式实时输出正文与思考，支持原生 MCP 客户端工具及图片附件适配；GLM/DeepSeek Flash、OpenCode 与 Pi 验收范围见 [说明](docs/agent-upstream-verification.md)。
 - 支持 Responses 工具命名空间，符合条件的文本工具链默认原生续接，减少重复发现工具与重传历史；兼容条件见 [API 文档](docs/api.md#原生工具续接)。
 - 扫码、短信登录，多账号去重、调度及会话隔离。
+- 支持超算互联网（SCNet）账号池：手机验证码加号，反代免费模型 `SCNet-Max`，凭据自动续期，与百度账号故障隔离。
 - 管理员令牌与模型 API 密钥独立，控制台管理账号、积分和密钥。
 - SQLite 保存设置、日志、对话与用量，支持 token 和积分统计。
 - 手动领取积分；每日自动领取默认关闭。
